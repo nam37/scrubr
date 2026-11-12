@@ -1,0 +1,883 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>scrubr Audio Editor PRD</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: one reading column (~48rem) under a gear-style spec plate; wide figures and tables scroll inside their own frames on phones. */
+:root {
+  --bg: #F4F5F7;
+  --surface: #FFFFFF;
+  --ink: #1A1D23;
+  --muted: #596170;
+  --rule: #D8DCE2;
+  --code: #ECEEF2;
+  --accent: #A35C00;
+  --accent-fill: #F6E3C3;
+  --accent-ink: #7A4400;
+  --display: "Barlow Semi Condensed", "Arial Narrow", "Helvetica Neue", sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121418; --surface: #1A1D22; --ink: #E6E8EC; --muted: #9BA2AF; --rule: #2D323B;
+    --code: #1F2329; --accent: #F0A73C; --accent-fill: #3A2A12; --accent-ink: #F7C27A;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121418; --surface: #1A1D22; --ink: #E6E8EC; --muted: #9BA2AF; --rule: #2D323B;
+  --code: #1F2329; --accent: #F0A73C; --accent-fill: #3A2A12; --accent-ink: #F7C27A;
+  color-scheme: dark;
+}
+
+body { background: var(--bg); color: var(--ink); font: 16px/1.62 var(--body); -webkit-font-smoothing: antialiased; }
+.page {
+  max-width: 48rem; margin: 0 auto;
+  padding-block: 40px 72px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 56px;
+}
+a { color: var(--accent-ink); text-underline-offset: 2px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+/* Header */
+.eyebrow { font: 500 12px/1.2 var(--mono); letter-spacing: .09em; text-transform: uppercase; color: var(--muted); margin: 0; }
+h1 { font: 700 clamp(2.8rem, 9vw, 4.25rem)/0.95 var(--display); letter-spacing: -0.005em; margin: 10px 0 14px; }
+.lede { font-size: 1.16rem; line-height: 1.55; max-width: 36em; margin: 0; text-wrap: pretty; }
+.wave-wrap { margin-top: 28px; }
+.wave-wrap canvas { display: block; width: 100%; height: 56px; }
+.wave-meta { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 6px; }
+.wave-file { margin: 0 0 8px; }
+.plate {
+  margin: 28px 0 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); overflow: hidden;
+}
+.plate div { padding: 12px 14px; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); margin-right: -1px; margin-bottom: -1px; min-width: 0; }
+.plate dt { font: 500 11px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.plate dd { margin: 4px 0 0; font-size: 15px; font-weight: 500; }
+.note { font-size: 14px; color: var(--muted); margin: 12px 0 0; }
+
+.toc { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 22px 0 0; padding: 0; list-style: none; font: 13px var(--mono); }
+.toc a { color: var(--muted); text-decoration: none; }
+.toc a:hover { color: var(--accent-ink); text-decoration: underline; }
+
+/* Sections */
+section { display: flex; flex-direction: column; gap: 16px; scroll-margin-top: 16px; }
+section > * { margin: 0; }
+h2 { font: 600 1.95rem/1.1 var(--display); letter-spacing: .005em; text-wrap: balance; padding-top: 22px; border-top: 1px solid var(--rule); }
+h3 { font: 600 1.2rem/1.25 var(--display); letter-spacing: .01em; text-wrap: balance; margin-top: 8px !important; }
+p, li { max-width: 65ch; }
+ul, ol { padding-left: 1.25em; }
+li + li { margin-top: .4em; }
+strong { font-weight: 600; }
+code { font: .88em var(--mono); background: var(--code); padding: .1em .36em; border-radius: 3px; overflow-wrap: anywhere; }
+pre { background: var(--code); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; overflow-x: auto; font: 13px/1.6 var(--mono); margin: 0; font-variant-numeric: tabular-nums; }
+pre code { background: none; padding: 0; font-size: inherit; overflow-wrap: normal; }
+.pr { color: var(--muted); user-select: none; }
+.c { color: var(--muted); }
+.k { color: var(--accent-ink); }
+
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px 32px; }
+.cols > div { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.cols h3 { margin-top: 0 !important; }
+.cols ul { margin: 0; }
+
+.key { display: grid; gap: 4px; }
+.tag { font: 600 11px/1.2 var(--mono); letter-spacing: .09em; text-transform: uppercase; color: var(--accent-ink); }
+
+/* Figures */
+figure { margin: 0; display: flex; flex-direction: column; gap: 10px; }
+.fig { border: 1px solid var(--rule); background: var(--surface); border-radius: 8px; padding: 16px; overflow-x: auto; }
+.fig svg { display: block; width: 100%; min-width: 640px; height: auto; }
+figcaption { font-size: 14px; color: var(--muted); max-width: 65ch; }
+figcaption b { color: var(--ink); font-weight: 600; }
+
+/* SVG parts */
+.d-box { fill: var(--surface); stroke: var(--ink); stroke-width: 1.25; }
+.d-acc-box { fill: var(--accent-fill); stroke: var(--accent); stroke-width: 1.25; }
+.d-group { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 5 5; }
+.d-line { fill: none; stroke: var(--ink); stroke-width: 1.25; }
+.d-line.d-acc { stroke: var(--accent); stroke-width: 1.5; }
+.d-dash { stroke-dasharray: 6 4; }
+.mk { fill: var(--ink); }
+.mk-acc { fill: var(--accent); }
+.d-t { font: 600 13px var(--body); fill: var(--ink); }
+.d-s { font: 12px var(--body); fill: var(--muted); }
+.d-s2 { font: 12px var(--body); fill: var(--ink); }
+.d-m { font: 12px var(--mono); fill: var(--ink); }
+.d-cap { font: 600 11px var(--mono); letter-spacing: .1em; fill: var(--muted); }
+.d-acc-t { fill: var(--accent-ink); }
+.d-seg { fill: var(--surface); stroke: var(--ink); stroke-width: 1.25; }
+.d-cut { fill: var(--accent-fill); stroke: var(--accent); stroke-width: 1.25; stroke-dasharray: 4 3; }
+.d-map { fill: var(--rule); opacity: .6; }
+.d-row { fill: var(--surface); stroke: var(--rule); }
+.d-cutt { font: 500 11px var(--body); fill: var(--accent-ink); }
+.d-tick { stroke: var(--muted); stroke-width: 1; }
+.d-tl { font: 11px var(--mono); fill: var(--muted); }
+.w-frame { fill: var(--bg); stroke: var(--ink); stroke-width: 1.25; }
+.w-sep { stroke: var(--rule); stroke-width: 1; }
+.w-dot { fill: var(--rule); }
+.w-btn { fill: var(--surface); stroke: var(--rule); }
+.w-panel { fill: var(--surface); stroke: var(--rule); }
+.w-sel { fill: var(--accent-fill); stroke: var(--accent); stroke-width: 1; }
+.w-wave { fill: var(--muted); opacity: .8; }
+.w-play { stroke: var(--ink); stroke-width: 1.5; }
+.w-playfill { fill: var(--ink); }
+.w-row { fill: none; stroke: var(--rule); }
+.w-hm { font: 11.5px var(--mono); fill: var(--ink); }
+.w-flag { font: 500 11px var(--body); fill: var(--accent-ink); }
+.w-btnc { fill: var(--surface); stroke: var(--ink); stroke-width: 1.25; }
+.w-meterbg { fill: var(--code); stroke: var(--rule); }
+.w-meterfg { fill: var(--muted); opacity: .65; }
+.w-hot { fill: var(--accent); }
+.w-live { fill: var(--accent); }
+
+/* Command list */
+.cmds { border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+.cmd { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 4px 20px; padding: 11px 14px; border-top: 1px solid var(--rule); align-items: baseline; }
+.cmd:first-child { border-top: 0; }
+.cmd code { background: none; padding: 0; font-size: 13px; color: var(--ink); }
+.cmd span { font-size: 14.5px; color: var(--muted); }
+@media (max-width: 640px) { .cmd { grid-template-columns: minmax(0, 1fr); } }
+
+/* Tables */
+.tbl { border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; line-height: 1.5; }
+th { text-align: left; font: 600 11px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 11px 14px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+td { padding: 10px 14px; border-top: 1px solid var(--rule); vertical-align: top; }
+tbody tr:first-child td { border-top: 0; }
+td:first-child { font-weight: 500; }
+td code { font-size: 12.5px; }
+.num { font-variant-numeric: tabular-nums; }
+table.w-wide { min-width: 560px; }
+kbd { font: 500 12px var(--mono); background: var(--code); border: 1px solid var(--rule); border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
+
+/* Milestones */
+.ms { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; }
+.ms li { display: grid; grid-template-columns: 4.2rem minmax(0, 1fr); gap: 4px 16px; padding: 16px 0; border-top: 1px solid var(--rule); margin: 0; max-width: none; }
+.ms li:first-child { border-top: 0; padding-top: 4px; }
+.ms .id { font: 700 1.6rem/1 var(--display); color: var(--accent-ink); font-variant-numeric: tabular-nums; }
+.ms .body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ms h3 { margin: 0 !important; }
+.ms p { margin: 0; }
+.ms .exit { font-size: 14.5px; }
+.ms .exit b { font: 600 11px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-right: 6px; }
+
+.refs { margin: 0; }
+.refs li { font-size: 14.5px; }
+footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(--rule); padding-top: 16px; }
+</style>
+
+<main class="page">
+  <header>
+    <p class="eyebrow">Product requirements · Draft</p>
+    <h1>scrubr</h1>
+    <p class="lede">An audio editor in Rust with two front ends over one engine. Agents edit by running commands in a shell. People review and refine the same project in a native Rune window.</p>
+
+    <div class="wave-wrap" aria-hidden="true">
+      <div class="wave-meta wave-file"><span>ep42.wav · 48 kHz · 24-bit · stereo</span></div>
+      <canvas id="hdrwave"></canvas>
+      <div class="wave-meta"><span>00:00:00.000</span><span>00:59:58.000</span></div>
+    </div>
+
+    <dl class="plate">
+      <div><dt>Status</dt><dd>Draft</dd></div>
+      <div><dt>Owner</dt><dd>Neil</dd></div>
+      <div><dt>Updated</dt><dd>12 Nov 2026</dd></div>
+      <div><dt>Platforms</dt><dd>macOS · Windows · Linux</dd></div>
+      <div><dt>Language</dt><dd>Rust</dd></div>
+      <div><dt>GUI</dt><dd>Rune (pre-release)</dd></div>
+      <div><dt>Agent interface</dt><dd>CLI with JSON output</dd></div>
+      <div><dt>License</dt><dd>MIT / Apache-2.0 (proposed)</dd></div>
+    </dl>
+    <p class="note">The name comes from scrubbing, which is dragging the playhead to hear audio at the cursor. The code lives at <a href="https://github.com/nam37/scrubr" target="_blank" rel="noopener">github.com/nam37/scrubr</a>.</p>
+
+    <ul class="toc" aria-label="Sections">
+      <li><a href="#idea">Idea</a></li>
+      <li><a href="#why">Why</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#model">Project model</a></li>
+      <li><a href="#cli">CLI</a></li>
+      <li><a href="#gui">GUI</a></li>
+      <li><a href="#shared">Shared editing</a></li>
+      <li><a href="#analysis">Analysis</a></li>
+      <li><a href="#stack">Stack</a></li>
+      <li><a href="#milestones">Milestones</a></li>
+      <li><a href="#risks">Risks</a></li>
+      <li><a href="#questions">Open questions</a></li>
+    </ul>
+  </header>
+
+  <section id="idea">
+    <h2>The idea</h2>
+    <p>Coding agents such as Claude Code and Codex edit audio by running <code>scrubr</code> commands and reading JSON back. People open the same project in a GPU-rendered window built with Rune, hear every edit the agent made, see who made it, and keep or undo each one.</p>
+    <p>Edits are non-destructive. Source files are never modified. A project is a list of edits applied to the sources, and audio is rendered only when you export. That shared edit list is what lets an agent and a person work on one project.</p>
+  </section>
+
+  <section id="why">
+    <h2>Why build it</h2>
+    <p>Agent-facing audio tools exist, but each one depends on something else:</p>
+    <ul>
+      <li><strong>AudacityMCP</strong> exposes 131 tools, but works by driving a running copy of Audacity through its scripting pipe.</li>
+      <li><strong>Audionaut's MCP server</strong> needs the Audionaut app installed.</li>
+      <li><strong>Others</strong> wrap FFmpeg in a Python server or call a hosted API, such as VocalRemover and MixMake.</li>
+    </ul>
+    <p>On the editor side, Rust terminal editors are small or dormant. Sampitor, the closest match, is about 1,000 lines and was last pushed in January 2023.</p>
+    <p>No tool ships as one native binary where an agent and a person share an engine, a project file and a history. Agents already work well from a shell, so a careful CLI is enough and scrubr does not need an MCP server.</p>
+  </section>
+
+  <section id="goals">
+    <h2>Goals</h2>
+    <div class="cols">
+      <div>
+        <h3>In scope</h3>
+        <ul>
+          <li>An agent can finish a real editing job using only the CLI and the agent guide.</li>
+          <li>A person can open that project, hear each edit, see who made it, and undo or adjust it.</li>
+          <li>Edits are sample-accurate, non-destructive and deterministic.</li>
+          <li>One binary for macOS, Windows and Linux.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Not in v1</h3>
+        <ul>
+          <li>Multitrack mixing, recording and MIDI</li>
+          <li>Plugin hosting (VST3, LV2, AU)</li>
+          <li>Real-time effect previews</li>
+          <li>A web build. Rune's web target is experimental and WebGPU-only.</li>
+          <li>Any GPL-licensed code, including Audacity's. scrubr is written from scratch.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="users">
+    <h2>Who uses it</h2>
+    <div class="cols">
+      <div>
+        <h3>Agents</h3>
+        <p>Claude Code, Codex, shell scripts and CI jobs. They need commands they can learn from help text, structured output, a stable way to address time, a way to judge audio through numbers and images, and safe retries when the project changes underneath them.</p>
+      </div>
+      <div>
+        <h3>People</h3>
+        <p>Whoever reviews the agent's work, starting with Neil. They need fast navigation through long recordings, playback, a clear history that shows who made each edit, and keyboard-driven editing.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <h2>Architecture</h2>
+    <figure>
+      <div class="fig">
+        <svg viewBox="0 0 800 430" role="img" aria-label="Agents call the CLI and people use the GUI. Both are front ends in one scrubr binary over a shared core library. The core reads source audio, writes exports, and appends edits to one project file, which the GUI watches for changes.">
+          <defs>
+            <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
+            <marker id="a1acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mk-acc" d="M0,1 L10,5 L0,9 z"/></marker>
+          </defs>
+
+          <rect class="d-group" x="24" y="112" width="732" height="206" rx="10"/>
+          <text class="d-cap" x="390" y="152" text-anchor="middle">ONE BINARY</text>
+          <text class="d-m" x="390" y="174" text-anchor="middle">scrubr cut …  ·  scrubr open</text>
+
+          <rect class="d-box" x="40" y="20" width="180" height="56" rx="6"/>
+          <text class="d-t" x="130" y="44" text-anchor="middle">Agent</text>
+          <text class="d-s" x="130" y="63" text-anchor="middle">Claude Code, Codex</text>
+
+          <rect class="d-box" x="560" y="20" width="180" height="56" rx="6"/>
+          <text class="d-t" x="650" y="44" text-anchor="middle">You</text>
+          <text class="d-s" x="650" y="63" text-anchor="middle">mouse, keyboard</text>
+
+          <line class="d-line" x1="110" y1="76" x2="110" y2="128" marker-end="url(#a1)"/>
+          <text class="d-s" x="102" y="106" text-anchor="end">commands</text>
+          <line class="d-line" x1="150" y1="130" x2="150" y2="78" marker-end="url(#a1)"/>
+          <text class="d-s" x="158" y="106">JSON, PNG</text>
+
+          <line class="d-line" x1="650" y1="76" x2="650" y2="128" marker-end="url(#a1)"/>
+          <text class="d-s" x="658" y="106">edits, playback</text>
+
+          <rect class="d-box" x="40" y="130" width="180" height="56" rx="6"/>
+          <text class="d-t" x="130" y="154" text-anchor="middle">CLI</text>
+          <text class="d-s" x="130" y="173" text-anchor="middle">subcommands · JSON out</text>
+
+          <rect class="d-box" x="560" y="130" width="180" height="56" rx="6"/>
+          <text class="d-t" x="650" y="154" text-anchor="middle">GUI</text>
+          <text class="d-s" x="650" y="173" text-anchor="middle">Rune window · cpal audio</text>
+
+          <rect class="d-box" x="200" y="236" width="380" height="62" rx="6"/>
+          <text class="d-t" x="390" y="261" text-anchor="middle">Core library</text>
+          <text class="d-s" x="390" y="281" text-anchor="middle">edit log · decode/encode · DSP · analysis · peak cache</text>
+
+          <polyline class="d-line" points="130,186 130,267 198,267" marker-end="url(#a1)"/>
+          <text class="d-s" x="138" y="228">calls</text>
+          <polyline class="d-line" points="650,186 650,267 582,267" marker-end="url(#a1)"/>
+          <text class="d-s" x="642" y="228" text-anchor="end">calls</text>
+
+          <rect class="d-box" x="40" y="360" width="180" height="52" rx="6"/>
+          <text class="d-t" x="130" y="382" text-anchor="middle">Source audio</text>
+          <text class="d-s" x="130" y="400" text-anchor="middle">read-only</text>
+
+          <rect class="d-box" x="300" y="360" width="180" height="52" rx="6"/>
+          <text class="d-t" x="390" y="382" text-anchor="middle">Exports</text>
+          <text class="d-s" x="390" y="400" text-anchor="middle">WAV · FLAC · MP3</text>
+
+          <rect class="d-acc-box" x="560" y="360" width="180" height="52" rx="6"/>
+          <text class="d-t" x="650" y="382" text-anchor="middle">Project file</text>
+          <text class="d-m" x="650" y="400" text-anchor="middle">ep42.scrubr</text>
+
+          <polyline class="d-line" points="240,298 240,340 130,340 130,358" marker-end="url(#a1)"/>
+          <text class="d-s" x="185" y="334" text-anchor="middle">reads</text>
+          <line class="d-line" x1="390" y1="298" x2="390" y2="358" marker-end="url(#a1)"/>
+          <text class="d-s" x="398" y="334">renders</text>
+          <polyline class="d-line d-acc" points="540,300 540,340 650,340 650,358" marker-start="url(#a1acc)" marker-end="url(#a1acc)"/>
+          <text class="d-s d-acc-t" x="595" y="334" text-anchor="middle">appends edits</text>
+
+          <polyline class="d-line d-acc d-dash" points="740,386 770,386 770,158 742,158" marker-end="url(#a1acc)"/>
+          <text class="d-s d-acc-t" transform="translate(786 272) rotate(-90)" text-anchor="middle">watches for changes</text>
+        </svg>
+      </div>
+      <figcaption><b>One binary, one engine, one project file.</b> The CLI and the GUI are thin front ends over the same core. Both write edits to the project file, and the GUI reloads whenever an agent changes it.</figcaption>
+    </figure>
+    <p>The binary is named <code>scrubr</code>. With a subcommand it runs as a CLI and exits. With <code>open</code>, or with no arguments, it opens the GUI. It is built from three crates:</p>
+    <ul>
+      <li><code>scrubr-core</code>: project model, edit log, decoding and encoding, DSP, analysis, peak cache and PNG rendering. No UI dependencies.</li>
+      <li><code>scrubr-cli</code>: argument and time parsing, JSON and text output.</li>
+      <li><code>scrubr-gui</code>: the Rune app and cpal playback.</li>
+    </ul>
+    <p>The core never depends on Rune. If Rune stalls, the GUI can move to another toolkit without touching the engine or the CLI.</p>
+  </section>
+
+  <section id="model">
+    <h2>Project model</h2>
+    <figure>
+      <div class="fig">
+        <svg viewBox="0 0 800 240" role="img" aria-label="The source file has five ranges, A to E. The edit log cuts B and D. The timeline at head is A, C and E joined end to end; the source file itself is unchanged.">
+          <defs>
+            <marker id="a2acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path class="mk-acc" d="M0,1 L10,5 L0,9 z"/></marker>
+          </defs>
+          <text class="d-s" x="40" y="28">Source · raw/ep42.wav · never modified</text>
+
+          <polygon class="d-map" points="40,74 200,74 200,170 40,170"/>
+          <polygon class="d-map" points="250,74 410,74 360,170 200,170"/>
+          <polygon class="d-map" points="440,74 560,74 480,170 360,170"/>
+
+          <rect class="d-seg" x="40" y="40" width="160" height="34"/>
+          <rect class="d-cut" x="200" y="40" width="50" height="34"/>
+          <rect class="d-seg" x="250" y="40" width="160" height="34"/>
+          <rect class="d-cut" x="410" y="40" width="30" height="34"/>
+          <rect class="d-seg" x="440" y="40" width="120" height="34"/>
+          <text class="d-t" x="120" y="62" text-anchor="middle">A</text>
+          <text class="d-t d-acc-t" x="225" y="62" text-anchor="middle">B</text>
+          <text class="d-t" x="330" y="62" text-anchor="middle">C</text>
+          <text class="d-t d-acc-t" x="425" y="62" text-anchor="middle">D</text>
+          <text class="d-t" x="500" y="62" text-anchor="middle">E</text>
+          <text class="d-cutt" x="218" y="94" text-anchor="middle">cut</text>
+          <text class="d-cutt" x="411" y="94" text-anchor="middle">cut</text>
+
+          <rect class="d-seg" x="40" y="170" width="160" height="34"/>
+          <rect class="d-seg" x="200" y="170" width="160" height="34"/>
+          <rect class="d-seg" x="360" y="170" width="120" height="34"/>
+          <text class="d-t" x="120" y="192" text-anchor="middle">A</text>
+          <text class="d-t" x="280" y="192" text-anchor="middle">C</text>
+          <text class="d-t" x="420" y="192" text-anchor="middle">E</text>
+          <text class="d-s" x="40" y="226">Timeline at head · what you hear and export</text>
+
+          <text class="d-t" x="590" y="28">Edit log</text>
+          <rect class="d-row" x="590" y="40" width="180" height="24" rx="3"/>
+          <text class="d-m" x="600" y="56">1  import ep42.wav</text>
+          <rect class="d-row" x="590" y="68" width="180" height="24" rx="3"/>
+          <text class="d-m" x="600" y="84">2  cut B</text>
+          <rect class="d-row" x="590" y="96" width="180" height="24" rx="3"/>
+          <text class="d-m" x="600" y="112">3  cut D</text>
+          <rect class="d-row" x="590" y="124" width="180" height="24" rx="3"/>
+          <text class="d-m" x="600" y="140">4  normalize −16 LUFS</text>
+          <rect class="d-acc-box" x="590" y="152" width="180" height="24" rx="3"/>
+          <text class="d-m" x="600" y="168">5  fade in 0.5 s</text>
+          <text class="d-s d-acc-t" x="574" y="168" text-anchor="end">head</text>
+          <line class="d-line d-acc" x1="577" y1="164" x2="588" y2="164" marker-end="url(#a2acc)"/>
+        </svg>
+      </div>
+      <figcaption><b>The timeline is computed, not stored.</b> Applying the log up to head drops ranges B and D, and the gain edits apply at render time. Undo moves head up one row. No audio is rewritten until export.</figcaption>
+    </figure>
+    <p>A project file holds the sources, the edit log, labels and a head pointer. This example shows the last two edits of an agent session:</p>
+<pre><code>{
+  "format": 1,
+  "version": 7,
+  "sample_rate": 48000,
+  "channels": 2,
+  "sources": [
+    { "id": "src1", "path": "raw/ep42.wav", "frames": 172704000,
+      "bytes": 1036224044, "mtime": "2026-11-10T09:14:02Z", "hash": "blake3:9f2c…" }
+  ],
+  "edits": [
+    { "id": "e4", "op": "normalize", "lufs": -16.0, "gain_db": 5.4, "author": "codex", "session": "s7" },
+    { "id": "e5", "op": "cut", "spans": [["src1", 37932000, 38251200]], "author": "codex", "session": "s7" }
+  ],
+  "head": "e5",
+  "labels": [
+    { "span": ["src1", 44935200, 45016800], "text": "check: cough?", "author": "codex" }
+  ]
+}</code></pre>
+    <ul>
+      <li>Edits and labels are stored in source coordinates: a source id and a frame range in that source. Commands still address the timeline. The engine resolves a timeline range to source spans when the edit is made, so <code>["src1", 37932000, 38251200]</code> is the audio that sat at 12:03.250 to 12:09.900 on the timeline at that moment.</li>
+      <li>Spans point at the source, so an edit keeps its meaning when an earlier edit is undone. Removing one session's edits from the middle of the log does not move later edits or labels.</li>
+      <li>Normalize stores the gain it resolved (<code>gain_db</code>) next to its target, so replaying the log never re-measures the timeline.</li>
+      <li>Each source is stored with its size, modified time and a BLAKE3 hash. Every command compares size and modified time. The full hash is checked when either differs, and always before export. If a source has changed, commands stop with an error instead of editing against different audio.</li>
+      <li>Peak data for drawing lives in a cache folder next to the project and is rebuilt when missing.</li>
+      <li><code>version</code> increases on every write. Writers use it to detect each other, and agents pass it back with <code>--if-version</code>.</li>
+    </ul>
+  </section>
+
+  <section id="cli">
+    <h2>CLI for agents</h2>
+    <p>The CLI follows five rules:</p>
+    <ul>
+      <li>Commands name the project file and change it in place. Many small commands are cheap because nothing is rendered until export.</li>
+      <li>Output is JSON when stdout is not a terminal or when <code>--json</code> is passed, and readable text otherwise. Every JSON reply includes <code>ok</code> and <code>project_version</code>.</li>
+      <li><code>--dry-run</code> on any edit command reports what would change without writing.</li>
+      <li><code>--if-version N</code> on any edit command refuses the edit, with exit code 3, unless the project is still at version N. Positions an agent worked out from an earlier reply are only valid for that version.</li>
+      <li>Errors say what went wrong and what to run next.</li>
+    </ul>
+
+    <h3>Commands</h3>
+    <div class="cmds">
+      <div class="cmd"><code>scrubr new ep42.scrubr --from raw/ep42.wav</code><span>Create a project from one or more files and build the peak cache.</span></div>
+      <div class="cmd"><code>scrubr info ep42.scrubr</code><span>Timeline length, format, sources, head and version.</span></div>
+      <div class="cmd"><code>scrubr analyze ep42.scrubr --loudness --silence -45dB:1s</code><span>Measurements as JSON. See Analysis.</span></div>
+      <div class="cmd"><code>scrubr render ep42.scrubr --png check.png --range 11:50..12:20</code><span>Waveform image of the timeline or a range.</span></div>
+      <div class="cmd"><code>scrubr cut ep42.scrubr 12:03.25..12:09.9</code><span>Remove a range.</span></div>
+      <div class="cmd"><code>scrubr keep ep42.scrubr 0:41..58:10</code><span>Remove everything outside a range.</span></div>
+      <div class="cmd"><code>scrubr gain ep42.scrubr +2dB --range 0..0:41</code><span>Change the level of the timeline or a range.</span></div>
+      <div class="cmd"><code>scrubr fade ep42.scrubr in 0.5s</code><span>Fade in or out at either end, or across a range.</span></div>
+      <div class="cmd"><code>scrubr normalize ep42.scrubr --lufs -16</code><span>Normalize to integrated loudness, or to a peak with <code>--peak -1dB</code>. Gain stops at a true-peak ceiling, −1 dBTP by default.</span></div>
+      <div class="cmd"><code>scrubr mute ep42.scrubr 30:12..30:13.4</code><span>Replace a range with silence and keep its length.</span></div>
+      <div class="cmd"><code>scrubr insert ep42.scrubr sting.wav --at 0</code><span>Insert another file, resampled if its rate differs.</span></div>
+      <div class="cmd"><code>scrubr apply ep42.scrubr --ops cuts.json</code><span>Several operations in one write and one undo step.</span></div>
+      <div class="cmd"><code>scrubr undo | redo | history ep42.scrubr</code><span>Move head, or list edits with author and session.</span></div>
+      <div class="cmd"><code>scrubr label ep42.scrubr add 14:18.5..14:20.2 "check: cough?"</code><span>Leave a note for the person reviewing.</span></div>
+      <div class="cmd"><code>scrubr export ep42.scrubr out/ep42.flac</code><span>Render head to WAV, FLAC or MP3.</span></div>
+      <div class="cmd"><code>scrubr help --agent</code><span>Print the agent guide.</span></div>
+      <div class="cmd"><code>scrubr open ep42.scrubr</code><span>Open the GUI. Plain <code>scrubr</code> opens it empty.</span></div>
+    </div>
+
+    <h3>Addressing time</h3>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Form</th><th>Example</th><th>Meaning</th></tr></thead>
+        <tbody class="num">
+          <tr><td>Seconds</td><td><code>723.25</code></td><td>Seconds from the start of the timeline</td></tr>
+          <tr><td>Timecode</td><td><code>12:03.250</code>, <code>1:02:03.250</code></td><td>Minutes or hours, seconds and milliseconds</td></tr>
+          <tr><td>Frames</td><td><code>34716000f</code></td><td>Exact sample position, for sample-accurate edits</td></tr>
+          <tr><td>Range</td><td><code>12:03.25..12:09.9</code></td><td>Start and end in any of the forms above</td></tr>
+          <tr><td>End</td><td><code>end</code>, <code>end-2s</code></td><td>Relative to the end of the timeline</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="key"><span class="tag">Batch rule</span>In <code>scrubr apply</code>, every range refers to the timeline as it was before the batch. The engine resolves them all against that one timeline. An agent can cut all 38 silences found by one <code>analyze</code> call in one step, without recomputing positions after each cut.</p>
+
+    <h3>Example session</h3>
+    <p>You imported the episode and trimmed both ends. The agent takes it from there:</p>
+<pre><code><span class="pr">$</span> export SCRUBR_AUTHOR=codex SCRUBR_SESSION=s7
+<span class="pr">$</span> scrubr analyze ep42.scrubr --loudness --silence -45dB:1s &gt; report.json
+<span class="c"># agent turns report.silence into cuts.json</span>
+<span class="pr">$</span> scrubr apply ep42.scrubr --ops cuts.json --if-version 2
+<span class="pr">$</span> scrubr normalize ep42.scrubr --lufs -16
+<span class="pr">$</span> scrubr cut ep42.scrubr 12:03.25..12:09.9
+<span class="pr">$</span> scrubr label ep42.scrubr add 14:18.5..14:20.2 "check: cough?"
+<span class="pr">$</span> scrubr render ep42.scrubr --png check.png
+<span class="pr">$</span> scrubr export ep42.scrubr out/ep42.flac</code></pre>
+    <p>The analyze call returns:</p>
+<pre><code>{
+  "ok": true,
+  "project_version": 2,
+  "timeline_seconds": 3449.0,
+  "loudness": { "integrated_lufs": -21.4, "true_peak_dbtp": -7.2, "range_lu": 8.1 },
+  "silence": [
+    { "start": 3.20, "end": 4.85 },
+    { "start": 412.10, "end": 414.02 }
+  ],
+  "silence_count": 38
+}</code></pre>
+    <p>The agent passes that <code>project_version</code> back as <code>--if-version 2</code>. If you edited the project after the analysis, the cuts are refused instead of landing in the wrong places.</p>
+    <p>Normalize never pushes the true peak past its ceiling. Here +5.4 dB takes the peak from −7.2 to −1.8 dBTP, so the target is reached. Had the peak been −5.1 dBTP, the gain would stop at +4.1 dB and the reply would say so:</p>
+<pre><code>{
+  "ok": true,
+  "project_version": 4,
+  "target_lufs": -16.0,
+  "achieved_lufs": -17.3,
+  "gain_db": 4.1,
+  "limited_by": "true_peak",
+  "ceiling_dbtp": -1.0
+}</code></pre>
+
+    <h3>Errors and exit codes</h3>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th><th>What the agent does</th></tr></thead>
+        <tbody>
+          <tr><td class="num">0</td><td>Success</td><td>Continue</td></tr>
+          <tr><td class="num">1</td><td>Bad usage, such as an unknown flag or unreadable time</td><td>Fix the command</td></tr>
+          <tr><td class="num">2</td><td>Project or file not found</td><td>Check the path</td></tr>
+          <tr><td class="num">3</td><td>Version conflict: the project changed since the version the command expected</td><td>Re-read the project, recompute positions and retry</td></tr>
+          <tr><td class="num">4</td><td>A source file changed on disk</td><td>Stop and tell the person</td></tr>
+          <tr><td class="num">5</td><td>Decode or encode failure</td><td>Report the file and format</td></tr>
+        </tbody>
+      </table>
+    </div>
+<pre><code>{
+  "ok": false,
+  "error": {
+    "code": "range_out_of_bounds",
+    "message": "End 3605.0s is past the end of the timeline (3449.0s).",
+    "hint": "Run `scrubr info ep42.scrubr` to get the timeline length."
+  }
+}</code></pre>
+
+    <h3>Agent guide</h3>
+    <p><code>scrubr help --agent</code> prints a one-page guide: the workflow, time addressing, the batch rule, version checks, exit codes and a worked example. The repo ships the same text as <code>AGENTS.md</code>, so Codex and Claude Code pick it up when working in a project folder.</p>
+  </section>
+
+  <section id="gui">
+    <h2>GUI for people</h2>
+    <figure>
+      <div class="fig">
+        <svg viewBox="0 0 800 450" role="img" aria-label="Sketch of the scrubr window: a toolbar with a selection readout, a stereo waveform with a selection and playhead, a label left by the agent, a history panel listing three edits by codex and two by you with an Undo codex session button, and a transport bar with position, level meters and live status.">
+          <rect class="w-frame" x="10" y="10" width="780" height="430" rx="10"/>
+          <circle class="w-dot" cx="30" cy="26" r="5"/>
+          <circle class="w-dot" cx="46" cy="26" r="5"/>
+          <circle class="w-dot" cx="62" cy="26" r="5"/>
+          <text class="d-s" x="400" y="31" text-anchor="middle">ep42.scrubr</text>
+          <line class="w-sep" x1="10" y1="42" x2="790" y2="42"/>
+
+          <rect class="w-btn" x="24" y="52" width="56" height="24" rx="4"/>
+          <text class="d-s2" x="52" y="68" text-anchor="middle">Open</text>
+          <rect class="w-btn" x="86" y="52" width="56" height="24" rx="4"/>
+          <text class="d-s2" x="114" y="68" text-anchor="middle">Undo</text>
+          <rect class="w-btn" x="148" y="52" width="56" height="24" rx="4"/>
+          <text class="d-s2" x="176" y="68" text-anchor="middle">Redo</text>
+          <rect class="w-btn" x="210" y="52" width="56" height="24" rx="4"/>
+          <text class="d-s2" x="238" y="68" text-anchor="middle">Export</text>
+          <text class="d-m" x="776" y="68" text-anchor="end">12:03.250 → 12:09.900 · 6.650 s</text>
+          <line class="w-sep" x1="10" y1="84" x2="790" y2="84"/>
+
+          <rect class="w-panel" x="24" y="92" width="556" height="288" rx="4"/>
+          <line class="w-sep" x1="24" y1="114" x2="580" y2="114"/>
+          <line class="d-tick" x1="45" y1="109" x2="45" y2="114"/>
+          <line class="d-tick" x1="90" y1="106" x2="90" y2="114"/>
+          <line class="d-tick" x1="135" y1="109" x2="135" y2="114"/>
+          <line class="d-tick" x1="181" y1="106" x2="181" y2="114"/>
+          <line class="d-tick" x1="226" y1="109" x2="226" y2="114"/>
+          <line class="d-tick" x1="271" y1="106" x2="271" y2="114"/>
+          <line class="d-tick" x1="316" y1="109" x2="316" y2="114"/>
+          <line class="d-tick" x1="361" y1="106" x2="361" y2="114"/>
+          <line class="d-tick" x1="406" y1="109" x2="406" y2="114"/>
+          <line class="d-tick" x1="451" y1="106" x2="451" y2="114"/>
+          <line class="d-tick" x1="496" y1="109" x2="496" y2="114"/>
+          <line class="d-tick" x1="541" y1="106" x2="541" y2="114"/>
+          <text class="d-tl" x="90" y="103" text-anchor="middle">11:40</text>
+          <text class="d-tl" x="181" y="103" text-anchor="middle">11:50</text>
+          <text class="d-tl" x="271" y="103" text-anchor="middle">12:00</text>
+          <text class="d-tl" x="361" y="103" text-anchor="middle">12:10</text>
+          <text class="d-tl" x="451" y="103" text-anchor="middle">12:20</text>
+          <text class="d-tl" x="541" y="103" text-anchor="middle">12:30</text>
+
+          <rect class="w-sel" x="300" y="114" width="60" height="234"/>
+          <polygon class="w-wave" points="40,152 48,139 56,131 64,133 72,128 80,128 88,129 96,133 104,150 112,160 120,150 128,151 136,145 144,155 152,154 160,153 168,165 176,161 184,159 192,167 200,166 208,154 216,141 224,145 232,151 240,152 248,158 256,153 264,144 272,134 280,132 288,131 296,134 304,136 312,143 320,152 328,141 336,140 344,137 352,143 360,136 368,141 376,160 384,167 392,164 400,160 408,152 416,154 424,147 432,148 440,157 448,157 456,166 464,169 472,170 480,170 488,151 496,140 504,130 512,135 520,144 528,141 536,136 544,131 552,132 560,132 568,134 576,136 576,207 568,209 560,211 552,211 544,212 536,207 528,203 520,200 512,208 504,213 496,203 488,193 480,175 472,176 464,177 456,179 448,187 440,188 432,196 424,197 416,191 408,192 400,185 392,181 384,179 376,185 368,202 360,207 352,200 344,206 336,203 328,202 320,192 312,200 304,207 296,209 288,211 280,211 272,209 264,200 256,191 248,187 240,193 232,193 224,199 216,203 208,191 200,179 192,179 184,186 176,184 168,181 160,191 152,191 144,190 136,199 128,193 120,194 112,185 104,194 96,210 88,214 80,214 72,215 64,210 56,211 48,205 40,192"/>
+          <polygon class="w-wave" points="40,251 48,241 56,247 64,248 72,239 80,240 88,247 96,260 104,261 112,260 120,258 128,263 136,262 144,266 152,267 160,268 168,271 176,277 184,277 192,275 200,275 208,274 216,268 224,270 232,271 240,262 248,260 256,253 264,251 272,251 280,247 288,252 296,251 304,246 312,250 320,257 328,246 336,243 344,244 352,246 360,255 368,263 376,276 384,270 392,266 400,273 408,265 416,263 424,269 432,273 440,276 448,269 456,279 464,283 472,284 480,284 488,253 496,252 504,252 512,248 520,248 528,249 536,249 544,246 552,241 560,251 568,249 576,263 576,309 568,322 560,320 552,330 544,324 536,322 528,322 520,323 512,323 504,319 496,320 488,318 480,289 472,290 464,291 456,294 448,304 440,297 432,300 424,304 416,309 408,307 400,300 392,307 384,303 376,297 368,309 360,316 352,324 344,326 336,328 328,325 320,315 312,321 304,324 296,320 288,320 280,324 272,320 264,320 256,318 248,312 240,310 232,302 224,303 216,305 208,299 200,298 192,298 184,296 176,296 168,302 160,304 152,305 144,306 136,310 128,309 120,314 112,312 104,311 96,312 88,323 80,330 72,331 64,323 56,324 48,329 40,320"/>
+          <text class="d-s" x="31" y="177" text-anchor="middle">L</text>
+          <text class="d-s" x="31" y="291" text-anchor="middle">R</text>
+          <line class="w-play" x1="284" y1="114" x2="284" y2="376"/>
+          <polygon class="w-playfill" points="279,108 289,108 284,114"/>
+
+          <line class="w-sep" x1="24" y1="348" x2="580" y2="348"/>
+          <rect class="d-acc-box" x="470" y="354" width="104" height="20" rx="3"/>
+          <text class="w-flag" x="478" y="368">check: cough?</text>
+
+          <rect class="w-panel" x="592" y="92" width="184" height="288" rx="4"/>
+          <text class="d-t" x="604" y="113">History</text>
+          <rect class="d-acc-box" x="600" y="122" width="168" height="40" rx="3"/>
+          <text class="w-hm" x="610" y="139">cut 12:03.25–12:09.90</text>
+          <text class="d-s" x="610" y="155">e5 · codex · just now</text>
+          <rect class="w-row" x="600" y="166" width="168" height="40" rx="3"/>
+          <text class="w-hm" x="610" y="183">normalize −16 LUFS</text>
+          <text class="d-s" x="610" y="199">e4 · codex</text>
+          <rect class="w-row" x="600" y="210" width="168" height="40" rx="3"/>
+          <text class="w-hm" x="610" y="227">cut silence ×38</text>
+          <text class="d-s" x="610" y="243">e3 · codex</text>
+          <rect class="w-row" x="600" y="254" width="168" height="40" rx="3"/>
+          <text class="w-hm" x="610" y="271">keep 0:41–58:10</text>
+          <text class="d-s" x="610" y="287">e2 · you</text>
+          <rect class="w-row" x="600" y="298" width="168" height="40" rx="3"/>
+          <text class="w-hm" x="610" y="315">import ep42.wav</text>
+          <text class="d-s" x="610" y="331">e1 · you</text>
+          <rect class="w-btn" x="600" y="346" width="168" height="26" rx="4"/>
+          <text class="d-s2" x="684" y="363" text-anchor="middle">Undo codex session</text>
+
+          <line class="w-sep" x1="10" y1="392" x2="790" y2="392"/>
+          <circle class="w-btnc" cx="44" cy="416" r="14"/>
+          <polygon class="w-playfill" points="39,408 39,424 52,416"/>
+          <text class="d-m" x="70" y="421">12:01.480 / 54:18.200</text>
+          <text class="d-s" x="256" y="413" text-anchor="end">L</text>
+          <text class="d-s" x="256" y="427" text-anchor="end">R</text>
+          <rect class="w-meterbg" x="262" y="406" width="200" height="7" rx="1"/>
+          <rect class="w-meterbg" x="262" y="420" width="200" height="7" rx="1"/>
+          <rect class="w-meterfg" x="262" y="406" width="124" height="7"/>
+          <rect class="w-hot" x="386" y="406" width="16" height="7"/>
+          <rect class="w-meterfg" x="262" y="420" width="116" height="7"/>
+          <rect class="w-hot" x="378" y="420" width="10" height="7"/>
+          <text class="d-s" x="776" y="421" text-anchor="end"><tspan class="w-live">●</tspan> Live · codex edited just now</text>
+        </svg>
+      </div>
+      <figcaption><b>Reviewing an agent's work.</b> The selection matches the agent's last cut, its note sits in the labels lane, and one button reverts the whole agent session. This is a layout sketch, not final visual design.</figcaption>
+    </figure>
+    <ul>
+      <li>Stereo waveform drawn from the peak cache, with smooth zoom from the whole file down to single samples.</li>
+      <li>Timecode ruler, selection with an exact readout, and playback with a moving playhead.</li>
+      <li>History panel listing each edit with its author and session. Selecting a row jumps to that spot.</li>
+      <li>Labels lane showing notes agents leave for review.</li>
+      <li>Live reload when the project file changes on disk.</li>
+    </ul>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>Space</kbd></td><td>Play or pause</td></tr>
+          <tr><td><kbd>I</kbd> <kbd>O</kbd></td><td>Set selection start or end at the playhead</td></tr>
+          <tr><td><kbd>Delete</kbd></td><td>Cut the selection</td></tr>
+          <tr><td><kbd>Ctrl/Cmd Z</kbd>, <kbd>Shift Ctrl/Cmd Z</kbd></td><td>Undo, redo</td></tr>
+          <tr><td><kbd>Ctrl/Cmd</kbd> + scroll</td><td>Zoom around the pointer</td></tr>
+          <tr><td><kbd>Z</kbd>, <kbd>F</kbd></td><td>Zoom to selection, fit the whole timeline</td></tr>
+          <tr><td><kbd>L</kbd></td><td>Add a label at the selection</td></tr>
+          <tr><td><kbd>Ctrl/Cmd E</kbd></td><td>Export</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="shared">
+    <h2>Shared editing</h2>
+    <p>An agent and a person can edit one project in the same sitting without losing work.</p>
+    <ul>
+      <li><strong>Locked, versioned writes.</strong> A command takes an OS file lock next to the project, reads the project, checks the version, writes a temporary file and renames it over the project. The lock makes the check and the rename one step, so two writers can't both pass. A killed command releases the lock and leaves the previous version intact. On Windows the rename is retried briefly if another program has the file open.</li>
+      <li><strong>Version checks.</strong> An agent that worked out positions at version N passes <code>--if-version N</code>. If you edited in between, the command exits with code 3, and the agent re-reads and recomputes instead of cutting stale positions.</li>
+      <li><strong>Live reload.</strong> The GUI watches the project file. When it changes, the GUI reloads, keeps your view and playhead, and shows a short notice naming the new edit.</li>
+      <li><strong>Authorship.</strong> Every edit records an author and a session, taken from <code>--author</code> and <code>--session</code> or the <code>SCRUBR_AUTHOR</code> and <code>SCRUBR_SESSION</code> environment variables. Edits made in the GUI are recorded as "you".</li>
+      <li><strong>Session undo.</strong> One action reverts everything an agent did in one run, even when your own edits came after it. Edits are stored in source coordinates, so your later edits and labels stay where they were.</li>
+      <li><strong>Notes in both directions.</strong> Agents mark spots they are unsure about with labels. Your GUI edits appear in <code>scrubr history</code>, so the agent can see what you changed.</li>
+    </ul>
+  </section>
+
+  <section id="analysis">
+    <h2>How an agent hears</h2>
+    <p>Agents can't listen, so measurement is a core feature, not an add-on.</p>
+    <div class="tbl">
+      <table class="w-wide">
+        <thead><tr><th>Measure</th><th>Command</th><th>Returns</th></tr></thead>
+        <tbody>
+          <tr><td>Loudness</td><td><code>analyze --loudness</code></td><td>Integrated LUFS, loudness range and true peak (EBU R128)</td></tr>
+          <tr><td>Peaks and clipping</td><td><code>analyze --peaks</code></td><td>Sample peak per channel, clipped sample count and ranges</td></tr>
+          <tr><td>Silence</td><td><code>analyze --silence -45dB:1s</code></td><td>Ranges below the threshold for at least the given duration</td></tr>
+          <tr><td>Level envelope</td><td><code>analyze --envelope 1s</code></td><td>RMS level in dBFS per window, for finding loud and quiet stretches</td></tr>
+          <tr><td>Waveform image</td><td><code>render --png</code></td><td>PNG of the timeline or a range, drawn by the core without a GPU</td></tr>
+          <tr><td>Spectrogram (M4)</td><td><code>render --spectrogram</code></td><td>PNG for spotting hum, hiss and clicks</td></tr>
+          <tr><td>Transcript (M4)</td><td><code>transcribe</code></td><td>Words with start and end times, so an agent can cut by phrase</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="stack">
+    <h2>Technology</h2>
+    <p>Candidate crates. Versions get pinned during M0 and M1.</p>
+    <div class="tbl">
+      <table class="w-wide">
+        <thead><tr><th>Crate</th><th>Job</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td><code>rune</code></td><td>GUI</td><td>Pre-release. Pin a git revision.</td></tr>
+          <tr><td><code>symphonia</code></td><td>Decode WAV, FLAC, MP3, OGG, AAC</td><td>Pure Rust</td></tr>
+          <tr><td><code>hound</code></td><td>Write WAV</td><td></td></tr>
+          <tr><td><code>flacenc</code></td><td>Write FLAC</td><td>Pure Rust</td></tr>
+          <tr><td><code>mp3lame-encoder</code></td><td>Write MP3 (M4)</td><td>Wraps LAME (LGPL). Optional feature.</td></tr>
+          <tr><td><code>cpal</code></td><td>Playback</td><td>Runs on its own audio thread</td></tr>
+          <tr><td><code>rubato</code></td><td>Resampling</td><td>For inserts with a different rate</td></tr>
+          <tr><td><code>ebur128</code></td><td>Loudness and true peak</td><td></td></tr>
+          <tr><td><code>tiny-skia</code></td><td>PNG rendering in the CLI</td><td>CPU only, works headless</td></tr>
+          <tr><td><code>clap</code>, <code>serde_json</code></td><td>Arguments, project file and output</td><td></td></tr>
+          <tr><td><code>notify</code></td><td>File watching in the GUI</td><td></td></tr>
+          <tr><td><code>blake3</code></td><td>Source hashing</td><td></td></tr>
+          <tr><td><code>fd-lock</code></td><td>Project write lock</td><td>OS advisory lock, released if the process dies</td></tr>
+          <tr><td><code>whisper-rs</code></td><td>Transcription (M4)</td><td>Local model, no cloud</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Rune's headless mode can render an app to PNG, dump its element tree and drive it with scripted input. That gives the GUI snapshot tests in CI and lets a coding agent check its own GUI work while building scrubr.</p>
+  </section>
+
+  <section id="targets">
+    <h2>Targets</h2>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Area</th><th>Target</th></tr></thead>
+        <tbody>
+          <tr><td>Accuracy</td><td>Every edit lands on an exact frame. Exporting the same version twice gives identical files on one platform.</td></tr>
+          <tr><td>CLI speed</td><td>Edit and info commands finish in under 100 ms on a 1-hour project with its peak cache built. Per-command source checks compare size and modified time. The full hash runs before export.</td></tr>
+          <tr><td>Peak cache</td><td>Built in under 10 s for a 1-hour, 48 kHz stereo WAV.</td></tr>
+          <tr><td>GUI</td><td>Zoom and scroll at 60 fps on a 1-hour project.</td></tr>
+          <tr><td>Memory</td><td>Audio streams from the sources. Whole files are never loaded into memory.</td></tr>
+          <tr><td>Safety</td><td>Source files are never written. Project writes are atomic and serialized by a lock.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="milestones">
+    <h2>Milestones</h2>
+    <ol class="ms">
+      <li>
+        <span class="id">M0</span>
+        <div class="body">
+          <h3>Rune spike</h3>
+          <p>A few days. Load a 1-hour WAV, build a min/max peak pyramid, draw it in a Rune window, zoom and scroll it, and play it through cpal with a moving playhead.</p>
+          <p class="exit"><b>Exit test</b>Smooth zoom on a 1-hour file with no audio dropouts. If Rune can't draw custom geometry well enough, move the GUI plan to egui and keep everything else.</p>
+        </div>
+      </li>
+      <li>
+        <span class="id">M1</span>
+        <div class="body">
+          <h3>Core and CLI</h3>
+          <p>Project file, edit log in source coordinates, locked and versioned atomic writes with <code>--if-version</code>, decoding, the edit commands, undo and history, analysis (loudness, peaks, silence, envelope), PNG rendering, WAV and FLAC export, <code>help --agent</code> and <code>AGENTS.md</code>.</p>
+          <p class="exit"><b>Exit test</b>An agent with only the binary and the guide cleans up a 1-hour podcast: removes long silences, cuts a named segment, hits −16 LUFS with true peak at or under −1 dBTP, fades both ends and exports FLAC. The result passes a listening check.</p>
+        </div>
+      </li>
+      <li>
+        <span class="id">M2</span>
+        <div class="body">
+          <h3>GUI</h3>
+          <p>Open a project, stereo waveform, timecode ruler, selection, playback, history panel, undo and redo, keyboard shortcuts and export.</p>
+          <p class="exit"><b>Exit test</b>You can audit and fix the M1 agent's work without touching the CLI.</p>
+        </div>
+      </li>
+      <li>
+        <span class="id">M3</span>
+        <div class="body">
+          <h3>Shared editing</h3>
+          <p>File watching with reload, author and session on every edit, session undo, the labels lane, and notices for outside edits.</p>
+          <p class="exit"><b>Exit test</b>An agent and a person edit the same project in one sitting and no edits are lost.</p>
+        </div>
+      </li>
+      <li>
+        <span class="id">M4</span>
+        <div class="body">
+          <h3>Extras</h3>
+          <p>MP3 export, spectrograms, transcription with word timestamps and cut-by-words, then effects such as noise reduction, EQ and compression. Multitrack only if it is still wanted.</p>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section id="risks">
+    <h2>Risks</h2>
+    <div class="tbl">
+      <table class="w-wide">
+        <thead><tr><th>Risk</th><th>Mitigation</th></tr></thead>
+        <tbody>
+          <tr><td>Rune is pre-release and its API may change</td><td>Pin a revision, keep the GUI crate thin, keep the core free of Rune.</td></tr>
+          <tr><td>Rune's support for custom drawing is unconfirmed</td><td>M0 tests it first. egui is the fallback.</td></tr>
+          <tr><td>Rune lists native audio as missing</td><td>Playback runs on a cpal thread. The GUI reads an atomic playhead position each frame.</td></tr>
+          <tr><td>Long files are slow to draw and scrub</td><td>Peak pyramid cache, streaming decode, seek tables for compressed formats.</td></tr>
+          <tr><td>Agent and person write at the same moment</td><td>A file lock around each write, and <code>--if-version</code> with exit code 3 for stale positions. The GUI retries after reloading.</td></tr>
+          <tr><td>Normalize can't reach its target without clipping</td><td>Gain stops at the true-peak ceiling and the reply reports the loudness achieved. A limiter is an open question.</td></tr>
+          <tr><td>Agents misjudge audio from numbers alone</td><td>Labels for human review, PNG renders, transcripts in M4.</td></tr>
+          <tr><td>License contamination</td><td>No Audacity code. LAME only as an optional, dynamically linked feature.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="questions">
+    <h2>Open questions</h2>
+    <ul>
+      <li>Should <code>scrubr undo</code> from the CLI undo only the caller's own edits?</li>
+      <li>After an undo, does a new edit discard the undone edits, or keep them recoverable as a branch?</li>
+      <li>One project file plus a cache folder, or a single project folder?</li>
+      <li>Does v1 need a limiter so normalize can reach −16 LUFS on peaky speech, or is stopping at the ceiling and reporting enough?</li>
+      <li>When a cut covers audio that an earlier edit had already removed, should it claim that hidden audio too, so it stays hidden if the earlier edit is reverted?</li>
+      <li>Is multitrack a v2 goal, or out of scope for good?</li>
+      <li>Should recording from a microphone ever be in scope?</li>
+      <li>Is a browser build through Rune's WebGPU target worth revisiting once it matures?</li>
+    </ul>
+  </section>
+
+  <section id="refs">
+    <h2>References</h2>
+    <ul class="refs">
+      <li><a href="https://github.com/nam37/scrubr" target="_blank" rel="noopener">scrubr on GitHub</a></li>
+      <li><a href="https://conare.ai/marketplace/mcp/audacity-mcp" target="_blank" rel="noopener">AudacityMCP</a></li>
+      <li><a href="https://socket.dev/npm/package/audionaut-mcp" target="_blank" rel="noopener">audionaut-mcp</a></li>
+      <li><a href="https://playbooks.com/mcp/video-audio-editor" target="_blank" rel="noopener">Video &amp; Audio Editor MCP server (FFmpeg)</a></li>
+      <li><a href="https://mcpservers.org/servers/vocalremover-mcp" target="_blank" rel="noopener">VocalRemover MCP server</a></li>
+      <li><a href="https://mcpplaygroundonline.com/mcp-servers/io-github-swappysh-mixmake" target="_blank" rel="noopener">MixMake MCP server</a></li>
+      <li><a href="https://lib.rs/crates/sampitor" target="_blank" rel="noopener">Sampitor</a></li>
+      <li><a href="https://github.com/anomalyco/rune" target="_blank" rel="noopener">Rune on GitHub</a></li>
+      <li><a href="https://braindetox.kr/en/posts/rune_rust_native_gpu_ui_framework.html" target="_blank" rel="noopener">Rune overview: headless rendering and pre-release status</a></li>
+    </ul>
+  </section>
+
+  <footer>scrubr PRD · draft · 12 November 2026</footer>
+</main>
+
+<script>
+(function () {
+  var c = document.getElementById('hdrwave');
+  if (!c) return;
+  function draw() {
+    try {
+      var dpr = window.devicePixelRatio || 1;
+      var w = c.clientWidth, h = c.clientHeight;
+      if (!w || !h) return;
+      c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+      var ctx = c.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+      var cs = getComputedStyle(document.documentElement);
+      var muted = cs.getPropertyValue('--muted').trim();
+      var acc = cs.getPropertyValue('--accent').trim();
+      var fill = cs.getPropertyValue('--accent-fill').trim();
+      var seed = 7;
+      function rnd() { seed = (seed * 16807) % 2147483647; return seed / 2147483647; }
+      var step = 3, mid = h / 2, n = Math.floor(w / step);
+      var selA = Math.floor(n * 0.56), selB = Math.floor(n * 0.64);
+      ctx.fillStyle = fill;
+      ctx.fillRect(selA * step, 0, (selB - selA) * step, h);
+      var a = 0.3;
+      for (var i = 0; i < n; i++) {
+        var x = i / n;
+        var t = 0.45 + 0.35 * Math.sin(x * 23) + 0.2 * Math.sin(x * 71 + 1.3);
+        var gap = (x > 0.30 && x < 0.33) || (x > 0.81 && x < 0.835);
+        var target = gap ? 0.04 : Math.max(0.06, t + (rnd() - 0.5) * 0.5);
+        a = a * 0.4 + target * 0.6;
+        var amp = Math.min(1, Math.max(0.04, a)) * (mid - 2);
+        var inSel = i >= selA && i < selB;
+        ctx.globalAlpha = inSel ? 0.95 : 0.5;
+        ctx.fillStyle = inSel ? acc : muted;
+        ctx.fillRect(i * step, mid - amp, 2, amp * 2);
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = acc;
+      ctx.fillRect(Math.floor(n * 0.47) * step, 0, 1.5, h);
+    } catch (e) {}
+  }
+  draw();
+  window.addEventListener('resize', draw);
+  try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw); } catch (e) {}
+  try { new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] }); } catch (e) {}
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(draw);
+})();
+</script>
+
+
+</body></html>

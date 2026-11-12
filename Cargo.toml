@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/scrubr-core", "crates/scrubr-gui"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+repository = "https://github.com/nam37/scrubr"
+
+[workspace.dependencies]
+# Rune is pre-release: pin a rev of `dev`, which is never rewritten.
+rune = { git = "https://github.com/anomalyco/rune", rev = "72327edc0028bc472680d11c2ee24ffea883072e" }
+
+# Rune builds against patched copies of these crates (its `vendor/` folder). A dependency's
+# `[patch]` does not apply to the workspace that depends on it, so the same patches are repeated
+# here, at the same rev as `rune` above. Keep the revs in step.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "72327edc0028bc472680d11c2ee24ffea883072e" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "72327edc0028bc472680d11c2ee24ffea883072e" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "72327edc0028bc472680d11c2ee24ffea883072e" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "72327edc0028bc472680d11c2ee24ffea883072e" }
+
+[profile.release]
+codegen-units = 16
+incremental = true

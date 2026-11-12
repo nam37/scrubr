@@ -1,0 +1,4 @@
+/target
+# Generated test audio and M0 snapshots
+/testdata
+*.png

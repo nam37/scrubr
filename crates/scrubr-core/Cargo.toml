@@ -1,0 +1,9 @@
+[package]
+name = "scrubr-core"
+description = "scrubr's engine: decoding, the peak cache and (later) the edit log. No UI dependencies."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+hound = "3.5"

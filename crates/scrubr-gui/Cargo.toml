@@ -7,7 +7,8 @@ repository.workspace = true
 
 [dependencies]
 scrubr-core = { path = "../scrubr-core" }
-rune = { workspace = true }
+# The system's own Open and Save dialogs.
+rune = { workspace = true, features = ["native-file-dialog"] }
 rune-kit = { workspace = true }
 cpal = "0.18"
 rtrb = "0.4"

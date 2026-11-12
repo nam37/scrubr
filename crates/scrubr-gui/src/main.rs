@@ -623,9 +623,14 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
 }
 
 fn main() {
-    // A project opens in the project view; a bare WAV still opens the M0 spike below.
-    if let Some(project) = rune::extra_args().iter().find(|a| a.ends_with(".scrubr")) {
-        return studio::run(PathBuf::from(project));
+    // A project opens in the project view, and so does no file at all: the view starts empty.
+    // A bare WAV still opens the M0 spike below.
+    let args = rune::extra_args();
+    if let Some(project) = args.iter().find(|a| a.ends_with(".scrubr")) {
+        return studio::run(Some(PathBuf::from(project)));
+    }
+    if !args.iter().any(|a| a.to_ascii_lowercase().ends_with(".wav")) {
+        return studio::run(None);
     }
     let spec = AppSpec::<State> {
         poll: Some(poll),

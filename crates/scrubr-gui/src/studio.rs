@@ -2,22 +2,27 @@
 //!
 //! `scrubr-gui <project.scrubr>` opens a project and draws its timeline at head: an overview of
 //! the whole recording, a ruler, a two-tone waveform (peaks around a loudness body), a mark at
-//! every splice in its author's colour, and level edits and labels under the lanes. Beside it is
+//! every splice in its author's colour with a speech bubble for every label beside them, and
+//! level edits along the foot of the lanes. Beside it is
 //! the activity log: every edit, by the person or an agent, with undo for one edit or a whole
 //! session. Agents work from a shell; the window has no chat. It reloads when the project file
 //! changes on disk. Every command is in one list, which the main menu, the tool buttons and the
-//! keyboard all read. Playback renders the timeline with its edits applied. Open and export are
-//! not wired yet.
+//! keyboard all read. Playback renders the timeline with its edits applied. Open and Export use
+//! the system's file dialogs; an export runs on its own thread and reports how far it has got.
+//! With no project named, the window starts empty.
 
 use std::f32::consts::FRAC_PI_2;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rune::{App, AppSpec, Chrome, Color, Cx, El, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, ScrollSpec, Shape, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
+use rune::{Align, App, AppSpec, Chrome, Color, Cx, El, FileDialogOptions, FileDialogResult, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, ScrollSpec, Shape, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
 use rune_kit::shell::{self, PaneState, SplitView, Toolbar};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuEntry, MenuItem, PaletteSeed, SegmentedControl};
 use scrubr_core::edit::{self, DEFAULT_CROSSFADE_MS, Request, Revert};
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts};
-use scrubr_core::{Peaks, Timeline, source};
+use scrubr_core::{Peaks, Timeline, export, source};
 
 use crate::audio::Player;
 
@@ -54,12 +59,15 @@ stroke_icon!(PREV, "scrubr-prev", r#"<path d="M4 3.5V12.5"/><path d="M12 3.8L6.5
 stroke_icon!(NEXT, "scrubr-next", r#"<path d="M12 3.5V12.5"/><path d="M4 3.8L9.5 8L4 12.2Z" fill="currentColor"/>"#);
 stroke_icon!(ZOOM_IN, "scrubr-zoom-in", r#"<circle cx="7" cy="7" r="4"/><path d="M10 10L13.2 13.2M5.3 7H8.7M7 5.3V8.7"/>"#);
 stroke_icon!(ZOOM_OUT, "scrubr-zoom-out", r#"<circle cx="7" cy="7" r="4"/><path d="M10 10L13.2 13.2M5.3 7H8.7"/>"#);
+stroke_icon!(BUBBLE, "scrubr-bubble", r#"<path d="M3.5 3H12.5A1.5 1.5 0 0 1 14 4.5V9.5A1.5 1.5 0 0 1 12.5 11H8L5 13.5V11H3.5A1.5 1.5 0 0 1 2 9.5V4.5A1.5 1.5 0 0 1 3.5 3Z"/>"#);
 stroke_icon!(FIT, "scrubr-fit", r#"<path d="M2.5 6V3.5H5M11 3.5H13.5V6M13.5 10V12.5H11M5 12.5H2.5V10"/>"#);
 
 const OVERVIEW_H: f32 = 46.0;
 const RULER_H: f32 = 26.0;
-const MARKS_H: f32 = 46.0;
-const TRANSPORT_H: f32 = 64.0;
+/// The strip at the foot of the lanes where level edits are marked. It lies over the lanes'
+/// own bottom margin, as the splice marks and labels lie over the top one.
+const MARKS_H: f32 = 16.0;
+const TRANSPORT_H: f32 = 68.0;
 /// The deepest zoom of this first look, in frames per point. Closer views need the renderer.
 const MIN_FPP: f64 = 32.0;
 
@@ -377,8 +385,30 @@ impl Doc {
 
 // ---------------------------------------------------------------- state
 
+/// Something a command wants that only a handler holding the window's `Tx` can start.
+#[derive(Clone, Copy)]
+enum Ask {
+    Open,
+    Export,
+}
+
+/// An export running on its own thread.
+struct Exporting {
+    name: String,
+    frames: u64,
+    /// Frames written so far, set by the export.
+    done: Arc<AtomicU64>,
+    result: mpsc::Receiver<Result<export::Report, String>>,
+    /// The percentage last shown, so the view is rebuilt only when it changes.
+    shown: u32,
+}
+
 pub struct Studio {
     paths: Paths,
+    /// True while no project is open: the window started without one.
+    blank: bool,
+    ask: Option<Ask>,
+    exporting: Option<Exporting>,
     doc: Option<Doc>,
     error: Option<String>,
     looks: [Look; 2],
@@ -399,7 +429,16 @@ pub struct Studio {
     selection: Option<(f64, f64)>,
     cursor: f64,
     selected: Option<usize>,
+    /// The label the pointer is over, by its place in the document's notes: its card is shown.
+    hover_note: Option<usize>,
+    /// Something to tell the person, at the right of the transport: why an edit failed, how an
+    /// export went, who just edited the project. There is nothing there otherwise.
     notice: Option<String>,
+    /// A notice that goes away by itself, and when: the word of an outside edit.
+    fleeting: Option<(String, f64)>,
+    /// `--outside-edit SECONDS`: at that time, act as if the project file had just been written
+    /// by someone else. For stills and checks of what the window does then.
+    pretend_edit_at: Option<f64>,
     /// The project file's modified time when it was last read.
     stamp: Option<SystemTime>,
     checked_at: f64,
@@ -575,12 +614,19 @@ fn sync(s: &Studio) {
 }
 
 fn reload(s: &mut Studio) {
+    if s.blank {
+        s.doc = None;
+        s.error = None;
+        s.player = None;
+        return;
+    }
     // Keep the place the audio had reached: the player is about to be replaced.
     s.cursor = head(s);
     s.stamp = stamp(&s.paths);
     s.generation += 1;
     match load(&s.paths) {
         Ok(doc) => {
+            s.hover_note = s.hover_note.filter(|&i| i < doc.notes.len());
             s.doc = Some(doc);
             s.error = None;
             if s.fit_pending { fit(s) } else { clamp(s) }
@@ -596,13 +642,16 @@ fn reload(s: &mut Studio) {
     open_player(s);
 }
 
-fn init_with(path: std::path::PathBuf) -> Studio {
+fn init_with(path: Option<PathBuf>) -> Studio {
     let args = rune::extra_args();
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let has = |name: &str| args.iter().any(|a| a == name);
     let play_check = flag("--play-check").and_then(|t| t.parse::<f64>().ok());
     let mut s = Studio {
-        paths: Paths::new(path),
+        blank: path.is_none(),
+        paths: Paths::new(path.unwrap_or_default()),
+        ask: None,
+        exporting: None,
         doc: None,
         error: None,
         looks: [look(false), look(true)],
@@ -618,7 +667,10 @@ fn init_with(path: std::path::PathBuf) -> Studio {
         selection: None,
         cursor: 0.0,
         selected: None,
+        hover_note: flag("--note").and_then(|t| t.parse().ok()),
         notice: None,
+        fleeting: None,
+        pretend_edit_at: flag("--outside-edit").and_then(|t| t.parse().ok()),
         stamp: None,
         checked_at: 0.0,
         generation: 0,
@@ -637,7 +689,9 @@ fn init_with(path: std::path::PathBuf) -> Studio {
     };
     reload(&mut s);
     // For stills: `--view START..END` in seconds, `--select START..END`, `--edit ID`,
-    // `--cursor SECONDS`, `--tab labels`, `--menu edit`, `--no-audio`, `--meter L,R` in dBFS.
+    // `--cursor SECONDS`, `--tab labels`, `--menu edit`, `--no-audio`, `--meter L,R` in dBFS,
+    // `--note N` to show the Nth label's card, `--outside-edit SECONDS` to reload then as if
+    // another program had written the project.
     // `--mute` plays silently.
     let rate = s.doc.as_ref().map_or(48_000.0, |d| d.rate() as f64);
     let range = |text: String| {
@@ -1032,6 +1086,51 @@ fn callout(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
     Some(card)
 }
 
+/// The card for the label under the pointer: who left it, what it marks and what it says.
+fn note_card(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
+    let k = &lk.k;
+    let note = doc.notes.get(s.hover_note?).filter(|n| !n.hidden)?;
+    let color = lk.author(note.agent);
+    let x = ((note.start as f64 - s.start) / s.fpp) as f32;
+    let cw = 268.0;
+    let rate = doc.rate();
+    let marks = if note.end > note.start { format!("{}  \u{2192}  {}", timecode(note.start as f64, rate), timecode(note.end as f64, rate)) } else { timecode(note.start as f64, rate) };
+    let mut card = col()
+        .key("note-card")
+        .absolute((x - 2.0).min(w - cw - 8.0).max(8.0), 23.0)
+        .w(cw)
+        .radius(k.radius.md)
+        .clip_rounded(k.radius.md)
+        .fill(k.c.layer_03)
+        .border(1.0, k.c.border_base)
+        // A band in the author's colour, then the note.
+        .child(
+            row()
+                .w_full()
+                .h(28.0)
+                .px(10.0)
+                .gap(6.0)
+                .center_y()
+                .fill(color.alpha(0.14))
+                .child(icon(&BUBBLE, 13.0).color(color))
+                .child(text(shown_name(&note.author)).font(k.ty.small_medium).color(color))
+                .child(el().grow(1.0))
+                .child(text(marks).font(lk.num(k.ty.small)).color(k.c.text_muted)),
+        )
+        .child(col().w_full().px(10.0).pt(8.0).pb(10.0).child(text(note.text.clone()).font(k.ty.ui).color(k.c.text_base).wrap()));
+    for shadow in &k.elevation.floating {
+        card = card.box_shadow(*shadow);
+    }
+    Some(card)
+}
+
+/// Selects what a label marks, or goes to it when it marks a point.
+fn pick_note(s: &mut Studio, i: usize) {
+    let Some((a, b)) = s.doc.as_ref().and_then(|d| d.notes.get(i)).map(|n| (n.start as f64, n.end as f64)) else { return };
+    set_cursor(s, a);
+    s.selection = (b > a).then_some((a, b));
+}
+
 fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
     let k = &lk.k;
     let [w, h] = s.wave;
@@ -1108,6 +1207,45 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
                 .child(text(note).font(lk.num(k.ty.small)).color(k.c.text_muted)),
         );
     }
+    area = area.child(marks(s, doc, lk, w, h));
+    // Labels: a speech bubble in the strip the splice marks share, where what it marks begins,
+    // and a line over the range it marks. The pointer over a bubble shows the note in a card.
+    let view_end = s.start + w as f64 * s.fpp;
+    let mut last_x = f32::NEG_INFINITY;
+    let mut shown: Vec<(usize, &Note)> = doc.notes.iter().enumerate().filter(|(_, n)| !n.hidden && (n.end as f64) >= s.start && (n.start as f64) <= view_end).collect();
+    shown.sort_by_key(|(_, n)| n.start);
+    for (i, note) in shown {
+        let color = lk.author(note.agent);
+        let x_of = |t: u64| ((t as f64 - s.start) / s.fpp) as f32;
+        let (x0, x1) = (x_of(note.start).max(0.0), x_of(note.end).min(w));
+        let open = s.hover_note == Some(i);
+        if x1 - x0 > 2.0 {
+            // While its card is open the whole range is tinted, so it is plain what the note is about.
+            area = area.child(el().key(format!("note-span-{i}")).absolute(x0, 0.0).size(x1 - x0, if open { h } else { 2.0 }).fill(color.alpha(if open { 0.10 } else { 0.8 })));
+        }
+        // Bubbles that would sit on top of each other step to the right.
+        let x = (x0 - 2.0).max(last_x + 23.0).min(w - 22.0);
+        last_x = x;
+        area = area.child(
+            row()
+                .key(format!("note-{i}"))
+                .absolute(x, 2.0)
+                .size(21.0, 17.0)
+                .radius(6.0)
+                .center()
+                .fill(if open { color } else { lk.lane })
+                .border(1.0, color.alpha(0.6))
+                .on_hover_change(move |s: &mut Studio, inside, _| {
+                    if inside {
+                        s.hover_note = Some(i);
+                    } else if s.hover_note == Some(i) {
+                        s.hover_note = None;
+                    }
+                })
+                .on_press(move |s: &mut Studio| pick_note(s, i))
+                .child(icon(&BUBBLE, 12.0).color(if open { lk.lane } else { color })),
+        );
+    }
     // The playhead: a line with a handle at its top, moved by a live value as the audio plays.
     let handle = Shape::new().fill(vec![[0.0, 0.0], [11.0, 0.0], [5.5, 8.0]], k.c.text_base);
     area = area.child(
@@ -1121,19 +1259,21 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
     if let Some(card) = callout(s, doc, lk, w) {
         area = area.child(card);
     }
+    if let Some(card) = note_card(s, doc, lk, w) {
+        area = area.child(card);
+    }
     area
 }
 
-/// Under the lanes: level edits as bars in their author's colour, then the labels.
-fn marks(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> El {
-    let k = &lk.k;
+/// Level edits as bars in their author's colour, along the foot of the lanes.
+fn marks(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32) -> El {
     let end = s.start + w as f64 * s.fpp;
     let x_of = |t: u64| ((t as f64 - s.start) / s.fpp) as f32;
     let mut shape = Shape::new();
     for m in doc.levels.iter().filter(|m| (m.end as f64) > s.start && (m.start as f64) < end) {
         let (x0, x1) = (x_of(m.start).max(0.0), x_of(m.end).min(w));
         let color = lk.author(m.agent).alpha(if s.selected == Some(m.edit) { 1.0 } else { 0.75 });
-        let (top, bottom) = (6.0, 13.0);
+        let (top, bottom) = (4.0, 11.0);
         match m.kind {
             LevelKind::Gain => shape = shape.fill(vec![[x0, top + 2.0], [x1, top + 2.0], [x1, bottom - 2.0], [x0, bottom - 2.0]], color),
             LevelKind::FadeIn => shape = shape.fill(vec![[x0, bottom], [x1, top], [x1, bottom]], color),
@@ -1148,33 +1288,7 @@ fn marks(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> El {
             }
         }
     }
-    let mut lane = el()
-        .key("marks")
-        .w_full()
-        .h(MARKS_H)
-        .border_sides([1.0, 0.0, 0.0, 0.0], lk.rule)
-        .child(canvas(shape).key("marks-canvas").absolute(0.0, 0.0).size(w, MARKS_H));
-    for (i, note) in doc.notes.iter().enumerate().filter(|(_, n)| !n.hidden && (n.end as f64) >= s.start && (n.start as f64) <= end) {
-        let color = lk.author(note.agent);
-        let (x0, x1) = (x_of(note.start).max(0.0), x_of(note.end).min(w));
-        if x1 - x0 > 2.0 {
-            lane = lane.child(el().key(format!("note-span-{i}")).absolute(x0, 19.0).size(x1 - x0, 2.0).fill(color.alpha(0.8)));
-        }
-        lane = lane.child(
-            row()
-                .key(format!("note-{i}"))
-                .absolute(x0.min(w - 60.0), 23.0)
-                .h(18.0)
-                .px(7.0)
-                .gap(5.0)
-                .center_y()
-                .radius(9.0)
-                .fill(color.alpha(0.14))
-                .border(1.0, color.alpha(0.45))
-                .child(text(note.text.clone()).font(k.ty.small_medium).color(k.c.text_base)),
-        );
-    }
-    lane
+    canvas(shape).key("marks").absolute(0.0, h - MARKS_H).size(w, MARKS_H)
 }
 
 /// A group of small tools on a shared plate.
@@ -1201,14 +1315,16 @@ fn meters(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> El {
     let k = &lk.k;
     let m = &s.meters;
     let stereo = doc.project.channels > 1;
-    let (bar_h, pitch) = if stereo { (8.0, 12.0) } else { (10.0, 0.0) };
-    let bars_h = pitch + bar_h;
-    // Room at the left for the channel's letter.
-    let x0 = if stereo { 14.0 } else { 0.0 };
+    // Two bars have the scale between them, so the block is the same above and below its middle
+    // and lines up with the buttons beside it. One bar has the scale under it.
+    let (bar_h, pitch, scale_y, height) = if stereo { (8.0, 22.0, 10.0, 30.0) } else { (10.0, 0.0, 12.0, 22.0) };
+    // Room at the left for the channel's letter, or for the first figure of the scale, which
+    // is centred on the bar's end.
+    let x0 = if stereo { 14.0 } else { 10.0 };
     let part = |db: f32| (db - METER_FLOOR) / -METER_FLOOR;
     let small = TextStyle { size: 9.0, weight: 500.0, line_height: 10.0, ..lk.num(k.ty.small) };
     let stops = [(0.0, lk.meter[0]), (part(-20.0), lk.meter[0]), (part(-12.0), lk.meter[1]), (part(-6.0), lk.meter[2]), (1.0, lk.meter[3])];
-    let mut plate = el().key("meters").size(x0 + w + 28.0, bars_h + 17.0);
+    let mut plate = el().key("meters").size(x0 + w + 28.0, height);
     for c in 0..if stereo { 2 } else { 1 } {
         let y = c as f32 * pitch;
         if stereo {
@@ -1234,23 +1350,19 @@ fn meters(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> El {
                     .child(el().key(format!("meter-clip-{c}")).absolute(0.0, 0.0).size(5.0, bar_h).radius(1.5).fill(lk.meter[3]).live_opacity(&m.clip[c])),
             );
     }
-    // Every mark gets a tick; a narrow meter names fewer of them.
+    // A narrow meter names fewer marks.
     let marks: &[f32] = if w >= 140.0 { &[-60.0, -48.0, -36.0, -24.0, -12.0, -6.0, 0.0] } else { &[-48.0, -24.0, -12.0, -6.0, 0.0] };
-    let mut ticks = Shape::new();
     for &db in marks {
         let x = part(db) * w;
-        ticks = ticks.line([x.clamp(0.5, w - 0.5), 0.0], [x.clamp(0.5, w - 0.5), 3.0], 1.0, LineCap::Butt, k.c.text_faint);
         // Name a mark only where its neighbours leave room for the figures.
         let named = if db == -6.0 { w >= 190.0 } else if db == -12.0 { w >= 110.0 } else { true };
         if !named {
             continue;
         }
         let label = if db == 0.0 { "0".to_string() } else { format!("\u{2212}{}", -db as i32) };
-        plate = plate.child(row().absolute(x0 + x - 14.0, bars_h + 6.0).size(28.0, 10.0).center().child(text(label).font(small).color(k.c.text_faint)));
+        plate = plate.child(row().absolute(x0 + x - 14.0, scale_y).size(28.0, 10.0).center().child(text(label).font(small).color(k.c.text_faint)));
     }
-    plate
-        .child(canvas(ticks).key("meter-scale").absolute(x0, bars_h + 2.0).size(w, 3.0))
-        .child(text("dB").absolute(x0 + w + 8.0, bars_h + 6.0).font(small).color(k.c.text_faint))
+    plate.child(text("dB").absolute(x0 + w + 8.0, scale_y).font(small).color(k.c.text_faint))
 }
 
 fn transport(s: &Studio, doc: &Doc, lk: &Look) -> El {
@@ -1258,14 +1370,15 @@ fn transport(s: &Studio, doc: &Doc, lk: &Look) -> El {
     let rate = doc.rate();
     let (meter_w, total_fits) = meter_room(s);
     let counter = TextStyle { size: 27.0, weight: 600.0, line_height: 30.0, tracking: -0.4, ..lk.num(k.ty.ui) };
-    let last = doc.project.head_index().map(|i| &doc.project.edits[i]);
-    let mut status = s.notice.clone().unwrap_or_else(|| match last {
-        Some(e) => format!("{} · {} · {}", shown_name(&e.author), describe(e, &doc.project), ago(e.time.as_deref())),
-        None => String::new(),
-    });
-    if s.player.is_none() && s.notice.is_none() && !s.audio_note.is_empty() {
-        status = format!("{status} · {}", s.audio_note);
-    }
+    // The right of the row speaks only when there is something to say. The last edit is not
+    // repeated here: it heads the activity log. A sound device that failed is worth a word;
+    // audio switched off on purpose is not.
+    let status = s.notice.clone().or_else(|| (s.player.is_none() && !s.no_audio && !s.audio_note.is_empty()).then(|| s.audio_note.clone()));
+    // Word of an outside edit carries its author's colour.
+    let dot = match (&s.fleeting, doc.project.head_index().map(|i| &doc.project.edits[i])) {
+        (Some(_), Some(e)) => lk.author(is_agent(&e.author)),
+        _ => k.c.text_faint,
+    };
     let playing = s.player.as_ref().is_some_and(Player::is_playing);
     row()
         .key("transport")
@@ -1299,15 +1412,19 @@ fn transport(s: &Studio, doc: &Doc, lk: &Look) -> El {
         .child(plate(lk, vec![tool(s, k, &SCISSORS, "Cut selection"), tool(s, k, &MUTE, "Mute selection")]))
         .child(plate(lk, vec![tool(s, k, &ZOOM_OUT, "Zoom out"), tool(s, k, &ZOOM_IN, "Zoom in"), tool(s, k, &FIT, "Fit timeline")]))
         .child(el().grow(1.0))
-        .child(
-            row()
+        .child(match status {
+            Some(status) => row()
+                .key("notice")
                 .gap(7.0)
                 .center_y()
                 .min_w(0.0)
                 .shrink()
-                .child(el().size(7.0, 7.0).radius(4.0).fill(lk.author(last.is_some_and(|e| is_agent(&e.author)))))
+                .child(el().size(7.0, 7.0).radius(4.0).fill(dot))
+                // The line is cut short when the window is narrow; the whole of it is in the tooltip.
+                .help(status.clone())
                 .child(text(status).font(lk.num(k.ty.small)).color(k.c.text_muted).truncate()),
-        )
+            None => el(),
+        })
 }
 
 // ---------------------------------------------------------------- the activity log
@@ -1554,6 +1671,125 @@ fn mute_selection(s: &mut Studio) {
     act(s, move |paths| edit::apply(paths, &WriteOpts::default(), &you(), false, |_, _| Ok((vec![Request::Mute { range, crossfade }], Some(desc)))).map(|_| ()));
 }
 
+/// Puts the start or the end of the selection at the playhead. The other end stays where it is,
+/// or joins it when it would fall on the wrong side.
+fn mark_selection(s: &mut Studio, start: bool) {
+    let at = head(s);
+    s.selection = Some(match (s.selection, start) {
+        (Some((_, b)), true) => (at, b.max(at)),
+        (Some((a, _)), false) => (a.min(at), at),
+        (None, _) => (at, at),
+    });
+}
+
+/// Shows another project in this window.
+fn open_project(s: &mut Studio, path: PathBuf) {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("scrubr")) {
+        s.notice = Some(format!("{name} is not a scrubr project. A project's name ends in .scrubr; `scrubr new` makes one from audio files."));
+        return;
+    }
+    if let Some(p) = &s.player {
+        p.pause();
+    }
+    s.paths = Paths::new(path);
+    s.blank = false;
+    s.selection = None;
+    s.selected = None;
+    s.notice = None;
+    s.view_request = None;
+    s.cursor = 0.0;
+    s.start = 0.0;
+    s.tab = 0;
+    s.fit_pending = true;
+    reload(s);
+    s.cursor = 0.0;
+}
+
+/// A size as people read it: 412 MB, 8.4 MB, 940 KB.
+fn size_text(bytes: u64) -> String {
+    let mb = bytes as f64 / 1_000_000.0;
+    if mb >= 100.0 { format!("{mb:.0} MB") } else if mb >= 1.0 { format!("{mb:.1} MB") } else { format!("{:.0} KB", bytes as f64 / 1000.0) }
+}
+
+/// Renders the timeline at head to `out` on a thread of its own. `poll` watches it.
+fn start_export(s: &mut Studio, mut out: PathBuf) {
+    let Some(doc) = &s.doc else { return };
+    if out.extension().is_none() {
+        out.set_extension("flac");
+    }
+    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (project, paths) = (doc.project.clone(), s.paths.clone());
+    let done = Arc::new(AtomicU64::new(0));
+    let options = export::Options { progress: Some(done.clone()), ..Default::default() };
+    let (answer, result) = mpsc::channel();
+    let started = std::thread::Builder::new().name("scrubr-export".into()).spawn(move || {
+        let _ = answer.send(export::export(&project, &paths, &out, &options).map_err(|e| e.to_string()));
+    });
+    match started {
+        Ok(_) => {
+            s.notice = Some(format!("Exporting {name}\u{2026}"));
+            s.exporting = Some(Exporting { name, frames: doc.tl.total(), done, result, shown: 0 });
+        }
+        Err(e) => s.notice = Some(format!("Could not start the export: {e}")),
+    }
+}
+
+/// Follows a running export. True when what the window shows has changed.
+fn watch_export(s: &mut Studio) -> bool {
+    let Some(x) = &mut s.exporting else { return false };
+    let finished = match x.result.try_recv() {
+        Ok(Ok(report)) => {
+            let rate = s.doc.as_ref().map_or(48_000, |d| d.rate());
+            let format = match report.depth {
+                export::Depth::Int(bits) => format!("{} {bits}-bit", report.format.name().to_uppercase()),
+                export::Depth::Float => format!("{} 32-bit float", report.format.name().to_uppercase()),
+            };
+            let clipped = if report.clipped_samples > 0 { format!(" \u{b7} {} samples clipped", report.clipped_samples) } else { String::new() };
+            format!("Exported {} to {} \u{b7} {format} \u{b7} {}{clipped}", timecode(report.frames as f64, rate), x.name, size_text(report.bytes))
+        }
+        Ok(Err(e)) => format!("Export failed: {e}"),
+        Err(mpsc::TryRecvError::Disconnected) => "Export failed: it stopped without a result.".to_string(),
+        Err(mpsc::TryRecvError::Empty) => {
+            let percent = (x.done.load(Relaxed) * 100 / x.frames.max(1)).min(99) as u32;
+            let moved = percent != x.shown;
+            x.shown = percent;
+            return moved;
+        }
+    };
+    s.exporting = None;
+    s.notice = Some(finished);
+    true
+}
+
+/// Starts what a command asked for, now that a `Tx` is at hand. Every place that runs a command
+/// calls this after it.
+fn flush_asks(s: &mut Studio, tx: &mut Tx) {
+    let folder = (!s.blank).then(|| s.paths.dir.clone());
+    match s.ask.take() {
+        Some(Ask::Open) => {
+            let options = FileDialogOptions { title: "Open project".into(), directory: folder, ..Default::default() }.filter("scrubr project", &["scrubr"]);
+            tx.open_file(options, |s: &mut Studio, result: FileDialogResult, _| match result {
+                Ok(Some(path)) => open_project(s, path),
+                Ok(None) => {}
+                Err(e) => s.notice = Some(format!("Could not show the file dialog: {e}")),
+            });
+        }
+        Some(Ask::Export) => {
+            let stem = s.paths.project.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "export".into());
+            let options = FileDialogOptions { title: "Export".into(), directory: folder, file_name: Some(format!("{stem}.flac")), ..Default::default() }
+                .filter("FLAC", &["flac"])
+                .filter("WAV", &["wav"]);
+            tx.save_file(options, |s: &mut Studio, result: FileDialogResult, _| match result {
+                Ok(Some(path)) => start_export(s, path),
+                Ok(None) => {}
+                Err(e) => s.notice = Some(format!("Could not show the file dialog: {e}")),
+            });
+        }
+        None => {}
+    }
+}
+
 /// Moves the cursor to the next or previous splice.
 fn step_splice(s: &mut Studio, forward: bool) {
     let Some(doc) = &s.doc else { return };
@@ -1636,9 +1872,12 @@ struct Command {
     run: fn(&mut Studio),
 }
 
+const OPEN: &str = "Open project\u{2026}";
+
 impl Command {
+    /// Every command but Open needs a project to act on.
     fn available(&self, s: &Studio) -> bool {
-        self.built && s.doc.is_some() && (self.enabled)(s)
+        self.built && (s.doc.is_some() || self.label == OPEN) && (self.enabled)(s)
     }
 }
 
@@ -1648,19 +1887,18 @@ fn always(_: &Studio) -> bool {
     true
 }
 
+/// A selection with some length: I or O alone leaves one with none, which is nothing to cut.
 fn has_selection(s: &Studio) -> bool {
-    s.selection.is_some()
+    s.selection.is_some_and(|(a, b)| b > a)
 }
 
 fn has_splices(s: &Studio) -> bool {
     s.doc.as_ref().is_some_and(|d| !d.splices.is_empty())
 }
 
-fn not_yet(_: &mut Studio) {}
-
-static COMMANDS: [Command; 18] = [
-    Command { menu: 0, label: "Open project\u{2026}", keys: Keys::Cmd('o'), divide: false, built: false, enabled: always, run: not_yet },
-    Command { menu: 0, label: "Export\u{2026}", keys: Keys::Cmd('e'), divide: false, built: false, enabled: always, run: not_yet },
+static COMMANDS: [Command; 20] = [
+    Command { menu: 0, label: OPEN, keys: Keys::Cmd('o'), divide: false, built: true, enabled: always, run: |s| s.ask = Some(Ask::Open) },
+    Command { menu: 0, label: "Export\u{2026}", keys: Keys::Cmd('e'), divide: false, built: true, enabled: |s| s.exporting.is_none(), run: |s| s.ask = Some(Ask::Export) },
     Command {
         menu: 1,
         label: "Undo",
@@ -1681,6 +1919,8 @@ static COMMANDS: [Command; 18] = [
     },
     Command { menu: 1, label: "Cut selection", keys: Keys::Delete, divide: true, built: true, enabled: has_selection, run: cut_selection },
     Command { menu: 1, label: "Mute selection", keys: Keys::Char('m'), divide: false, built: true, enabled: has_selection, run: mute_selection },
+    Command { menu: 1, label: "Set selection start", keys: Keys::Char('i'), divide: true, built: true, enabled: always, run: |s| mark_selection(s, true) },
+    Command { menu: 1, label: "Set selection end", keys: Keys::Char('o'), divide: false, built: true, enabled: always, run: |s| mark_selection(s, false) },
     Command {
         menu: 1,
         label: "Deselect",
@@ -1767,9 +2007,10 @@ fn main_menu(s: &Studio, k: &Kit, layer: &mut Vec<El>) -> El {
             if c.divide {
                 entries.push(MenuEntry::Separator);
             }
-            let mut item = MenuItem::new(c.label).shortcut(c.keys.label()).disabled(!c.available(s)).on_select(move |s: &mut Studio| {
+            let mut item = MenuItem::new(c.label).shortcut(c.keys.label()).disabled(!c.available(s)).on_select_tx(move |s: &mut Studio, tx: &mut Tx| {
                 close_menu(s);
                 (c.run)(s);
+                flush_asks(s, tx);
             });
             if !c.built {
                 item = item.badge("soon");
@@ -1795,7 +2036,7 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
     let lk = &s.looks[cx.system_dark() as usize];
     let k = &lk.k;
     let scale = cx.env().scale;
-    let name = s.paths.project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = if s.blank { "No project".to_string() } else { s.paths.project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() };
 
     let main = match (&s.doc, &s.error) {
         (Some(doc), _) => {
@@ -1815,18 +2056,56 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
                 .border(1.0, k.c.border_muted)
                 .child(overview(s, doc, lk, w, scale))
                 .child(ruler(s, doc, lk, w))
-                .child(wave_area(s, doc, lk, scale))
-                .child(marks(s, doc, lk, w));
+                .child(wave_area(s, doc, lk, scale));
             col()
                 .w_full()
                 .h_full()
                 .px(12.0)
-                .pb(4.0)
                 .child(row().w_full().h(30.0).center().child(text(readout).key("readout").font(lk.num(k.ty.ui)).color(if s.selection.is_some() { lk.you } else { k.c.text_faint })))
                 .child(card)
                 .child(transport(s, doc, lk))
         }
-        (None, error) => col().w_full().h_full().center().padding(32.0).child(text(error.clone().unwrap_or_default()).font(k.ty.body).color(k.c.text_muted).wrap()),
+        // No project, or one that would not load: say so, and offer another.
+        (None, error) => {
+            let (title, body) = match error {
+                Some(e) => ("This project could not be opened", e.clone()),
+                None => ("No project open", "Open a .scrubr project to hear and review its edits. `scrubr new` makes a project from audio files.".to_string()),
+            };
+            let mut plate = col()
+                .key("empty")
+                .w_full()
+                .h_full()
+                .center()
+                .padding(32.0)
+                // The toolbar above takes 48 points of the window; as much again below puts the
+                // middle of this plate at the middle of the window.
+                .pb(32.0 + 48.0)
+                .gap(10.0)
+                .child(icon(&LOGO, 44.0).color(lk.you))
+                .child(el().h(2.0))
+                .child(text(title).font(TextStyle { size: 19.0, weight: 620.0, line_height: 24.0, ..k.ty.ui }).color(k.c.text_base))
+                .child(text(body).font(k.ty.body).color(k.c.text_muted).wrap().align(Align::Center).max_w(460.0))
+                .child(el().h(4.0))
+                .child(
+                    row()
+                        .key("open-project")
+                        .h(32.0)
+                        .px(14.0)
+                        .center_y()
+                        .radius(k.radius.md)
+                        .fill(lk.you)
+                        .help(format!("Open project ({})", command(OPEN).keys.label()))
+                        .on_press_tx(|s: &mut Studio, tx: &mut Tx| {
+                            s.ask = Some(Ask::Open);
+                            flush_asks(s, tx);
+                        })
+                        .child(text(OPEN).font(k.ty.ui_medium).color(lk.on_you)),
+                );
+            if let Some(notice) = &s.notice {
+                plate = plate.child(text(notice.clone()).font(k.ty.small).color(k.c.text_muted).wrap().align(Align::Center).max_w(460.0));
+            }
+            plate
+        }
     };
 
     let mut layer = Vec::new();
@@ -1851,36 +2130,54 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
                 .child(tool(s, k, &UNDO, "Undo"))
                 .child(tool(s, k, &REDO, "Redo"))
                 .child(el().w(6.0))
-                .child(
-                    row()
+                .child({
+                    // While an export runs the button shows how far it has got and does nothing.
+                    let ready = command("Export\u{2026}").available(s);
+                    let label = match &s.exporting {
+                        Some(x) => format!("Exporting {}%", x.shown),
+                        None => "Export".to_string(),
+                    };
+                    let button = row()
                         .key("export")
                         .h(28.0)
                         .px(12.0)
                         .gap(6.0)
                         .center_y()
                         .radius(k.radius.md)
-                        .fill(lk.you)
-                        .help("Export (not wired in this first look)")
+                        .fill(lk.you.alpha(if ready { 1.0 } else { 0.45 }))
+                        .help(format!("Export to FLAC or WAV ({})", command("Export\u{2026}").keys.label()))
                         .child(icon(&EXPORT, 14.0).color(lk.on_you))
-                        .child(text("Export").font(k.ty.ui_medium).color(lk.on_you)),
-                )
+                        .child(text(label).font(lk.num(k.ty.ui_medium)).color(lk.on_you));
+                    if ready {
+                        button.on_press_tx(|s: &mut Studio, tx: &mut Tx| {
+                            s.ask = Some(Ask::Export);
+                            flush_asks(s, tx);
+                        })
+                    } else {
+                        button
+                    }
+                })
                 .child(el().w(2.0))
-                .child(
+                // The log's switch, while there is a log.
+                .child(if s.doc.is_none() {
+                    el()
+                } else {
                     IconButton::new(&shell::INSPECTOR)
                         .variant(IconButtonVariant::GhostMuted)
                         .expanded(s.inspector.is_open())
                         .label(if s.inspector.is_open() { "Hide the log" } else { "Show the log" })
                         .on_press(|s: &mut Studio| s.inspector.toggle())
                         .build(k)
-                        .key("log-toggle"),
-                ),
+                        .key("log-toggle")
+                }),
         );
-    let inspector = match &s.doc {
-        Some(doc) => log(s, doc, lk),
-        None => el(),
-    };
-    let window = SplitView::new(main)
-        .inspector(&s.inspector, |s: &mut Studio| &mut s.inspector, inspector)
+    let mut split = SplitView::new(main);
+    // With no project there is no log, so its pane goes too and the empty state sits in the
+    // middle of the window, not of what the pane left.
+    if let Some(doc) = &s.doc {
+        split = split.inspector(&s.inspector, |s: &mut Studio| &mut s.inspector, log(s, doc, lk));
+    }
+    let window = split
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .frame_inset(8.0)
@@ -1891,7 +2188,7 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
     rune_kit::root(window, layer)
 }
 
-fn on_key(s: &mut Studio, e: &KeyEvent, _: &mut Tx) -> bool {
+fn on_key(s: &mut Studio, e: &KeyEvent, tx: &mut Tx) -> bool {
     if s.menu && matches!(e.key, Key::Escape) {
         close_menu(s);
         return true;
@@ -1899,6 +2196,7 @@ fn on_key(s: &mut Studio, e: &KeyEvent, _: &mut Tx) -> bool {
     match COMMANDS.iter().find(|c| c.keys.pressed(e)) {
         Some(c) if c.available(s) => {
             (c.run)(s);
+            flush_asks(s, tx);
             true
         }
         _ => false,
@@ -1960,15 +2258,32 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
     let still_playing = s.player.as_ref().is_some_and(Player::is_playing);
     // The meters go on falling for a moment after the audio stops.
     let meters_lit = step_meters(s, t);
-    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else { 500 }));
+    changed |= watch_export(s);
+    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() { 100 } else { 500 }));
 
-    if t - s.checked_at >= 0.45 {
+    if s.pretend_edit_at.is_some_and(|at| t >= at) {
+        s.pretend_edit_at = None;
+        s.stamp = None;
+    }
+    if t - s.checked_at >= 0.45 && !s.blank {
         s.checked_at = t;
         if stamp(&s.paths) != s.stamp {
             reload(s);
             if let Some((e, project)) = s.doc.as_ref().and_then(|d| d.project.head_index().map(|i| (&d.project.edits[i], &d.project))) {
-                s.notice = Some(format!("Live · {} edited just now · {}", shown_name(&e.author), describe(e, project)));
+                let word = format!("{} just edited · {}", shown_name(&e.author), describe(e, project));
+                s.fleeting = Some((word.clone(), t + 8.0));
+                s.notice = Some(word);
             }
+            changed = true;
+        }
+    }
+    // Word of an outside edit goes after a few seconds, unless something else has been said since.
+    if let Some((word, until)) = &s.fleeting {
+        if s.notice.as_ref() != Some(word) {
+            s.fleeting = None;
+        } else if t >= *until {
+            s.notice = None;
+            s.fleeting = None;
             changed = true;
         }
     }
@@ -1976,11 +2291,12 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
     changed
 }
 
-pub fn run(path: std::path::PathBuf) {
+/// Opens the window on a project, or empty when there is none.
+pub fn run(path: Option<PathBuf>) {
     // The path is handed to `init` through a cell: `AppSpec` takes a plain function.
-    PATH.with(|p| *p.borrow_mut() = Some(path));
+    PATH.with(|p| *p.borrow_mut() = path);
     fn init() -> Studio {
-        init_with(PATH.with(|p| p.borrow_mut().take()).expect("the project path is set before the window opens"))
+        init_with(PATH.with(|p| p.borrow_mut().take()))
     }
     let spec = AppSpec::<Studio> { poll: Some(poll), on_key: Some(on_key), min_size: Some((960.0, 480.0)), ..AppSpec::new("scrubr", (1360.0, 760.0), init, view) };
     // On macOS the header runs under a clear title bar and leaves room at its left for the
@@ -1991,5 +2307,5 @@ pub fn run(path: std::path::PathBuf) {
 }
 
 thread_local! {
-    static PATH: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    static PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }

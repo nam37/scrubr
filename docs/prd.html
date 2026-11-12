@@ -226,13 +226,15 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <li>An agent can finish a real editing job using only the CLI and the agent guide.</li>
           <li>A person can open that project, hear each edit, see who made it, and undo or adjust it.</li>
           <li>Edits are sample-accurate, non-destructive and deterministic.</li>
+          <li>Several tracks in one project, such as a microphone for each speaker and a music bed, mixed down at export.</li>
           <li>One binary for macOS, Windows and Linux.</li>
         </ul>
       </div>
       <div>
         <h3>Not in v1</h3>
         <ul>
-          <li>Multitrack mixing, recording and MIDI</li>
+          <li>Recording and MIDI</li>
+          <li>A mixer beyond level, mute and solo for each track: no buses, sends or automation</li>
           <li>Plugin hosting (VST3, LV2, AU)</li>
           <li>Real-time effect previews</li>
           <li>A web build. Rune's web target is experimental and WebGPU-only.</li>
@@ -416,6 +418,17 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>Peak data for drawing lives in a cache folder next to the project and is rebuilt when missing.</li>
       <li><code>version</code> increases on every write. Writers use it to detect each other, and agents pass it back with <code>--if-version</code>.</li>
     </ul>
+
+    <h3>Tracks (M3)</h3>
+    <p>Through M2 a project is one timeline. From M3 it holds one or more tracks: named lanes that share that timeline and are summed for playback and export. A recording made with a microphone for each speaker is one track per microphone. A music bed or a sting is another.</p>
+    <ul>
+      <li><strong>One track is the plain case.</strong> A project made before M3 opens as a project with one track, and nothing about it changes. The file's <code>format</code> number goes up, and a build that does not know the new format must refuse the file with a clear error, not misread it.</li>
+      <li><strong>Time is shared.</strong> <code>cut</code> and <code>keep</code> remove time from every track, so tracks recorded together stay in step. <code>insert</code> adds time to every track, with silence on the others. No command cuts one track alone, so tracks cannot drift apart.</li>
+      <li><strong>Level is per track.</strong> <code>gain</code>, <code>fade</code>, <code>mute</code> and <code>normalize</code> take <code>--track</code>, and act on the mix when none is named. Each track also has a level, a mute and a solo of its own.</li>
+      <li><strong>Adding a track moves nothing.</strong> <code>scrubr track add</code> places a file at a position on a new track. That is how a second microphone or a music bed joins a project, where <code>insert</code> splices a file into the timeline.</li>
+      <li><strong>Measuring.</strong> <code>analyze</code>, <code>render</code> and <code>transcribe</code> work on the mix, or on one track with <code>--track</code>. A transcript for each track avoids most of the trouble with people talking over each other, when each has their own recording.</li>
+      <li><strong>What stays the same.</strong> Edits in source coordinates, the batch rule, author and session on every edit, session undo and version checks.</li>
+    </ul>
   </section>
 
   <section id="cli">
@@ -444,6 +457,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <div class="cmd"><code>scrubr normalize ep42.scrubr --lufs -16</code><span>Normalize to integrated loudness, or to a peak with <code>--peak -1dB</code>. Gain stops at a true-peak ceiling, −1 dBTP by default.</span></div>
       <div class="cmd"><code>scrubr mute ep42.scrubr 30:12..30:13.4</code><span>Replace a range with silence and keep its length.</span></div>
       <div class="cmd"><code>scrubr insert ep42.scrubr sting.wav --at 0</code><span>Insert another file, resampled if its rate differs.</span></div>
+      <div class="cmd"><code>scrubr track add ep42.scrubr guest.wav --name guest</code><span>Add a file as a new track, list tracks, or remove one (M3). <code>--track guest</code> on level, analysis and transcript commands then names it.</span></div>
       <div class="cmd"><code>scrubr apply ep42.scrubr --ops cuts.json</code><span>Several operations in one write and one undo step.</span></div>
       <div class="cmd"><code>scrubr undo | redo | history ep42.scrubr</code><span>Move head, or list edits with author and session.</span></div>
       <div class="cmd"><code>scrubr label ep42.scrubr add 14:18.5..14:20.2 "check: cough?"</code><span>Leave a note for the person reviewing.</span></div>
@@ -549,6 +563,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>Activity log listing each edit with its author, session and time. The person's edits are amber and agents' are blue-green. Selecting a row jumps to that spot. Any edit can be undone on its own, and an agent's whole session in one step.</li>
       <li>Splices marked on the timeline in their author's colour. Selecting one shows the audio that was removed there.</li>
       <li>Labels lane showing notes agents leave for review.</li>
+      <li>Files tab (M3), the third tab in the side panel beside Activity and Labels: a file browser for adding more audio to the open project. It lists folders and the audio files scrubr can read, each with a Play button to hear it before adding, and adds one at the playhead or as a new track. It also lists the files the project already uses.</li>
+      <li>Tracks (M3) as stacked lanes under one ruler, each with its name, level, mute and solo.</li>
       <li>Live reload when the project file changes on disk.</li>
       <li>One menu button holds every command, the same on all three platforms. The same list drives the tool buttons and the keyboard shortcuts.</li>
       <li>No chat or prompt box. Agents drive scrubr from the CLI; the window is for hearing, reviewing and refining what they did.</li>
@@ -699,16 +715,18 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>
         <span class="id">M3</span>
         <div class="body">
-          <h3>Shared editing</h3>
+          <h3>Shared editing, files and multitrack</h3>
           <p>Session undo, the labels lane, notices naming each outside edit, and GUI write retries after a version conflict. Authorship arrives in M1 and live reload in M2.</p>
-          <p class="exit"><b>Exit test</b>An agent and a person edit the same project in one sitting and no edits are lost.</p>
+          <p>The Files tab in the side panel, for hearing and adding more files to the open project.</p>
+          <p>Multitrack: several tracks in one project, <code>scrubr track</code> and <code>--track</code> in the CLI, stacked lanes with level, mute and solo in the window, and a mix-down for playback and export.</p>
+          <p class="exit"><b>Exit test</b>An agent and a person edit the same project in one sitting and no edits are lost. A two-microphone recording and a music bed are brought together from the Files tab, cleaned up by an agent track by track, and exported as one mix.</p>
         </div>
       </li>
       <li>
         <span class="id">M4</span>
         <div class="body">
           <h3>Extras</h3>
-          <p>MP3 export, spectrograms, cut-by-words commands on top of the transcript, then effects such as noise reduction, EQ and compression. Multitrack only if it is still wanted.</p>
+          <p>MP3 export, spectrograms, cut-by-words commands on top of the transcript, then effects such as noise reduction, EQ and compression.</p>
         </div>
       </li>
     </ol>
@@ -731,6 +749,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Transcription brings a heavy dependency and a large model</td><td>Optional feature. The binary builds and works without it, and no model is bundled. The engine is pure Rust, and the model is one download of about 290 MB.</td></tr>
           <tr><td>Transcripts have wrong words and loose word times, worst where people talk over each other</td><td>Cuts go at the quietest moment between words, not at word times. The agent transcribes again across each join, and labels what it is unsure of.</td></tr>
           <tr><td>The Whisper crate is young (0.1) and tested here on Windows only</td><td>It sits behind one trait in the core, so another engine can replace it without touching the CLI.</td></tr>
+          <tr><td>Multitrack arrives after the core, the CLI and the window were built around one timeline</td><td>One track is the plain case of the same model, so earlier projects and commands keep working. The file format number goes up. Source coordinates, the batch rule and version checks do not change.</td></tr>
           <tr><td>License contamination</td><td>No Audacity code. LAME only as an optional, dynamically linked feature.</td></tr>
         </tbody>
       </table>
@@ -747,7 +766,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>When a cut covers audio that an earlier edit had already removed, should it claim that hidden audio too, so it stays hidden if the earlier edit is reverted?</li>
       <li>Is <code>base.en</code> the right default model, or should recordings with several speakers default to a larger one such as <code>small.en</code>, about 1 GB?</li>
       <li>Should release builds include the transcription feature, or stay without it and leave it to people who build from source?</li>
-      <li>Is multitrack a v2 goal, or out of scope for good?</li>
+      <li>Does a track have pan, or only level, mute and solo?</li>
       <li>Should recording from a microphone ever be in scope?</li>
       <li>Is a browser build through Rune's WebGPU target worth revisiting once it matures?</li>
     </ul>

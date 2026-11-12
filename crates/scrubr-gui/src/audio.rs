@@ -1,7 +1,7 @@
-//! cpal playback of a WAV file, streamed from disk.
+//! cpal playback, streamed from disk: a WAV file, or a project's timeline with its edits applied.
 //!
 //! Three threads share a handful of atomics:
-//! - the **decoder** reads the file, converts to stereo at the device's rate and fills a
+//! - the **decoder** reads the source, converts to stereo at the device's rate and fills a
 //!   lock-free ring buffer;
 //! - the **audio callback** drains the ring into the device and counts the frames it played;
 //! - the **UI** plays, pauses, seeks and reads the position. It never blocks on either.
@@ -20,10 +20,80 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
+use scrubr_core::project::{Paths, Project};
+use scrubr_core::render::Renderer;
 use scrubr_core::WavFile;
 
 /// Source frames decoded per read.
 const CHUNK: usize = 4096;
+
+/// What a player streams: audio at one rate that can be read from any frame.
+pub trait Source: Send + 'static {
+    fn frames(&self) -> u64;
+    fn sample_rate(&self) -> u32;
+    fn channels(&self) -> usize;
+    fn seek(&mut self, frame: u64);
+    /// Replaces `out` with up to `frames` interleaved frames from the current position and
+    /// returns how many it read. Zero is the end.
+    fn read(&mut self, frames: usize, out: &mut Vec<f32>) -> usize;
+}
+
+impl Source for WavFile {
+    fn frames(&self) -> u64 {
+        self.info().frames
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.info().sample_rate
+    }
+
+    fn channels(&self) -> usize {
+        self.info().channels as usize
+    }
+
+    fn seek(&mut self, frame: u64) {
+        let _ = WavFile::seek(self, frame);
+    }
+
+    fn read(&mut self, frames: usize, out: &mut Vec<f32>) -> usize {
+        WavFile::read(self, frames, out).unwrap_or(0)
+    }
+}
+
+/// A project's timeline at head, rendered as it plays: cuts, level edits and crossfades included.
+struct TimelineSource {
+    renderer: Renderer,
+    rate: u32,
+    pos: u64,
+}
+
+impl Source for TimelineSource {
+    fn frames(&self) -> u64 {
+        self.renderer.total()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn channels(&self) -> usize {
+        self.renderer.channels()
+    }
+
+    fn seek(&mut self, frame: u64) {
+        self.pos = frame.min(self.renderer.total());
+    }
+
+    fn read(&mut self, frames: usize, out: &mut Vec<f32>) -> usize {
+        let n = (self.renderer.total().saturating_sub(self.pos) as usize).min(frames);
+        if n == 0 || self.renderer.read(self.pos, n, out).is_err() {
+            out.clear();
+            return 0;
+        }
+        self.pos += n as u64;
+        n
+    }
+}
 
 struct Shared {
     playing: AtomicBool,
@@ -59,9 +129,19 @@ pub struct Player {
 impl Player {
     /// Opens the default output device and starts streaming `path`, paused at frame 0.
     pub fn open(path: &Path, gain: f32) -> Result<Player, String> {
-        let wav = WavFile::open(path).map_err(|e| e.to_string())?;
-        let frames = wav.info().frames;
-        let src_rate = wav.info().sample_rate;
+        Self::start(Box::new(WavFile::open(path).map_err(|e| e.to_string())?), gain)
+    }
+
+    /// Opens the default output device over a project's timeline at head, paused at frame 0.
+    /// The player holds the timeline it was given: open another after an edit.
+    pub fn timeline(project: &Project, paths: &Paths, gain: f32) -> Result<Player, String> {
+        let renderer = Renderer::new(project, paths).map_err(|e| e.to_string())?;
+        Self::start(Box::new(TimelineSource { renderer, rate: project.sample_rate, pos: 0 }), gain)
+    }
+
+    fn start(wav: Box<dyn Source>, gain: f32) -> Result<Player, String> {
+        let frames = wav.frames();
+        let src_rate = wav.sample_rate();
         let shared = Arc::new(Shared {
             playing: AtomicBool::new(false),
             quit: AtomicBool::new(false),
@@ -150,7 +230,7 @@ impl Drop for Player {
     }
 }
 
-fn start_stream(wav: WavFile, shared: Arc<Shared>) -> Result<(cpal::Stream, (String, u32, u16)), String> {
+fn start_stream(wav: Box<dyn Source>, shared: Arc<Shared>) -> Result<(cpal::Stream, (String, u32, u16)), String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let name = device.id().map(|id| id.to_string()).unwrap_or_else(|_| "default output".into());
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
@@ -278,9 +358,9 @@ impl Resampler {
     }
 }
 
-fn decode(mut wav: WavFile, mut ring: Producer<f32>, shared: Arc<Shared>, dev_rate: u32) {
-    let channels = wav.info().channels as usize;
-    let src_rate = wav.info().sample_rate;
+fn decode(mut wav: Box<dyn Source>, mut ring: Producer<f32>, shared: Arc<Shared>, dev_rate: u32) {
+    let channels = wav.channels().max(1);
+    let src_rate = wav.sample_rate();
     let same_rate = src_rate == dev_rate;
     let mut resampler = Resampler::new(src_rate, dev_rate);
     let mut raw = Vec::with_capacity(CHUNK * channels);
@@ -300,7 +380,7 @@ fn decode(mut wav: WavFile, mut ring: Producer<f32>, shared: Arc<Shared>, dev_ra
             while !shared.flushed.load(Acquire) && since.elapsed() < Duration::from_millis(250) {
                 thread::sleep(Duration::from_micros(500));
             }
-            let _ = wav.seek(target as u64);
+            wav.seek(target as u64);
             resampler.reset();
             shared.base.store(target as u64, Release);
             shared.played.store(0, Release);
@@ -314,12 +394,9 @@ fn decode(mut wav: WavFile, mut ring: Producer<f32>, shared: Arc<Shared>, dev_ra
             thread::sleep(Duration::from_millis(2));
             continue;
         }
-        match wav.read(CHUNK, &mut raw) {
-            Ok(0) | Err(_) => {
-                shared.ended.store(true, Release);
-                continue;
-            }
-            Ok(_) => {}
+        if wav.read(CHUNK, &mut raw) == 0 {
+            shared.ended.store(true, Release);
+            continue;
         }
         stereo.clear();
         for frame in raw.chunks_exact(channels) {

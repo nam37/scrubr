@@ -6,16 +6,19 @@
 //! the activity log: every edit, by the person or an agent, with undo for one edit or a whole
 //! session. Agents work from a shell; the window has no chat. It reloads when the project file
 //! changes on disk. Every command is in one list, which the main menu, the tool buttons and the
-//! keyboard all read. Playback, open and export are not wired yet.
+//! keyboard all read. Playback renders the timeline with its edits applied. Open and export are
+//! not wired yet.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rune::{App, AppSpec, Chrome, Color, Cx, El, Icon, Key, KeyEvent, LineCap, Phase, ScrollSpec, Shape, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
+use rune::{App, AppSpec, Chrome, Color, Cx, El, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, ScrollSpec, Shape, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
 use rune_kit::shell::{self, PaneState, SplitView, Toolbar};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuEntry, MenuItem, PaletteSeed, SegmentedControl};
 use scrubr_core::edit::{self, DEFAULT_CROSSFADE_MS, Request, Revert};
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts};
 use scrubr_core::{Peaks, Timeline, source};
+
+use crate::audio::Player;
 
 // ---------------------------------------------------------------- icons
 
@@ -26,6 +29,7 @@ macro_rules! stroke_icon {
 }
 
 static PLAY: Icon = Icon { name: "scrubr-play", view: 16.0, body: r#"<path d="M5.2 3.2L12.6 8L5.2 12.8Z" fill="currentColor"/>"# };
+static PAUSE: Icon = Icon { name: "scrubr-pause", view: 16.0, body: r#"<path d="M4.5 3.2H7V12.8H4.5ZM9 3.2H11.5V12.8H9Z" fill="currentColor"/>"# };
 static LOGO: Icon = Icon {
     name: "scrubr-logo",
     view: 16.0,
@@ -127,8 +131,8 @@ fn is_agent(author: &str) -> bool {
 /// Where two pieces of audio meet on the timeline.
 struct Splice {
     at: u64,
-    /// Index of the edit that made the join.
-    edit: Option<usize>,
+    /// The edits that made the join, latest first: more than one where cuts meet.
+    edits: Vec<usize>,
     agent: bool,
     /// The audio taken out here: source index and frame range.
     removed: Option<(usize, u64, u64)>,
@@ -178,6 +182,8 @@ struct Doc {
     levels: Vec<LevelMark>,
     notes: Vec<Note>,
     groups: Vec<Group>,
+    /// The loudest sample on the timeline, 0.0 to 1.0, after the level edits.
+    peak: f32,
 }
 
 fn load(paths: &Paths) -> Result<Doc, String> {
@@ -237,15 +243,18 @@ fn load(paths: &Paths) -> Result<Doc, String> {
     let mut splices = Vec::new();
     for i in 1..segs.len() {
         let (a, b) = (segs[i - 1], segs[i]);
-        let (edit, removed) = if a.src == b.src && b.start >= a.end {
-            // The latest cut that took out any of the audio between the two pieces.
-            let edit = cuts.iter().rev().find(|c| c.0 == a.src && c.1 < b.start && c.2 > a.end).map(|c| c.3);
-            (edit, Some((a.src, a.end, b.start)))
+        let (mut edits, removed) = if a.src == b.src && b.start >= a.end {
+            // Every cut that took out some of the audio between the two pieces.
+            let edits: Vec<usize> = cuts.iter().filter(|c| c.0 == a.src && c.1 < b.start && c.2 > a.end).map(|c| c.3).collect();
+            (edits, Some((a.src, a.end, b.start)))
         } else {
-            (inserted[b.src].or(inserted[a.src]), None)
+            (inserted[b.src].or(inserted[a.src]).into_iter().collect(), None)
         };
-        let agent = edit.is_some_and(|i| is_agent(&project.edits[i].author));
-        splices.push(Splice { at: tl.seg_start(i), edit, agent, removed });
+        edits.sort_unstable_by(|x, y| y.cmp(x));
+        edits.dedup();
+        // The mark takes the colour of the latest edit.
+        let agent = edits.first().is_some_and(|&i| is_agent(&project.edits[i].author));
+        splices.push(Splice { at: tl.seg_start(i), edits, agent, removed });
     }
 
     let mut levels = Vec::new();
@@ -285,7 +294,12 @@ fn load(paths: &Paths) -> Result<Doc, String> {
         }
         last = Some((e.author.as_str(), &e.session));
     }
-    Ok(Doc { project, tl, peaks, states, splices, levels, notes, groups })
+    let mut doc = Doc { project, tl, peaks, states, splices, levels, notes, groups, peak: 1.0 };
+    let total = doc.tl.total().max(1) as f64;
+    doc.peak = (0..doc.project.channels.min(2) as usize)
+        .flat_map(|c| doc.columns(c, 0.0, total / 2048.0, 2048))
+        .fold(0f32, |m, c| if c.any { m.max(c.max).max(-c.min) } else { m });
+    Ok(doc)
 }
 
 /// One column of a waveform: its peaks and its loudness, after the level edits.
@@ -300,6 +314,12 @@ struct Column {
 impl Doc {
     fn rate(&self) -> u32 {
         self.project.sample_rate
+    }
+
+    /// How much taller than true scale the lanes draw, so a quiet recording fills them. The
+    /// peaks land at nine tenths of a lane; a recording that already does is left alone.
+    fn magnify(&self) -> f32 {
+        if self.peak <= 0.0 { 1.0 } else { (0.9 / self.peak).clamp(1.0, 8.0) }
     }
 
     /// `cols` columns of `fpc` timeline frames each, from `start`, for one channel.
@@ -374,13 +394,84 @@ pub struct Studio {
     checked_at: f64,
     /// Bumped on every reload, so drawings cached for the old document are rebuilt.
     generation: u64,
+    /// Plays the timeline as it stands. Reopened on every reload, since an edit changes the audio.
+    player: Option<Player>,
+    /// Why there is no player, when there is none.
+    audio_note: String,
+    no_audio: bool,
+    mute: bool,
+    /// The playhead's place and the counter's text. Live values: moving them does not re-run
+    /// the view.
+    playhead: Live<[f32; 2]>,
+    clock: LiveText,
+    /// `--play-check SECONDS`: play muted for that long, print what happened, and exit.
+    play_check: Option<f64>,
+    play_check_began: Option<f64>,
 }
 
 fn stamp(paths: &Paths) -> Option<SystemTime> {
     std::fs::metadata(&paths.project).and_then(|m| m.modified()).ok()
 }
 
+/// The playhead in timeline frames: the player's position while it plays, the cursor otherwise.
+fn head(s: &Studio) -> f64 {
+    match &s.player {
+        Some(p) if p.is_playing() => p.position() as f64,
+        _ => s.cursor,
+    }
+}
+
+/// Moves the cursor, and the player with it.
+fn set_cursor(s: &mut Studio, frame: f64) {
+    s.cursor = frame.clamp(0.0, total(s));
+    if let Some(p) = &s.player {
+        p.seek(s.cursor as u64);
+    }
+}
+
+/// Opens a player over the timeline as it stands now, paused at the cursor.
+fn open_player(s: &mut Studio) {
+    s.player = None;
+    let Some(doc) = &s.doc else { return };
+    if s.no_audio {
+        s.audio_note = "audio off".into();
+        return;
+    }
+    match Player::timeline(&doc.project, &s.paths, if s.mute { 0.0 } else { 1.0 }) {
+        Ok(p) => {
+            p.seek(s.cursor as u64);
+            s.audio_note = String::new();
+            s.player = Some(p);
+        }
+        Err(e) => s.audio_note = format!("no audio: {e}"),
+    }
+}
+
+fn toggle_play(s: &mut Studio) {
+    let Some(p) = &s.player else {
+        s.notice = Some(if s.audio_note.is_empty() { "No audio output.".into() } else { s.audio_note.clone() });
+        return;
+    };
+    if p.is_playing() {
+        p.pause();
+        s.cursor = p.position() as f64;
+    } else {
+        p.play();
+    }
+}
+
+/// Puts the playhead and the counter where the audio is.
+fn sync(s: &Studio) {
+    let Some(doc) = &s.doc else { return };
+    let at = head(s);
+    let x = ((at - s.start) / s.fpp) as f32;
+    s.playhead.set([if x >= 0.0 && x <= s.wave[0] { x } else { -100.0 }, 0.0]);
+    s.clock.set(timecode(at, doc.rate()));
+}
+
 fn reload(s: &mut Studio) {
+    // Keep the place the audio had reached: the player is about to be replaced.
+    s.cursor = head(s);
     s.stamp = stamp(&s.paths);
     s.generation += 1;
     match load(&s.paths) {
@@ -397,11 +488,14 @@ fn reload(s: &mut Studio) {
             s.error = Some(e);
         }
     }
+    open_player(s);
 }
 
 fn init_with(path: std::path::PathBuf) -> Studio {
     let args = rune::extra_args();
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let has = |name: &str| args.iter().any(|a| a == name);
+    let play_check = flag("--play-check").and_then(|t| t.parse::<f64>().ok());
     let mut s = Studio {
         paths: Paths::new(path),
         doc: None,
@@ -423,10 +517,18 @@ fn init_with(path: std::path::PathBuf) -> Studio {
         stamp: None,
         checked_at: 0.0,
         generation: 0,
+        player: None,
+        audio_note: String::new(),
+        no_audio: has("--no-audio"),
+        mute: has("--mute") || play_check.is_some(),
+        playhead: Live::new([-100.0, 0.0]),
+        clock: LiveText::new("0:00.000"),
+        play_check,
+        play_check_began: None,
     };
     reload(&mut s);
     // For stills: `--view START..END` in seconds, `--select START..END`, `--edit ID`,
-    // `--cursor SECONDS`, `--tab labels`, `--menu edit`.
+    // `--cursor SECONDS`, `--tab labels`, `--menu edit`, `--no-audio`. `--mute` plays silently.
     let rate = s.doc.as_ref().map_or(48_000.0, |d| d.rate() as f64);
     let range = |text: String| {
         let (a, b) = text.split_once("..")?;
@@ -435,7 +537,7 @@ fn init_with(path: std::path::PathBuf) -> Studio {
     s.view_request = flag("--view").and_then(range);
     s.selection = flag("--select").and_then(range);
     if let Some(at) = flag("--cursor").and_then(|t| t.parse::<f64>().ok()) {
-        s.cursor = at * rate;
+        set_cursor(&mut s, at * rate);
     }
     if let (Some(id), Some(doc)) = (flag("--edit"), &s.doc) {
         s.selected = doc.project.edits.iter().position(|e| e.id == id);
@@ -584,10 +686,22 @@ fn kind(op: &Op) -> (&'static str, &'static Icon) {
     }
 }
 
-/// An edit's own description, with a batch's count set as a multiplication sign.
-fn describe(e: &project::Edit) -> String {
+/// What an edit did, in the log's words: its own description, a batch's count set as a
+/// multiplication sign, and an undo named after what it undid.
+fn describe(e: &project::Edit, project: &Project) -> String {
     let text = e.desc.clone().unwrap_or_else(|| e.op.name().to_string());
-    if matches!(e.op, Op::Batch { .. }) { text.replace(" x", " \u{00d7}") } else { text }
+    match &e.op {
+        Op::Batch { .. } => text.replace(" x", " \u{00d7}"),
+        Op::Revert { edits } => match (edits.as_slice(), text.strip_prefix("revert session ")) {
+            (_, Some(session)) => format!("undid session {session}"),
+            ([one], _) => match project.edits.iter().find(|x| &x.id == one) {
+                Some(target) => format!("undid {}", describe(target, project)),
+                None => format!("undid {one}"),
+            },
+            (many, _) => format!("undid {} edits", many.len()),
+        },
+        _ => text,
+    }
 }
 
 fn shown_name(author: &str) -> String {
@@ -721,7 +835,7 @@ fn wave_shape(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32, scale: f32) -> S
             shape = shape.line([0.0, lane_h * c as f32], [w, lane_h * c as f32], 1.0, LineCap::Butt, lk.rule);
         }
         let columns = doc.columns(c, s.start, fpc, cols);
-        shape = lane(shape, &columns, col_w, mid, lane_h * 0.5 - 10.0, lk.ink, lk.ink_soft, |i| match selected {
+        shape = lane(shape, &columns, col_w, mid, (lane_h * 0.5 - 10.0) * doc.magnify(), lk.ink, lk.ink_soft, |i| match selected {
             Some((a, b)) if (i as isize) >= a && (i as isize) < b => Some((lk.you, lk.you.alpha(0.38))),
             _ => None,
         });
@@ -732,7 +846,7 @@ fn wave_shape(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32, scale: f32) -> S
     for splice in visible {
         let x = ((splice.at as f64 - s.start) / s.fpp) as f32;
         let color = lk.author(splice.agent);
-        let chosen = splice.edit.is_some() && splice.edit == s.selected;
+        let chosen = s.selected.is_some_and(|i| splice.edits.contains(&i));
         if roomy || chosen {
             shape = shape.line([x, 14.0], [x, h], if chosen { 1.5 } else { 1.0 }, LineCap::Butt, color.alpha(if chosen { 0.75 } else { 0.18 }));
         }
@@ -769,15 +883,20 @@ fn ghost(doc: &Doc, lk: &Look, removed: (usize, u64, u64), w: f32, h: f32) -> Sh
 fn callout(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
     let k = &lk.k;
     let edit = s.selected?;
-    let splice = doc.splices.iter().find(|j| j.edit == Some(edit) && (j.at as f64) >= s.start && (j.at as f64) <= s.start + w as f64 * s.fpp)?;
+    let splice = doc.splices.iter().find(|j| j.edits.contains(&edit) && (j.at as f64) >= s.start && (j.at as f64) <= s.start + w as f64 * s.fpp)?;
     let removed = splice.removed?;
-    let e = &doc.project.edits[edit];
     let x = ((splice.at as f64 - s.start) / s.fpp) as f32;
     let (cw, gh) = (236.0, 40.0);
-    let by = match &e.session {
-        Some(session) => format!("{} · {session}", shown_name(&e.author)),
-        None => shown_name(&e.author),
-    };
+    // Oldest first: the ids of the cuts that meet here, and who made them.
+    let ids: Vec<&str> = splice.edits.iter().rev().map(|&i| doc.project.edits[i].id.as_str()).collect();
+    let mut by: Vec<String> = Vec::new();
+    for &i in splice.edits.iter().rev() {
+        let name = shown_name(&doc.project.edits[i].author);
+        if !by.contains(&name) {
+            by.push(name);
+        }
+    }
+    let credit = format!("{} · {} · still in the source", ids.join(" + "), by.join(" and "));
     let mut card = col()
         .key("callout")
         .absolute((x + 10.0).min(w - cw - 8.0).max(8.0), 22.0)
@@ -796,7 +915,7 @@ fn callout(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
                 .child(text(format!("{} removed here", duration((removed.2 - removed.1) as f64, doc.rate()))).font(lk.num(k.ty.ui_medium)).color(k.c.text_base)),
         )
         .child(canvas(ghost(doc, lk, removed, cw - 20.0, gh)).key("ghost").size(cw - 20.0, gh).radius(k.radius.sm).fill(lk.lane))
-        .child(text(format!("{} · {by} · still in the source", e.id)).font(k.ty.small).color(k.c.text_muted));
+        .child(text(credit).font(k.ty.small).color(k.c.text_muted));
     for shadow in &k.elevation.floating {
         card = card.box_shadow(*shadow);
     }
@@ -833,7 +952,8 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
                 let (a, b) = (frame(d.start_x), frame(d.x));
                 s.selection = Some((a.min(b), a.max(b)));
             } else if d.phase == Phase::Up {
-                s.cursor = frame(d.x);
+                let at = frame(d.x);
+                set_cursor(s, at);
                 s.selection = None;
             }
         });
@@ -863,10 +983,31 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
             );
         }
     }
-    let cx = ((s.cursor - s.start) / s.fpp) as f32;
-    if (0.0..=w).contains(&cx) {
-        area = area.child(el().key("cursor").absolute(cx - 0.75, 0.0).size(1.5, h).fill(k.c.text_base));
+    if doc.magnify() > 1.05 {
+        // Say so when the lanes are not at true scale.
+        let note = format!("peak {:.1} dB · shown \u{00d7}{:.1}", 20.0 * doc.peak.log10(), doc.magnify());
+        area = area.child(
+            row()
+                .key("magnify")
+                .pin(None, Some(18.0), Some(8.0), None)
+                .h(18.0)
+                .px(7.0)
+                .center_y()
+                .radius(5.0)
+                .fill(k.c.text_base.alpha(0.07))
+                .child(text(note).font(lk.num(k.ty.small)).color(k.c.text_muted)),
+        );
     }
+    // The playhead: a line with a handle at its top, moved by a live value as the audio plays.
+    let handle = Shape::new().fill(vec![[0.0, 0.0], [11.0, 0.0], [5.5, 8.0]], k.c.text_base);
+    area = area.child(
+        el().key("playhead")
+            .absolute(-0.75, 0.0)
+            .size(1.5, h)
+            .fill(k.c.text_base)
+            .live_offset(&s.playhead)
+            .child(canvas(handle).key("playhead-handle").absolute(-4.75, 0.0).size(11.0, 8.0)),
+    );
     if let Some(card) = callout(s, doc, lk, w) {
         area = area.child(card);
     }
@@ -949,10 +1090,14 @@ fn transport(s: &Studio, doc: &Doc, lk: &Look) -> El {
     let rate = doc.rate();
     let counter = TextStyle { size: 27.0, weight: 600.0, line_height: 30.0, tracking: -0.4, ..lk.num(k.ty.ui) };
     let last = doc.project.head_index().map(|i| &doc.project.edits[i]);
-    let status = s.notice.clone().unwrap_or_else(|| match last {
-        Some(e) => format!("{} · {} · {}", shown_name(&e.author), describe(e), ago(e.time.as_deref())),
+    let mut status = s.notice.clone().unwrap_or_else(|| match last {
+        Some(e) => format!("{} · {} · {}", shown_name(&e.author), describe(e, &doc.project), ago(e.time.as_deref())),
         None => String::new(),
     });
+    if s.player.is_none() && s.notice.is_none() && !s.audio_note.is_empty() {
+        status = format!("{status} · {}", s.audio_note);
+    }
+    let playing = s.player.as_ref().is_some_and(Player::is_playing);
     row()
         .key("transport")
         .w_full()
@@ -967,15 +1112,17 @@ fn transport(s: &Studio, doc: &Doc, lk: &Look) -> El {
                 .radius(21.0)
                 .center()
                 .fill(lk.you)
-                .help("Play (not wired in this first look)")
-                .child(icon(&PLAY, 18.0).color(lk.on_you)),
+                .help(if playing { "Pause" } else { "Play" })
+                .on_press(toggle_play)
+                .child(icon(if playing { &PAUSE } else { &PLAY }, 18.0).color(lk.on_you)),
         )
         .child(plate(lk, vec![tool(s, k, &PREV, "Previous splice"), tool(s, k, &NEXT, "Next splice")]))
         .child(
             row()
                 .gap(10.0)
                 .items_end()
-                .child(text(timecode(s.cursor, rate)).key("counter").font(counter).color(k.c.text_base))
+                // The placeholder sets the box a live text draws in: as wide as the longest time.
+                .child(text(timecode(doc.tl.total() as f64, rate)).key("counter").live_text(&s.clock).font(counter).color(k.c.text_base))
                 .child(text(format!("/ {}", timecode(doc.tl.total() as f64, rate))).font(lk.num(k.ty.ui)).color(k.c.text_faint).pb(3.0)),
         )
         .child(el().w(4.0))
@@ -1055,7 +1202,7 @@ fn activity(s: &Studio, doc: &Doc, lk: &Look) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(icon(glyph, 14.0).color(if live { k.c.text_muted } else { k.c.text_faint }))
-                .child(text(describe(e)).font(lk.num(k.ty.ui)).color(if live { k.c.text_base } else { k.c.text_faint }).truncate().grow(1.0).min_w(0.0))
+                .child(text(describe(e, &doc.project)).font(lk.num(k.ty.ui)).color(if live { k.c.text_base } else { k.c.text_faint }).truncate().grow(1.0).min_w(0.0))
                 .child(chip(lk, chip_label, chip_color));
             let mut body = col().grow(1.0).min_w(0.0).gap(3.0).child(top).child(bottom);
             if chosen {
@@ -1140,7 +1287,7 @@ fn labels(doc: &Doc, lk: &Look) -> El {
                     .child(text(note.text.clone()).font(k.ty.ui).color(k.c.text_base).wrap()),
             )
             .on_press(move |s: &mut Studio| {
-                s.cursor = at;
+                set_cursor(s, at);
                 reveal(s, at);
             });
         list = list.child(k.interactive(item));
@@ -1199,7 +1346,7 @@ fn act(s: &mut Studio, change: impl FnOnce(&Paths) -> scrubr_core::Result<()>) {
 
 fn select(s: &mut Studio, i: usize) {
     s.selected = if s.selected == Some(i) { None } else { Some(i) };
-    let at = s.doc.as_ref().and_then(|d| d.splices.iter().find(|j| j.edit == Some(i)).map(|j| j.at as f64));
+    let at = s.doc.as_ref().and_then(|d| d.splices.iter().find(|j| j.edits.contains(&i)).map(|j| j.at as f64));
     if let (Some(_), Some(at)) = (s.selected, at) {
         reveal(s, at);
     }
@@ -1227,7 +1374,7 @@ fn cut_selection(s: &mut Studio) {
     act(s, move |paths| edit::apply(paths, &WriteOpts::default(), &you(), false, |_, _| Ok((vec![Request::Cut { range, crossfade }], Some(desc)))).map(|_| ()));
     if s.notice.is_none() {
         s.selection = None;
-        s.cursor = range.0 as f64;
+        set_cursor(s, range.0 as f64);
     }
 }
 
@@ -1245,7 +1392,7 @@ fn step_splice(s: &mut Studio, forward: bool) {
         doc.splices.iter().rev().map(|j| j.at as f64).find(|&t| t < s.cursor - 1.0)
     };
     if let Some(at) = at {
-        s.cursor = at;
+        set_cursor(s, at);
         reveal(s, at);
     }
 }
@@ -1407,7 +1554,7 @@ static COMMANDS: [Command; 18] = [
     Command { menu: 2, label: "Scroll back", keys: Keys::Left, divide: true, built: true, enabled: always, run: |s| pan(s, -0.2 * s.wave[0] as f64) },
     Command { menu: 2, label: "Scroll forward", keys: Keys::Right, divide: false, built: true, enabled: always, run: |s| pan(s, 0.2 * s.wave[0] as f64) },
     Command { menu: 2, label: "Toggle the log", keys: Keys::Char('h'), divide: true, built: true, enabled: always, run: |s| s.inspector.toggle() },
-    Command { menu: 3, label: "Play or pause", keys: Keys::Char(' '), divide: false, built: false, enabled: always, run: not_yet },
+    Command { menu: 3, label: "Play or pause", keys: Keys::Char(' '), divide: false, built: true, enabled: |s| s.player.is_some(), run: toggle_play },
     Command {
         menu: 3,
         label: "Go to start",
@@ -1416,7 +1563,7 @@ static COMMANDS: [Command; 18] = [
         built: true,
         enabled: always,
         run: |s| {
-            s.cursor = 0.0;
+            set_cursor(s, 0.0);
             s.start = 0.0;
         },
     },
@@ -1587,22 +1734,69 @@ fn on_key(s: &mut Studio, e: &KeyEvent, _: &mut Tx) -> bool {
     }
 }
 
-/// Twice a second, look at the project file: if an agent or another window wrote it, reload.
+/// Every frame: follow the audio while it plays, and twice a second look at the project file,
+/// reloading if an agent or another window wrote it.
 fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
-    tx.wake_after(Duration::from_millis(500));
-    if t - s.checked_at < 0.45 {
-        return false;
+    let mut changed = false;
+
+    if let (Some(seconds), Some(p)) = (s.play_check, &s.player) {
+        match s.play_check_began {
+            None => {
+                s.play_check_began = Some(t);
+                p.play();
+            }
+            Some(began) if t - began >= seconds => {
+                let rate = s.doc.as_ref().map_or(48_000, |d| d.rate());
+                println!(
+                    "play-check: {:.1} s of wall time, playhead at {:.2} s, underruns {}, device {} at {} Hz, {} ch",
+                    t - began,
+                    p.position() as f64 / rate as f64,
+                    p.underruns(),
+                    p.device,
+                    p.dev_rate,
+                    p.dev_channels
+                );
+                std::process::exit(0);
+            }
+            Some(_) => {}
+        }
+    } else if s.play_check.is_some() {
+        println!("play-check: no player ({})", s.audio_note);
+        std::process::exit(1);
     }
-    s.checked_at = t;
-    let now = stamp(&s.paths);
-    if now == s.stamp {
-        return false;
+
+    let playing = s.player.as_ref().map(|p| (p.is_playing(), p.finished(), p.position() as f64));
+    if let Some((true, finished, at)) = playing {
+        if finished {
+            if let Some(p) = &s.player {
+                p.pause();
+            }
+            s.cursor = total(s);
+            changed = true;
+        }
+        // Page the view when the playhead leaves it.
+        let w = s.wave[0] as f64;
+        if w > 0.0 && (at < s.start || at > s.start + w * s.fpp) {
+            s.start = at - 0.05 * w * s.fpp;
+            clamp(s);
+            changed = true;
+        }
     }
-    reload(s);
-    if let Some(e) = s.doc.as_ref().and_then(|d| d.project.head_index().map(|i| &d.project.edits[i])) {
-        s.notice = Some(format!("Live · {} edited just now · {}", shown_name(&e.author), describe(e)));
+    let still_playing = s.player.as_ref().is_some_and(Player::is_playing);
+    tx.wake_after(Duration::from_millis(if still_playing { 4 } else { 500 }));
+
+    if t - s.checked_at >= 0.45 {
+        s.checked_at = t;
+        if stamp(&s.paths) != s.stamp {
+            reload(s);
+            if let Some((e, project)) = s.doc.as_ref().and_then(|d| d.project.head_index().map(|i| (&d.project.edits[i], &d.project))) {
+                s.notice = Some(format!("Live · {} edited just now · {}", shown_name(&e.author), describe(e, project)));
+            }
+            changed = true;
+        }
     }
-    true
+    sync(s);
+    changed
 }
 
 pub fn run(path: std::path::PathBuf) {

@@ -23,7 +23,8 @@ use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant
 use scrubr_core::edit::{self, DEFAULT_CROSSFADE_MS, Request, Revert};
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts};
 use scrubr_core::render::Renderer;
-use scrubr_core::{Peaks, Timeline, export, peaks, source};
+use scrubr_core::timeline::SrcSpan;
+use scrubr_core::{Kind, Peaks, Timeline, export, peaks, source};
 
 use crate::audio::Player;
 
@@ -61,6 +62,9 @@ stroke_icon!(NEXT, "scrubr-next", r#"<path d="M12 3.5V12.5"/><path d="M4 3.8L9.5
 stroke_icon!(ZOOM_IN, "scrubr-zoom-in", r#"<circle cx="7" cy="7" r="4"/><path d="M10 10L13.2 13.2M5.3 7H8.7M7 5.3V8.7"/>"#);
 stroke_icon!(ZOOM_OUT, "scrubr-zoom-out", r#"<circle cx="7" cy="7" r="4"/><path d="M10 10L13.2 13.2M5.3 7H8.7"/>"#);
 stroke_icon!(BUBBLE, "scrubr-bubble", r#"<path d="M3.5 3H12.5A1.5 1.5 0 0 1 14 4.5V9.5A1.5 1.5 0 0 1 12.5 11H8L5 13.5V11H3.5A1.5 1.5 0 0 1 2 9.5V4.5A1.5 1.5 0 0 1 3.5 3Z"/>"#);
+static STOP: Icon = Icon { name: "scrubr-stop", view: 16.0, body: r#"<path d="M4.6 4.6H11.4V11.4H4.6Z" fill="currentColor"/>"# };
+stroke_icon!(FOLDER, "scrubr-folder", r#"<path d="M2 4.5A1 1 0 0 1 3 3.5H6.2L7.6 5H13A1 1 0 0 1 14 6V11.5A1 1 0 0 1 13 12.5H3A1 1 0 0 1 2 11.5Z"/>"#);
+stroke_icon!(UP, "scrubr-up", r#"<path d="M8 12.5V3.5M4.5 7L8 3.5L11.5 7"/>"#);
 stroke_icon!(CROSS, "scrubr-cross", r#"<path d="M4.5 4.5L11.5 11.5M11.5 4.5L4.5 11.5"/>"#);
 stroke_icon!(FIT, "scrubr-fit", r#"<path d="M2.5 6V3.5H5M11 3.5H13.5V6M13.5 10V12.5H11M5 12.5H2.5V10"/>"#);
 
@@ -401,6 +405,57 @@ enum Ask {
     Export,
 }
 
+/// One row of the Files tab: a folder, or an audio file scrubr can read.
+struct Entry {
+    name: String,
+    path: PathBuf,
+    folder: bool,
+    bytes: u64,
+}
+
+/// The Files tab: a folder on disk, what is in it, and the file being listened to.
+struct Browser {
+    dir: PathBuf,
+    entries: Vec<Entry>,
+    /// Why the folder could not be read.
+    error: Option<String>,
+    /// The file being played before it is added, and its player.
+    playing: Option<(PathBuf, Player)>,
+}
+
+/// The endings of the files the Files tab lists: what `scrubr new` and `insert` read.
+const AUDIO_ENDINGS: [&str; 8] = ["wav", "wave", "flac", "mp3", "ogg", "m4a", "mp4", "aac"];
+
+/// The folders and audio files in `dir`: folders first, each in name order. Names that start
+/// with a dot and projects' cache folders are left out.
+fn list_folder(dir: &std::path::Path) -> Result<Vec<Entry>, String> {
+    let mut entries: Vec<Entry> = std::fs::read_dir(dir)
+        .map_err(|e| format!("This folder could not be read: {e}"))?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let meta = entry.metadata().ok()?;
+            let audio = path.extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO_ENDINGS.contains(&e.to_ascii_lowercase().as_str()));
+            // A project's own cache folder is scrubr's business, not something to browse.
+            let hidden = name.starts_with('.') || name.ends_with(".scrubr.cache");
+            (!hidden && (meta.is_dir() || (meta.is_file() && audio))).then(|| Entry { name, path, folder: meta.is_dir(), bytes: meta.len() })
+        })
+        .collect();
+    entries.sort_by(|a, b| b.folder.cmp(&a.folder).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(entries)
+}
+
+/// Shows a folder in the Files tab. Whatever was being listened to stops.
+fn browse(s: &mut Studio, dir: PathBuf) {
+    s.files.playing = None;
+    match list_folder(&dir) {
+        Ok(entries) => (s.files.entries, s.files.error) = (entries, None),
+        Err(e) => (s.files.entries, s.files.error) = (Vec::new(), Some(e)),
+    }
+    s.files.dir = dir;
+}
+
 /// An export running on its own thread.
 struct Exporting {
     name: String,
@@ -443,6 +498,10 @@ pub struct Studio {
     /// The range a label is being written for, in frames: a card with a text field is shown.
     labeling: Option<(f64, f64)>,
     label_text: TextEdit,
+    files: Browser,
+    /// `--outside-cut A..B`: no reload until the window next writes, so that write meets a
+    /// project another program has changed. For checks.
+    hold_reloads: bool,
     /// Something to tell the person, at the right of the transport: why an edit failed, how an
     /// export went, who just edited the project. There is nothing there otherwise.
     notice: Option<String>,
@@ -603,7 +662,51 @@ fn open_player(s: &mut Studio) {
     }
 }
 
+/// Plays a file from the Files tab, or stops it if it is the one playing. The timeline pauses.
+fn toggle_listen(s: &mut Studio, file: PathBuf) {
+    if s.files.playing.take().is_some_and(|(playing, _)| playing == file) {
+        return;
+    }
+    if let Some(p) = s.player.as_ref().filter(|p| p.is_playing()) {
+        p.pause();
+        s.cursor = p.position() as f64;
+    }
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if s.no_audio {
+        s.notice = Some("Audio is switched off, so there is nothing to hear.".into());
+        return;
+    }
+    match Player::file(&file, if s.mute { 0.0 } else { 1.0 }) {
+        Ok(p) => {
+            p.play();
+            s.notice = None;
+            s.files.playing = Some((file, p));
+        }
+        Err(e) => s.notice = Some(format!("{name} could not be played: {e}")),
+    }
+}
+
+/// Inserts a file from the Files tab into the timeline at the playhead.
+fn add_file(s: &mut Studio, file: PathBuf) {
+    let Some(doc) = &s.doc else { return };
+    s.files.playing = None;
+    let at = (head(s).round().max(0.0) as u64).min(doc.tl.total());
+    let (rate, crossfade) = (doc.rate(), (DEFAULT_CROSSFADE_MS / 1000.0 * doc.rate() as f64).round() as u32);
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let made = act_at(s, (at, at), "insert", move |paths, opts, range| {
+        let desc = format!("insert {name} at {}", timecode(range.0 as f64, rate));
+        edit::apply(paths, opts, &you(), false, |_, _| Ok((vec![Request::Insert { file: file.clone(), at: range.0, crossfade }], Some(desc)))).map(|_| ())
+    });
+    if let Some((at, _)) = made {
+        set_cursor(s, at as f64);
+        reveal(s, at as f64);
+        let dir = s.files.dir.clone();
+        browse(s, dir);
+    }
+}
+
 fn toggle_play(s: &mut Studio) {
+    s.files.playing = None;
     let Some(p) = &s.player else {
         s.notice = Some(if s.audio_note.is_empty() { "No audio output.".into() } else { s.audio_note.clone() });
         return;
@@ -682,6 +785,8 @@ fn init_with(path: Option<PathBuf>) -> Studio {
         hover_note: flag("--note").and_then(|t| t.parse().ok()),
         labeling: None,
         label_text: TextEdit::default(),
+        files: Browser { dir: PathBuf::new(), entries: Vec::new(), error: None, playing: None },
+        hold_reloads: false,
         notice: None,
         fleeting: None,
         pretend_edit_at: flag("--outside-edit").and_then(|t| t.parse().ok()),
@@ -704,6 +809,8 @@ fn init_with(path: Option<PathBuf>) -> Studio {
     reload(&mut s);
     // For stills: `--view START..END` in seconds, `--select START..END`, `--edit ID`,
     // `--cursor SECONDS`, `--tab labels`, `--menu edit`, `--no-audio`, `--meter L,R` in dBFS,
+    // `--tab files` with `--files FOLDER` for the Files tab, `--outside-cut A..B` to have another
+    // author cut that range behind the window's back,
     // `--note N` to show the Nth label's card, `--label-card` to open the card for writing one, `--outside-edit SECONDS` to reload then as if
     // another program had written the project.
     // `--mute` plays silently.
@@ -723,8 +830,23 @@ fn init_with(path: Option<PathBuf>) -> Studio {
     if has("--label-card") {
         begin_label(&mut s);
     }
-    if flag("--tab").as_deref() == Some("labels") {
-        s.tab = 1;
+    // The Files tab opens on the project's own folder, or the one `--files` names.
+    let folder = flag("--files").map(PathBuf::from).unwrap_or_else(|| s.paths.dir.clone());
+    if !s.blank {
+        browse(&mut s, folder);
+    }
+    // `--outside-cut A..B` in seconds: another author cuts that range once the window has read
+    // the project, and the window is not told.
+    if let (Some((a, b)), Some(version)) = (flag("--outside-cut").and_then(range), s.doc.as_ref().map(|d| d.project.version)) {
+        let range = (a as u64, b as u64);
+        let outside = Who { author: "codex".into(), session: Some("s9".into()) };
+        let _ = edit::apply(&s.paths, &WriteOpts { if_version: Some(version), ..Default::default() }, &outside, false, |_, _| Ok((vec![Request::Cut { range, crossfade: 240 }], None)));
+        s.hold_reloads = true;
+    }
+    match flag("--tab").as_deref() {
+        Some("labels") => s.tab = 1,
+        Some("files") => s.tab = 2,
+        _ => {}
     }
     if let Some(name) = flag("--menu") {
         s.menu = true;
@@ -1240,9 +1362,9 @@ fn commit_label(s: &mut Studio) {
         return cancel_label(s);
     }
     let range = (a.round() as u64, b.round() as u64);
-    act(s, move |paths| edit::add_label(paths, &WriteOpts::default(), &you(), |_, _| Ok((range, text))).map(|_| ()));
+    let made = act_at(s, range, "label", move |paths, opts, range| edit::add_label(paths, opts, &you(), |_, _| Ok((range, text.clone()))).map(|_| ()));
     // If it could not be added the card stays, with the reason in the transport.
-    if s.notice.is_none() {
+    if made.is_some() || s.selection.is_none() && s.notice.as_ref().is_some_and(|n| n.contains("edited the project first")) {
         cancel_label(s);
     }
 }
@@ -1802,10 +1924,127 @@ fn labels(doc: &Doc, lk: &Look) -> El {
     list
 }
 
+/// A size as file lists show it.
+fn file_size(bytes: u64) -> String {
+    size_text(bytes)
+}
+
+/// The Files tab: a folder to walk through, with a Play button and an Add button on each audio
+/// file, and under it the files the project already uses.
+fn files(s: &Studio, doc: &Doc, lk: &Look) -> El {
+    let k = &lk.k;
+    let b = &s.files;
+    let folder = b.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| b.dir.to_string_lossy().into_owned());
+    let parent = b.dir.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
+    let mut up = IconButton::new(&UP).variant(IconButtonVariant::GhostMuted).disabled(parent.is_none()).help("Up a folder");
+    if let Some(parent) = parent {
+        up = up.on_press(move |s: &mut Studio| browse(s, parent.clone()));
+    }
+    let mut head = row()
+        .w_full()
+        .pb(6.0)
+        .gap(6.0)
+        .center_y()
+        .child(up.build(k).key("files-up"))
+        .child(icon(&FOLDER, 14.0).color(k.c.text_muted))
+        .child(text(folder).font(k.ty.ui_medium).color(k.c.text_base).truncate().help(b.dir.to_string_lossy().into_owned()))
+        .child(el().grow(1.0));
+    if b.dir != s.paths.dir {
+        head = head.child(small_button(k, "Project folder", "files-home".into(), |s: &mut Studio| {
+            let dir = s.paths.dir.clone();
+            browse(s, dir);
+        }));
+    }
+    let mut list = col().key("file-list").w_full().gap(1.0).child(head);
+    if let Some(error) = &b.error {
+        list = list.child(text(error.clone()).font(k.ty.small).color(k.c.text_muted).wrap());
+    } else if b.entries.is_empty() {
+        list = list.child(text("No folders or audio files here.").font(k.ty.small).color(k.c.text_faint).wrap());
+    }
+    let at = timecode(self::head(s), doc.rate());
+    for (i, entry) in b.entries.iter().enumerate() {
+        let path = entry.path.clone();
+        if entry.folder {
+            let item = row()
+                .key(format!("folder-{i}"))
+                .w_full()
+                .h(30.0)
+                .px(8.0)
+                .gap(9.0)
+                .center_y()
+                .radius(k.radius.md)
+                .child(icon(&FOLDER, 14.0).color(k.c.text_muted))
+                .child(text(entry.name.clone()).font(k.ty.ui).color(k.c.text_base).truncate())
+                .on_press(move |s: &mut Studio| browse(s, path.clone()));
+            list = list.child(k.interactive(item));
+            continue;
+        }
+        let playing = b.playing.as_ref().is_some_and(|(p, _)| *p == entry.path);
+        let ending = entry.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
+        let (listen, add) = (path.clone(), path);
+        list = list.child(
+            row()
+                .key(format!("file-{i}"))
+                .w_full()
+                .px(8.0)
+                .py(5.0)
+                .gap(9.0)
+                .center_y()
+                .child(
+                    row()
+                        .key(format!("file-play-{i}"))
+                        .size(24.0, 24.0)
+                        .radius(12.0)
+                        .center()
+                        .fill(if playing { lk.you } else { k.c.text_base.alpha(0.07) })
+                        .help(if playing { "Stop" } else { "Play this file" })
+                        .on_press(move |s: &mut Studio| toggle_listen(s, listen.clone()))
+                        .child(icon(if playing { &STOP } else { &PLAY }, 11.0).color(if playing { lk.on_you } else { k.c.text_base })),
+                )
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(1.0)
+                        .child(text(entry.name.clone()).font(k.ty.ui).color(k.c.text_base).truncate())
+                        .child(text(format!("{ending} \u{b7} {}", file_size(entry.bytes))).font(lk.num(k.ty.small)).color(k.c.text_faint)),
+                )
+                .child(
+                    Button::new("Add".to_string())
+                        .variant(ButtonVariant::Neutral)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut Studio| add_file(s, add.clone()))
+                        .build(k)
+                        .key(format!("file-add-{i}"))
+                        .help(format!("Insert at the playhead, {at}")),
+                ),
+        );
+    }
+    // What the project is already made of.
+    list = list.child(el().h(10.0)).child(el().w_full().h(1.0).fill(lk.rule)).child(el().h(6.0)).child(text("In this project").font(k.ty.small_medium).color(k.c.text_muted).px(8.0));
+    for source in &doc.project.sources {
+        let missing = !s.paths.source_file(source).is_file();
+        let name = std::path::Path::new(&source.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| source.path.clone());
+        let length = duration(source.frames as f64, doc.rate());
+        list = list.child(
+            row()
+                .w_full()
+                .px(8.0)
+                .py(4.0)
+                .gap(8.0)
+                .center_y()
+                .child(text(name).font(k.ty.ui).color(if missing { k.c.text_muted } else { k.c.text_base }).truncate().help(source.path.clone()))
+                .child(el().grow(1.0))
+                .child(if missing { chip(lk, "missing", lk.meter[3]) } else { text(length).font(lk.num(k.ty.small)).color(k.c.text_faint) }),
+        );
+    }
+    list
+}
+
 fn log(s: &Studio, doc: &Doc, lk: &Look) -> El {
     let k = &lk.k;
     let applied = doc.states.iter().filter(|s| **s == EditState::Applied).count();
-    let tabs = [format!("Activity  {applied}"), format!("Labels  {}", doc.notes.len())];
+    let tabs = [format!("Activity  {applied}"), format!("Labels  {}", doc.notes.len()), "Files".to_string()];
     col()
         .key("log")
         .w_full()
@@ -1818,7 +2057,14 @@ fn log(s: &Studio, doc: &Doc, lk: &Look) -> El {
                 .pb(10.0)
                 .gap(10.0)
                 .center_y()
-                .child(SegmentedControl::new(&tabs, Some(s.tab)).fit().on_pick(|s: &mut Studio, i, _| s.tab = i).build(k).key("log-tabs"))
+                .child(SegmentedControl::new(&tabs, Some(s.tab)).fit().on_pick(|s: &mut Studio, i, _| {
+                    s.tab = i;
+                    // The folder may have changed since it was last read.
+                    if i == 2 {
+                        let dir = s.files.dir.clone();
+                        browse(s, dir);
+                    }
+                }).build(k).key("log-tabs"))
                 .child(el().grow(1.0))
                 .child(text(format!("v{}", doc.project.version)).font(lk.num(k.ty.small)).color(k.c.text_faint)),
         )
@@ -1830,7 +2076,11 @@ fn log(s: &Studio, doc: &Doc, lk: &Look) -> El {
                 .px(10.0)
                 .pb(16.0)
                 .scroll(ScrollSpec { stick_bottom: false })
-                .child(if s.tab == 0 { activity(s, doc, lk) } else { labels(doc, lk) }),
+                .child(match s.tab {
+                    0 => activity(s, doc, lk),
+                    1 => labels(doc, lk),
+                    _ => files(s, doc, lk),
+                }),
         )
 }
 
@@ -1840,14 +2090,112 @@ fn you() -> Who {
     Who { author: "you".into(), session: None }
 }
 
-/// Runs a change to the project and reloads, or says why it could not be made.
+/// Runs a change to the project and reloads, or says why it could not be made. For changes that
+/// name what they act on by id, which mean the same whatever else has happened to the project.
 fn act(s: &mut Studio, change: impl FnOnce(&Paths) -> scrubr_core::Result<()>) {
+    s.hold_reloads = false;
     match change(&s.paths) {
         Ok(()) => {
             s.notice = None;
             reload(s);
         }
         Err(e) => s.notice = Some(e.to_string()),
+    }
+}
+
+/// How a write that checked the project's version came out.
+#[derive(PartialEq)]
+enum Wrote {
+    Done,
+    /// Another program had written the project since this window read it. Nothing was changed,
+    /// and the window now shows the project as it is.
+    Changed,
+    Failed,
+}
+
+/// Runs a change that depends on what this window last read: a position on the timeline, or
+/// which edit is at head. It is refused if the project has been written since, and the window
+/// reloads; the caller decides whether the change still makes sense.
+fn act_checked(s: &mut Studio, change: impl FnOnce(&Paths, &WriteOpts) -> scrubr_core::Result<()>) -> Wrote {
+    s.hold_reloads = false;
+    let opts = WriteOpts { if_version: s.doc.as_ref().map(|d| d.project.version), ..Default::default() };
+    match change(&s.paths, &opts) {
+        Ok(()) => {
+            s.notice = None;
+            reload(s);
+            Wrote::Done
+        }
+        Err(e) if e.kind() == Kind::Conflict => {
+            reload(s);
+            Wrote::Changed
+        }
+        Err(e) => {
+            s.notice = Some(e.to_string());
+            Wrote::Failed
+        }
+    }
+}
+
+/// Who made the edit now at head, for telling the person whose write came first.
+fn last_author(s: &Studio) -> String {
+    s.doc.as_ref().and_then(|d| d.project.head_index().map(|i| shown_name(&d.project.edits[i].author))).unwrap_or_else(|| "Someone".into())
+}
+
+/// A place on the timeline in terms of the source audio, which still means something after the
+/// project has changed: the audio a range covered, or the frame a point sat on.
+enum Place {
+    Range(Vec<SrcSpan>),
+    Point(Option<(usize, u64)>),
+}
+
+fn place(s: &Studio, range: (u64, u64)) -> Place {
+    match &s.doc {
+        Some(doc) if range.1 > range.0 => Place::Range(doc.tl.resolve(range.0, range.1)),
+        Some(doc) => Place::Point(doc.tl.anchor(range.0)),
+        None => Place::Point(None),
+    }
+}
+
+/// Where a place is on the timeline now, if the same audio is still there in one piece.
+fn find(s: &Studio, place: &Place) -> Option<(u64, u64)> {
+    let tl = &s.doc.as_ref()?.tl;
+    match place {
+        Place::Range(spans) => {
+            let first = spans.first()?;
+            let a = tl.position_from(first.src, first.start)?;
+            let b = a + spans.iter().map(|x| x.frames()).sum::<u64>();
+            (b <= tl.total() && tl.resolve(a, b) == *spans).then_some((a, b))
+        }
+        Place::Point(at) => {
+            let (src, frame) = (*at)?;
+            let t = tl.position_from(src, frame)?;
+            (tl.anchor(t) == Some((src, frame))).then_some((t, t))
+        }
+    }
+}
+
+/// Runs a change at a place on the timeline. If another program wrote the project first, the
+/// place is looked for again in the project as it now is, and the change is made there when the
+/// same audio is still in one piece. Returns where it was made.
+fn act_at(s: &mut Studio, range: (u64, u64), what: &str, change: impl Fn(&Paths, &WriteOpts, (u64, u64)) -> scrubr_core::Result<()>) -> Option<(u64, u64)> {
+    let kept = place(s, range);
+    match act_checked(s, |paths, opts| change(paths, opts, range)) {
+        Wrote::Done => Some(range),
+        Wrote::Failed => None,
+        Wrote::Changed => {
+            let who = last_author(s);
+            match find(s, &kept) {
+                Some(moved) if act_checked(s, |paths, opts| change(paths, opts, moved)) == Wrote::Done => {
+                    s.notice = Some(format!("{who} edited the project first. Your {what} was made on the same audio, now at {}.", timecode(moved.0 as f64, s.doc.as_ref().map_or(48_000, |d| d.rate()))));
+                    Some(moved)
+                }
+                _ => {
+                    s.selection = None;
+                    s.notice = Some(format!("{who} edited the project first, and the audio your {what} was for has changed. Nothing was done: look again and repeat it."));
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -1859,12 +2207,20 @@ fn select(s: &mut Studio, i: usize) {
     }
 }
 
+/// Undo and redo move head, so they mean something only for the project this window last read.
+fn step_head(s: &mut Studio, back: bool) {
+    let wrote = act_checked(s, |paths, opts| if back { edit::undo(paths, opts, 1).map(|_| ()) } else { edit::redo(paths, opts, 1).map(|_| ()) });
+    if wrote == Wrote::Changed {
+        s.notice = Some(format!("{} edited the project first, so nothing was {}. Look at the log and repeat it if you still mean to.", last_author(s), if back { "undone" } else { "redone" }));
+    }
+}
+
 fn undo(s: &mut Studio) {
-    act(s, |paths| edit::undo(paths, &WriteOpts::default(), 1).map(|_| ()));
+    step_head(s, true);
 }
 
 fn redo(s: &mut Studio) {
-    act(s, |paths| edit::redo(paths, &WriteOpts::default(), 1).map(|_| ()));
+    step_head(s, false);
 }
 
 /// The selection as whole frames, with what a cut or mute of it is called in the log.
@@ -1877,17 +2233,24 @@ fn selected_range(s: &Studio, verb: &str) -> Option<((u64, u64), u32, String)> {
 }
 
 fn cut_selection(s: &mut Studio) {
-    let Some((range, crossfade, desc)) = selected_range(s, "cut") else { return };
-    act(s, move |paths| edit::apply(paths, &WriteOpts::default(), &you(), false, |_, _| Ok((vec![Request::Cut { range, crossfade }], Some(desc)))).map(|_| ()));
-    if s.notice.is_none() {
+    let Some((range, crossfade, _)) = selected_range(s, "cut") else { return };
+    let rate = s.doc.as_ref().map_or(48_000, |d| d.rate());
+    let name = move |range: (u64, u64)| format!("cut {}..{}", timecode(range.0 as f64, rate), timecode(range.1 as f64, rate));
+    let made = act_at(s, range, "cut", move |paths, opts, range| edit::apply(paths, opts, &you(), false, |_, _| Ok((vec![Request::Cut { range, crossfade }], Some(name(range))))).map(|_| ()));
+    if let Some(range) = made {
         s.selection = None;
         set_cursor(s, range.0 as f64);
     }
 }
 
 fn mute_selection(s: &mut Studio) {
-    let Some((range, crossfade, desc)) = selected_range(s, "mute") else { return };
-    act(s, move |paths| edit::apply(paths, &WriteOpts::default(), &you(), false, |_, _| Ok((vec![Request::Mute { range, crossfade }], Some(desc)))).map(|_| ()));
+    let Some((range, crossfade, _)) = selected_range(s, "mute") else { return };
+    let rate = s.doc.as_ref().map_or(48_000, |d| d.rate());
+    let name = move |range: (u64, u64)| format!("mute {}..{}", timecode(range.0 as f64, rate), timecode(range.1 as f64, rate));
+    let made = act_at(s, range, "mute", move |paths, opts, range| edit::apply(paths, opts, &you(), false, |_, _| Ok((vec![Request::Mute { range, crossfade }], Some(name(range))))).map(|_| ()));
+    if let Some(range) = made {
+        s.selection = Some((range.0 as f64, range.1 as f64));
+    }
 }
 
 /// Puts the start or the end of the selection at the playhead. The other end stays where it is,
@@ -1923,12 +2286,16 @@ fn open_project(s: &mut Studio, path: PathBuf) {
     s.fit_pending = true;
     reload(s);
     s.cursor = 0.0;
+    let folder = s.paths.dir.clone();
+    browse(s, folder);
 }
 
-/// A size as people read it: 412 MB, 8.4 MB, 940 KB.
+/// A size as people read it: 1.04 GB, 412 MB, 8.4 MB, 940 KB.
 fn size_text(bytes: u64) -> String {
     let mb = bytes as f64 / 1_000_000.0;
-    if mb >= 100.0 { format!("{mb:.0} MB") } else if mb >= 1.0 { format!("{mb:.1} MB") } else { format!("{:.0} KB", bytes as f64 / 1000.0) }
+    if mb >= 1000.0 {
+        format!("{:.2} GB", mb / 1000.0)
+    } else if mb >= 100.0 { format!("{mb:.0} MB") } else if mb >= 1.0 { format!("{mb:.1} MB") } else { format!("{:.0} KB", bytes as f64 / 1000.0) }
 }
 
 /// Renders the timeline at head to `out` on a thread of its own. `poll` watches it.
@@ -2488,13 +2855,18 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
     // The meters go on falling for a moment after the audio stops.
     let meters_lit = step_meters(s, t);
     changed |= watch_export(s);
-    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() { 100 } else { 500 }));
+    // A file being listened to stops showing as playing when it ends.
+    if s.files.playing.as_ref().is_some_and(|(_, p)| p.done()) {
+        s.files.playing = None;
+        changed = true;
+    }
+    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
 
     if s.pretend_edit_at.is_some_and(|at| t >= at) {
         s.pretend_edit_at = None;
         s.stamp = None;
     }
-    if t - s.checked_at >= 0.45 && !s.blank {
+    if t - s.checked_at >= 0.45 && !s.blank && !s.hold_reloads {
         s.checked_at = t;
         if stamp(&s.paths) != s.stamp {
             reload(s);

@@ -6,7 +6,7 @@
 //! original when it is missing. Everything streams: no file is held in memory.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
@@ -215,6 +215,80 @@ pub fn probe(path: &Path) -> Result<Probe> {
         frames: decoded.format.tracks().iter().find(|t| t.id == decoded.track).and_then(|t| t.codec_params.n_frames),
         wav: false,
     })
+}
+
+enum Reader {
+    Wav(WavFile),
+    Other(Decoded),
+}
+
+/// A file opened for listening to before it joins a project: any format scrubr reads, streamed
+/// from its start at its own rate. Nothing is converted or cached.
+pub struct FileAudio {
+    path: PathBuf,
+    reader: Reader,
+    rate: u32,
+    channels: usize,
+    frames: Option<u64>,
+    /// Decoded samples not yet handed out.
+    carry: Vec<f32>,
+}
+
+impl FileAudio {
+    pub fn open(path: &Path) -> Result<FileAudio> {
+        if !path.exists() {
+            return Err(Error::not_found("file_not_found", format!("{} does not exist.", path.display())).hint("Check the path to the audio file."));
+        }
+        if let Ok(wav) = WavFile::open(path) {
+            let info = wav.info();
+            let (rate, channels, frames) = (info.sample_rate, info.channels as usize, Some(info.frames));
+            return Ok(FileAudio { path: path.to_path_buf(), reader: Reader::Wav(wav), rate, channels, frames, carry: Vec::new() });
+        }
+        let decoded = Decoded::open(path)?;
+        let frames = decoded.format.tracks().iter().find(|t| t.id == decoded.track).and_then(|t| t.codec_params.n_frames);
+        Ok(FileAudio { path: path.to_path_buf(), rate: decoded.rate, channels: decoded.channels, frames, reader: Reader::Other(decoded), carry: Vec::new() })
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// The file's length in frames, when its header gives it.
+    pub fn frames(&self) -> Option<u64> {
+        self.frames
+    }
+
+    /// Starts again from the first frame.
+    pub fn rewind(&mut self) -> Result<()> {
+        *self = FileAudio::open(&self.path.clone())?;
+        Ok(())
+    }
+
+    /// Replaces `out` with up to `frames` interleaved frames and returns how many. Zero is the end.
+    pub fn read(&mut self, frames: usize, out: &mut Vec<f32>) -> Result<usize> {
+        match &mut self.reader {
+            Reader::Wav(wav) => wav.read(frames, out),
+            Reader::Other(decoded) => {
+                let want = frames * self.channels;
+                let mut block = Vec::new();
+                while self.carry.len() < want {
+                    decoded.decode_next(&self.path, &mut block)?;
+                    if block.is_empty() {
+                        break;
+                    }
+                    self.carry.extend_from_slice(&block);
+                }
+                let take = want.min(self.carry.len()) / self.channels * self.channels;
+                out.clear();
+                out.extend(self.carry.drain(..take));
+                Ok(take / self.channels)
+            }
+        }
+    }
 }
 
 fn open_frames<'a>(path: &'a Path, wav: bool) -> Result<Box<dyn Frames + 'a>> {

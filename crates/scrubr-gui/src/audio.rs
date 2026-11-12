@@ -22,6 +22,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 use scrubr_core::project::{Paths, Project};
 use scrubr_core::render::Renderer;
+use scrubr_core::source::FileAudio;
 use scrubr_core::WavFile;
 
 /// Source frames decoded per read.
@@ -95,6 +96,45 @@ impl Source for TimelineSource {
     }
 }
 
+/// A file played as it is, before it joins a project: any format the core reads.
+struct FileSource {
+    audio: FileAudio,
+    /// The length, or a very large number when the file does not state one.
+    frames: u64,
+}
+
+impl Source for FileSource {
+    fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.audio.sample_rate()
+    }
+
+    fn channels(&self) -> usize {
+        self.audio.channels()
+    }
+
+    fn seek(&mut self, frame: u64) {
+        // A compressed file is read from its start: go back there and read up to the frame.
+        if self.audio.rewind().is_err() {
+            return;
+        }
+        let (mut left, mut skipped) = (frame, Vec::new());
+        while left > 0 {
+            match self.audio.read((left as usize).min(CHUNK), &mut skipped) {
+                Ok(n) if n > 0 => left -= n as u64,
+                _ => break,
+            }
+        }
+    }
+
+    fn read(&mut self, frames: usize, out: &mut Vec<f32>) -> usize {
+        self.audio.read(frames, out).unwrap_or(0)
+    }
+}
+
 struct Shared {
     playing: AtomicBool,
     quit: AtomicBool,
@@ -110,6 +150,8 @@ struct Shared {
     base: AtomicU64,
     /// Device frames played since `base`.
     played: AtomicU64,
+    /// Device frames handed to the device's queue since `base`.
+    fed: AtomicU64,
     /// The decoder reached the end of the file.
     ended: AtomicBool,
     /// Callbacks that ran out of audio while playing before the end of the file.
@@ -143,6 +185,14 @@ impl Player {
         Self::start(Box::new(TimelineSource { renderer, rate: project.sample_rate, pos: 0 }), gain)
     }
 
+    /// Opens the default output device over an audio file in any format the core reads, paused
+    /// at its start: for hearing a file before adding it to a project.
+    pub fn file(path: &Path, gain: f32) -> Result<Player, String> {
+        let audio = FileAudio::open(path).map_err(|e| e.to_string())?;
+        let frames = audio.frames().unwrap_or(u64::MAX / 4);
+        Self::start(Box::new(FileSource { audio, frames }), gain)
+    }
+
     fn start(wav: Box<dyn Source>, gain: f32) -> Result<Player, String> {
         let frames = wav.frames();
         let src_rate = wav.sample_rate();
@@ -155,6 +205,7 @@ impl Player {
             flushed: AtomicBool::new(false),
             base: AtomicU64::new(0),
             played: AtomicU64::new(0),
+            fed: AtomicU64::new(0),
             ended: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             gain: AtomicU32::new(gain.to_bits()),
@@ -222,6 +273,12 @@ impl Player {
     /// True once the file has played to its end.
     pub fn finished(&self) -> bool {
         self.shared.ended.load(Relaxed) && self.position() >= self.frames.saturating_sub(self.src_rate as u64 / 50)
+    }
+
+    /// True once everything the source held has been played. Unlike [`Player::finished`] it does
+    /// not need the source to have said how long it is.
+    pub fn done(&self) -> bool {
+        self.shared.ended.load(Relaxed) && self.shared.pending.load(Acquire) < 0 && self.shared.played.load(Relaxed) >= self.shared.fed.load(Relaxed)
     }
 
     pub fn underruns(&self) -> u64 {
@@ -404,6 +461,7 @@ fn decode(mut wav: Box<dyn Source>, mut ring: Producer<f32>, shared: Arc<Shared>
             resampler.reset();
             shared.base.store(target as u64, Release);
             shared.played.store(0, Release);
+            shared.fed.store(0, Release);
             shared.ended.store(false, Release);
             shared.flushing.store(false, Release);
             // Leave `pending` alone if the UI has already asked for another seek.
@@ -435,6 +493,7 @@ fn decode(mut wav: Box<dyn Source>, mut ring: Producer<f32>, shared: Arc<Shared>
             a.copy_from_slice(&samples[..a.len()]);
             b.copy_from_slice(&samples[a.len()..]);
             chunk.commit_all();
+            shared.fed.fetch_add(samples.len() as u64 / 2, Relaxed);
         }
     }
 }

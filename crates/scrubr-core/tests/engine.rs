@@ -737,6 +737,38 @@ fn waveform_images_are_written_from_peaks_and_from_audio() {
 }
 
 #[test]
+fn a_file_can_be_listened_to_before_it_joins_a_project() {
+    use scrubr_core::source::FileAudio;
+    // The AAC fixture: read in small pieces from its start, it gives the audio an import gives.
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.m4a");
+    let mut audio = FileAudio::open(&file).unwrap();
+    assert_eq!((audio.sample_rate(), audio.channels(), audio.frames()), (48_000, 1, Some(49_024)));
+    let (mut all, mut piece) = (Vec::new(), Vec::new());
+    while audio.read(1000, &mut piece).unwrap() > 0 {
+        assert!(piece.len() <= 1000);
+        all.extend_from_slice(&piece);
+    }
+    assert_eq!(all.len(), 49_024);
+    let body = &all[4_800..43_200];
+    let crossings = body.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+    assert!((351..=353).contains(&crossings), "0.8 s of 440 Hz has 352 rising crossings, not {crossings}");
+    // Starting again gives the same audio.
+    audio.rewind().unwrap();
+    audio.read(1000, &mut piece).unwrap();
+    assert_eq!(piece[..], all[..1000]);
+
+    // A WAV is read in place, and a file that is not there says so.
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("tone.wav");
+    write_wav(&wav, RATE, 2, 16, 4_800, |f, _| (f as f32 * 0.01).sin() * 0.25);
+    let mut audio = FileAudio::open(&wav).unwrap();
+    assert_eq!((audio.sample_rate(), audio.channels(), audio.frames()), (RATE, 2, Some(4_800)));
+    assert_eq!(audio.read(10_000, &mut piece).unwrap(), 4_800);
+    assert_eq!(audio.read(10_000, &mut piece).unwrap(), 0);
+    assert_eq!(FileAudio::open(&dir.path().join("nope.wav")).err().unwrap().exit_code(), 2);
+}
+
+#[test]
 fn an_m4a_file_imports_as_a_source() {
     // One second of a 440 Hz tone at an eighth of full scale, encoded as AAC in an M4A file.
     let dir = tempfile::tempdir().unwrap();

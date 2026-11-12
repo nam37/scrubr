@@ -115,6 +115,10 @@ struct Shared {
     /// Callbacks that ran out of audio while playing before the end of the file.
     underruns: AtomicU64,
     gain: AtomicU32,
+    /// The highest sample magnitude played on the left and the right since the UI last took
+    /// them, as `f32` bits, before the output gain. Magnitudes are never negative, so their
+    /// bits order the same way they do.
+    level: [AtomicU32; 2],
 }
 
 pub struct Player {
@@ -154,6 +158,7 @@ impl Player {
             ended: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             gain: AtomicU32::new(gain.to_bits()),
+            level: [AtomicU32::new(0), AtomicU32::new(0)],
         });
 
         // A cpal stream is not `Send` on every platform, so it lives on the thread that made it.
@@ -222,6 +227,13 @@ impl Player {
     pub fn underruns(&self) -> u64 {
         self.shared.underruns.load(Relaxed)
     }
+
+    /// The highest sample magnitude played on the left and the right since the last call, and
+    /// zero while nothing plays. It is the timeline's own level: the output gain does not
+    /// change it.
+    pub fn take_levels(&self) -> [f32; 2] {
+        [0, 1].map(|c| f32::from_bits(self.shared.level[c].swap(0, Relaxed)))
+    }
 }
 
 impl Drop for Player {
@@ -284,12 +296,15 @@ where
                 let want = data.len() / channels;
                 let have = (ring.slots() / 2).min(want);
                 let mut out = data.chunks_exact_mut(channels);
+                let mut loudest = [0f32; 2];
                 if let Ok(chunk) = ring.read_chunk(have * 2) {
                     let (a, b) = chunk.as_slices();
                     let mut samples = a.iter().chain(b.iter());
                     for frame in out.by_ref().take(have) {
-                        let l = samples.next().copied().unwrap_or(0.0) * gain;
-                        let r = samples.next().copied().unwrap_or(0.0) * gain;
+                        let l = samples.next().copied().unwrap_or(0.0);
+                        let r = samples.next().copied().unwrap_or(0.0);
+                        loudest = [loudest[0].max(l.abs()), loudest[1].max(r.abs())];
+                        let (l, r) = (l * gain, r * gain);
                         for (c, s) in frame.iter_mut().enumerate() {
                             *s = match c {
                                 0 => T::from_sample(l),
@@ -308,6 +323,11 @@ where
                     frame.fill(silence);
                 }
                 shared.played.fetch_add(have as u64, Relaxed);
+                for (level, loudest) in shared.level.iter().zip(loudest) {
+                    if loudest.is_finite() {
+                        level.fetch_max(loudest.to_bits(), Relaxed);
+                    }
+                }
                 if have < want && !shared.ended.load(Relaxed) {
                     shared.underruns.fetch_add(1, Relaxed);
                 }

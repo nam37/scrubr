@@ -9,6 +9,7 @@
 //! keyboard all read. Playback renders the timeline with its edits applied. Open and export are
 //! not wired yet.
 
+use std::f32::consts::FRAC_PI_2;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rune::{App, AppSpec, Chrome, Color, Cx, El, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, ScrollSpec, Shape, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
@@ -78,13 +79,20 @@ struct Look {
     /// The timeline card.
     lane: Color,
     rule: Color,
+    /// The window's own background, for covers drawn over it.
+    page: Color,
+    /// The level meter from quiet to full scale: safe, getting loud, loud, clipping.
+    meter: [Color; 4],
 }
 
 fn look(dark: bool) -> Look {
     if dark {
         let you = oklch(0.80, 0.14, 75.0);
-        let k = Kit::from_palette(PaletteSeed { bg: oklch(0.195, 0.006, 70.0), fg: oklch(0.94, 0.012, 85.0), accent: you });
+        let page = oklch(0.195, 0.006, 70.0);
+        let k = Kit::from_palette(PaletteSeed { bg: page, fg: oklch(0.94, 0.012, 85.0), accent: you });
         Look {
+            page,
+            meter: [oklch(0.80, 0.17, 152.0), oklch(0.88, 0.17, 102.0), oklch(0.79, 0.17, 62.0), oklch(0.66, 0.22, 27.0)],
             ink: oklch(0.90, 0.03, 85.0),
             ink_soft: oklch(0.90, 0.03, 85.0).alpha(0.30),
             you,
@@ -96,8 +104,11 @@ fn look(dark: bool) -> Look {
         }
     } else {
         let you = oklch(0.64, 0.155, 60.0);
-        let k = Kit::from_palette(PaletteSeed { bg: oklch(0.962, 0.006, 80.0), fg: oklch(0.24, 0.012, 70.0), accent: you });
+        let page = oklch(0.962, 0.006, 80.0);
+        let k = Kit::from_palette(PaletteSeed { bg: page, fg: oklch(0.24, 0.012, 70.0), accent: you });
         Look {
+            page,
+            meter: [oklch(0.70, 0.17, 152.0), oklch(0.82, 0.17, 98.0), oklch(0.72, 0.18, 58.0), oklch(0.60, 0.22, 27.0)],
             ink: oklch(0.30, 0.02, 70.0),
             ink_soft: oklch(0.30, 0.02, 70.0).alpha(0.28),
             you,
@@ -404,9 +415,103 @@ pub struct Studio {
     /// the view.
     playhead: Live<[f32; 2]>,
     clock: LiveText,
+    meters: Meters,
     /// `--play-check SECONDS`: play muted for that long, print what happened, and exit.
     play_check: Option<f64>,
     play_check_began: Option<f64>,
+}
+
+/// The bottom of the level meters, in dBFS. The top is full scale.
+const METER_FLOOR: f32 = -60.0;
+/// How fast a bar falls once the audio is quieter than it shows, in dB a second.
+const METER_FALL: f32 = 24.0;
+/// How long the tick stays at the highest level before it falls too, in seconds.
+const METER_HOLD: f64 = 1.2;
+/// How long the light at the end of a bar stays on after a sample at full scale, in seconds.
+const METER_CLIP: f64 = 2.0;
+
+/// The level meters beside the counter: what is playing, left and right. The bars rise at once
+/// and fall slowly, as a peak meter does. Everything drawn moves through live values, so a
+/// frame of playback does not re-run the view.
+struct Meters {
+    /// What each bar shows, in dBFS.
+    level: [f32; 2],
+    /// The highest level each bar reached lately, and when.
+    hold: [(f32, f64); 2],
+    clip_until: [f64; 2],
+    /// When the meters last moved.
+    at: f64,
+    /// The highest level since the window opened, for `--play-check`.
+    seen: [f32; 2],
+    /// `--meter L,R` in dBFS: levels to hold, for stills.
+    fixed: Option<[f32; 2]>,
+    /// Where the cover over the unlit part of each bar starts, the tick, and the light.
+    cover: [Live<[f32; 2]>; 2],
+    tick: [Live<[f32; 2]>; 2],
+    clip: [Live<f32>; 2],
+}
+
+impl Meters {
+    fn new(fixed: Option<[f32; 2]>) -> Meters {
+        Meters {
+            level: [METER_FLOOR; 2],
+            hold: [(METER_FLOOR, 0.0); 2],
+            clip_until: [0.0; 2],
+            at: 0.0,
+            seen: [f32::NEG_INFINITY; 2],
+            fixed,
+            cover: [Live::new([0.0, 0.0]), Live::new([0.0, 0.0])],
+            tick: [Live::new([-100.0, 0.0]), Live::new([-100.0, 0.0])],
+            clip: [Live::new(0.0), Live::new(0.0)],
+        }
+    }
+}
+
+/// How wide the meter bars are, and whether the timeline's length still fits beside the
+/// counter: a narrow window gives the length up before the meters.
+fn meter_room(s: &Studio) -> (f32, bool) {
+    // What the transport has left once its buttons and the counter are placed, less what the
+    // meters need around their bars.
+    let room = s.wave[0] - 467.0 - 56.0;
+    // The length takes 86 points. While both fit, the last edit's line keeps 180 too.
+    if room - 86.0 >= 110.0 { ((room - 86.0 - 180.0).clamp(110.0, 200.0), true) } else { (room.clamp(72.0, 200.0), false) }
+}
+
+/// Moves the meters to the level of what just played. True while anything is still lit.
+fn step_meters(s: &mut Studio, t: f64) -> bool {
+    let (w, _) = meter_room(s);
+    let played = match (s.meters.fixed, &s.player) {
+        (Some(db), _) => db.map(|db| 10f32.powf(db / 20.0)),
+        (None, Some(p)) => p.take_levels(),
+        (None, None) => [0.0; 2],
+    };
+    let m = &mut s.meters;
+    let fall = METER_FALL * (t - m.at).clamp(0.0, 0.25) as f32;
+    m.at = t;
+    let x_of = |db: f32| w * (db.clamp(METER_FLOOR, 0.0) - METER_FLOOR) / -METER_FLOOR;
+    let mut lit = false;
+    for (c, &played) in played.iter().enumerate() {
+        let db = if played > 0.0 { 20.0 * played.log10() } else { f32::NEG_INFINITY };
+        m.seen[c] = m.seen[c].max(db);
+        if played >= scrubr_core::analysis::CLIP_LEVEL {
+            m.clip_until[c] = t + METER_CLIP;
+        }
+        m.level[c] = db.max(m.level[c] - fall).max(METER_FLOOR);
+        if m.level[c] >= m.hold[c].0 {
+            m.hold[c] = (m.level[c], t);
+        } else if t - m.hold[c].1 > METER_HOLD {
+            m.hold[c].0 = (m.hold[c].0 - fall).max(m.level[c]);
+        }
+        if m.fixed.is_some() {
+            // A still shows the tick a little above the bar, as it sits just after a peak.
+            m.hold[c].0 = (m.level[c] + 5.0).min(0.0);
+        }
+        m.cover[c].set([x_of(m.level[c]), 0.0]);
+        m.tick[c].set([if m.hold[c].0 > METER_FLOOR + 0.5 { x_of(m.hold[c].0) } else { -100.0 }, 0.0]);
+        m.clip[c].set(if t < m.clip_until[c] { 1.0 } else { 0.0 });
+        lit |= m.level[c] > METER_FLOOR || m.hold[c].0 > METER_FLOOR || t < m.clip_until[c];
+    }
+    lit
 }
 
 fn stamp(paths: &Paths) -> Option<SystemTime> {
@@ -523,12 +628,17 @@ fn init_with(path: std::path::PathBuf) -> Studio {
         mute: has("--mute") || play_check.is_some(),
         playhead: Live::new([-100.0, 0.0]),
         clock: LiveText::new("0:00.000"),
+        meters: Meters::new(flag("--meter").and_then(|text| {
+            let (l, r) = text.split_once(',')?;
+            Some([l.parse().ok()?, r.parse().ok()?])
+        })),
         play_check,
         play_check_began: None,
     };
     reload(&mut s);
     // For stills: `--view START..END` in seconds, `--select START..END`, `--edit ID`,
-    // `--cursor SECONDS`, `--tab labels`, `--menu edit`, `--no-audio`. `--mute` plays silently.
+    // `--cursor SECONDS`, `--tab labels`, `--menu edit`, `--no-audio`, `--meter L,R` in dBFS.
+    // `--mute` plays silently.
     let rate = s.doc.as_ref().map_or(48_000.0, |d| d.rate() as f64);
     let range = |text: String| {
         let (a, b) = text.split_once("..")?;
@@ -1085,9 +1195,68 @@ fn tool(s: &Studio, k: &Kit, i: &'static Icon, label: &str) -> El {
         .key(format!("tool-{}", c.label))
 }
 
+/// Level meters for what is playing: a bar for each channel on a dB scale, a tick at the highest
+/// recent level, and a light at the end that stays on for a moment after a sample at full scale.
+fn meters(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> El {
+    let k = &lk.k;
+    let m = &s.meters;
+    let stereo = doc.project.channels > 1;
+    let (bar_h, pitch) = if stereo { (8.0, 12.0) } else { (10.0, 0.0) };
+    let bars_h = pitch + bar_h;
+    // Room at the left for the channel's letter.
+    let x0 = if stereo { 14.0 } else { 0.0 };
+    let part = |db: f32| (db - METER_FLOOR) / -METER_FLOOR;
+    let small = TextStyle { size: 9.0, weight: 500.0, line_height: 10.0, ..lk.num(k.ty.small) };
+    let stops = [(0.0, lk.meter[0]), (part(-20.0), lk.meter[0]), (part(-12.0), lk.meter[1]), (part(-6.0), lk.meter[2]), (1.0, lk.meter[3])];
+    let mut plate = el().key("meters").size(x0 + w + 28.0, bars_h + 17.0);
+    for c in 0..if stereo { 2 } else { 1 } {
+        let y = c as f32 * pitch;
+        if stereo {
+            plate = plate.child(text(["L", "R"][c]).absolute(1.0, y + bar_h / 2.0 - 5.0).font(TextStyle { weight: 650.0, ..small }).color(k.c.text_muted));
+        }
+        plate = plate
+            .child(
+                el().key(format!("meter-{c}"))
+                    .absolute(x0, y)
+                    .size(w, bar_h)
+                    .radius(bar_h / 2.0)
+                    .clip_rounded(bar_h / 2.0)
+                    .child(el().absolute(0.0, 0.0).size(w, bar_h).linear_gradient(FRAC_PI_2, stops))
+                    // The unlit part: the same colours, mostly covered. The cover slides right as the level rises.
+                    .child(el().key(format!("meter-cover-{c}")).absolute(0.0, 0.0).size(w, bar_h).fill(lk.page.alpha(0.84)).live_offset(&m.cover[c]))
+                    .child(el().key(format!("meter-hold-{c}")).absolute(-1.5, 0.0).size(1.5, bar_h).fill(k.c.text_base).live_offset(&m.tick[c])),
+            )
+            .child(
+                el().absolute(x0 + w + 3.0, y)
+                    .size(5.0, bar_h)
+                    .radius(1.5)
+                    .fill(k.c.text_base.alpha(0.10))
+                    .child(el().key(format!("meter-clip-{c}")).absolute(0.0, 0.0).size(5.0, bar_h).radius(1.5).fill(lk.meter[3]).live_opacity(&m.clip[c])),
+            );
+    }
+    // Every mark gets a tick; a narrow meter names fewer of them.
+    let marks: &[f32] = if w >= 140.0 { &[-60.0, -48.0, -36.0, -24.0, -12.0, -6.0, 0.0] } else { &[-48.0, -24.0, -12.0, -6.0, 0.0] };
+    let mut ticks = Shape::new();
+    for &db in marks {
+        let x = part(db) * w;
+        ticks = ticks.line([x.clamp(0.5, w - 0.5), 0.0], [x.clamp(0.5, w - 0.5), 3.0], 1.0, LineCap::Butt, k.c.text_faint);
+        // Name a mark only where its neighbours leave room for the figures.
+        let named = if db == -6.0 { w >= 190.0 } else if db == -12.0 { w >= 110.0 } else { true };
+        if !named {
+            continue;
+        }
+        let label = if db == 0.0 { "0".to_string() } else { format!("\u{2212}{}", -db as i32) };
+        plate = plate.child(row().absolute(x0 + x - 14.0, bars_h + 6.0).size(28.0, 10.0).center().child(text(label).font(small).color(k.c.text_faint)));
+    }
+    plate
+        .child(canvas(ticks).key("meter-scale").absolute(x0, bars_h + 2.0).size(w, 3.0))
+        .child(text("dB").absolute(x0 + w + 8.0, bars_h + 6.0).font(small).color(k.c.text_faint))
+}
+
 fn transport(s: &Studio, doc: &Doc, lk: &Look) -> El {
     let k = &lk.k;
     let rate = doc.rate();
+    let (meter_w, total_fits) = meter_room(s);
     let counter = TextStyle { size: 27.0, weight: 600.0, line_height: 30.0, tracking: -0.4, ..lk.num(k.ty.ui) };
     let last = doc.project.head_index().map(|i| &doc.project.edits[i]);
     let mut status = s.notice.clone().unwrap_or_else(|| match last {
@@ -1123,8 +1292,9 @@ fn transport(s: &Studio, doc: &Doc, lk: &Look) -> El {
                 .items_end()
                 // The placeholder sets the box a live text draws in: as wide as the longest time.
                 .child(text(timecode(doc.tl.total() as f64, rate)).key("counter").live_text(&s.clock).font(counter).color(k.c.text_base))
-                .child(text(format!("/ {}", timecode(doc.tl.total() as f64, rate))).font(lk.num(k.ty.ui)).color(k.c.text_faint).pb(3.0)),
+                .child(if total_fits { text(format!("/ {}", timecode(doc.tl.total() as f64, rate))).font(lk.num(k.ty.ui)).color(k.c.text_faint).pb(3.0) } else { el() }),
         )
+        .child(meters(s, doc, lk, meter_w))
         .child(el().w(4.0))
         .child(plate(lk, vec![tool(s, k, &SCISSORS, "Cut selection"), tool(s, k, &MUTE, "Mute selection")]))
         .child(plate(lk, vec![tool(s, k, &ZOOM_OUT, "Zoom out"), tool(s, k, &ZOOM_IN, "Zoom in"), tool(s, k, &FIT, "Fit timeline")]))
@@ -1134,6 +1304,7 @@ fn transport(s: &Studio, doc: &Doc, lk: &Look) -> El {
                 .gap(7.0)
                 .center_y()
                 .min_w(0.0)
+                .shrink()
                 .child(el().size(7.0, 7.0).radius(4.0).fill(lk.author(last.is_some_and(|e| is_agent(&e.author)))))
                 .child(text(status).font(lk.num(k.ty.small)).color(k.c.text_muted).truncate()),
         )
@@ -1748,13 +1919,17 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
             Some(began) if t - began >= seconds => {
                 let rate = s.doc.as_ref().map_or(48_000, |d| d.rate());
                 println!(
-                    "play-check: {:.1} s of wall time, playhead at {:.2} s, underruns {}, device {} at {} Hz, {} ch",
+                    "play-check: {:.1} s of wall time, playhead at {:.2} s, underruns {}, device {} at {} Hz, {} ch, meters reached {:.1} / {:.1} dBFS and show {:.1} / {:.1}",
                     t - began,
                     p.position() as f64 / rate as f64,
                     p.underruns(),
                     p.device,
                     p.dev_rate,
-                    p.dev_channels
+                    p.dev_channels,
+                    s.meters.seen[0],
+                    s.meters.seen[1],
+                    s.meters.level[0],
+                    s.meters.level[1]
                 );
                 std::process::exit(0);
             }
@@ -1783,7 +1958,9 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
         }
     }
     let still_playing = s.player.as_ref().is_some_and(Player::is_playing);
-    tx.wake_after(Duration::from_millis(if still_playing { 4 } else { 500 }));
+    // The meters go on falling for a moment after the audio stops.
+    let meters_lit = step_meters(s, t);
+    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else { 500 }));
 
     if t - s.checked_at >= 0.45 {
         s.checked_at = t;

@@ -17,12 +17,13 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rune::{Align, App, AppSpec, Chrome, Color, Cx, El, FileDialogOptions, FileDialogResult, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, ScrollSpec, Shape, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
+use rune::{Align, App, AppSpec, Chrome, Color, Cx, El, FileDialogOptions, FileDialogResult, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, ScrollSpec, Shape, TextEdit, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
 use rune_kit::shell::{self, PaneState, SplitView, Toolbar};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuEntry, MenuItem, PaletteSeed, SegmentedControl};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuEntry, MenuItem, PaletteSeed, SegmentedControl, TextInput};
 use scrubr_core::edit::{self, DEFAULT_CROSSFADE_MS, Request, Revert};
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts};
-use scrubr_core::{Peaks, Timeline, export, source};
+use scrubr_core::render::Renderer;
+use scrubr_core::{Peaks, Timeline, export, peaks, source};
 
 use crate::audio::Player;
 
@@ -60,6 +61,7 @@ stroke_icon!(NEXT, "scrubr-next", r#"<path d="M12 3.5V12.5"/><path d="M4 3.8L9.5
 stroke_icon!(ZOOM_IN, "scrubr-zoom-in", r#"<circle cx="7" cy="7" r="4"/><path d="M10 10L13.2 13.2M5.3 7H8.7M7 5.3V8.7"/>"#);
 stroke_icon!(ZOOM_OUT, "scrubr-zoom-out", r#"<circle cx="7" cy="7" r="4"/><path d="M10 10L13.2 13.2M5.3 7H8.7"/>"#);
 stroke_icon!(BUBBLE, "scrubr-bubble", r#"<path d="M3.5 3H12.5A1.5 1.5 0 0 1 14 4.5V9.5A1.5 1.5 0 0 1 12.5 11H8L5 13.5V11H3.5A1.5 1.5 0 0 1 2 9.5V4.5A1.5 1.5 0 0 1 3.5 3Z"/>"#);
+stroke_icon!(CROSS, "scrubr-cross", r#"<path d="M4.5 4.5L11.5 11.5M11.5 4.5L4.5 11.5"/>"#);
 stroke_icon!(FIT, "scrubr-fit", r#"<path d="M2.5 6V3.5H5M11 3.5H13.5V6M13.5 10V12.5H11M5 12.5H2.5V10"/>"#);
 
 const OVERVIEW_H: f32 = 46.0;
@@ -68,8 +70,13 @@ const RULER_H: f32 = 26.0;
 /// own bottom margin, as the splice marks and labels lie over the top one.
 const MARKS_H: f32 = 16.0;
 const TRANSPORT_H: f32 = 68.0;
-/// The deepest zoom of this first look, in frames per point. Closer views need the renderer.
-const MIN_FPP: f64 = 32.0;
+/// The deepest zoom, in frames per point: one sample every 24 points.
+const MIN_FPP: f64 = 1.0 / 24.0;
+/// At this many frames per point or fewer, the lanes draw a line through the samples in place
+/// of a column for each point.
+const LINE_FPP: f64 = 3.0;
+/// At this many frames per point or fewer, each sample gets a dot on the line.
+const DOT_FPP: f64 = 0.2;
 
 // ---------------------------------------------------------------- the look
 
@@ -175,6 +182,8 @@ struct LevelMark {
 }
 
 struct Note {
+    /// The label's id in the project, for removing it.
+    id: String,
     start: u64,
     end: u64,
     text: String,
@@ -296,7 +305,7 @@ fn load(paths: &Paths) -> Result<Doc, String> {
                     (at, at, true)
                 }
             };
-            Some(Note { start, end, text: l.text.clone(), author: l.author.clone(), agent: is_agent(&l.author), hidden })
+            Some(Note { id: l.id.clone(), start, end, text: l.text.clone(), author: l.author.clone(), agent: is_agent(&l.author), hidden })
         })
         .collect();
 
@@ -431,6 +440,9 @@ pub struct Studio {
     selected: Option<usize>,
     /// The label the pointer is over, by its place in the document's notes: its card is shown.
     hover_note: Option<usize>,
+    /// The range a label is being written for, in frames: a card with a text field is shown.
+    labeling: Option<(f64, f64)>,
+    label_text: TextEdit,
     /// Something to tell the person, at the right of the transport: why an edit failed, how an
     /// export went, who just edited the project. There is nothing there otherwise.
     notice: Option<String>,
@@ -668,6 +680,8 @@ fn init_with(path: Option<PathBuf>) -> Studio {
         cursor: 0.0,
         selected: None,
         hover_note: flag("--note").and_then(|t| t.parse().ok()),
+        labeling: None,
+        label_text: TextEdit::default(),
         notice: None,
         fleeting: None,
         pretend_edit_at: flag("--outside-edit").and_then(|t| t.parse().ok()),
@@ -690,7 +704,7 @@ fn init_with(path: Option<PathBuf>) -> Studio {
     reload(&mut s);
     // For stills: `--view START..END` in seconds, `--select START..END`, `--edit ID`,
     // `--cursor SECONDS`, `--tab labels`, `--menu edit`, `--no-audio`, `--meter L,R` in dBFS,
-    // `--note N` to show the Nth label's card, `--outside-edit SECONDS` to reload then as if
+    // `--note N` to show the Nth label's card, `--label-card` to open the card for writing one, `--outside-edit SECONDS` to reload then as if
     // another program had written the project.
     // `--mute` plays silently.
     let rate = s.doc.as_ref().map_or(48_000.0, |d| d.rate() as f64);
@@ -705,6 +719,9 @@ fn init_with(path: Option<PathBuf>) -> Studio {
     }
     if let (Some(id), Some(doc)) = (flag("--edit"), &s.doc) {
         s.selected = doc.project.edits.iter().position(|e| e.id == id);
+    }
+    if has("--label-card") {
+        begin_label(&mut s);
     }
     if flag("--tab").as_deref() == Some("labels") {
         s.tab = 1;
@@ -799,7 +816,8 @@ fn ruler_label(seconds: f64, decimals: usize) -> String {
 
 /// Seconds between ruler labels so they sit at least `min_points` apart, and minor ticks per label.
 fn ruler_step(seconds_per_point: f64, min_points: f64) -> (f64, usize, u32) {
-    const STEPS: [(f64, usize, u32); 19] = [
+    const STEPS: [(f64, usize, u32); 23] = [
+        (0.00001, 5, 5), (0.00005, 5, 5), (0.0001, 4, 5), (0.0005, 4, 5),
         (0.001, 3, 5), (0.005, 3, 5), (0.01, 2, 5), (0.05, 2, 5), (0.1, 1, 5), (0.5, 1, 5), (1.0, 0, 5), (2.0, 0, 4), (5.0, 0, 5), (10.0, 0, 5),
         (15.0, 0, 3), (30.0, 0, 6), (60.0, 0, 6), (120.0, 0, 4), (300.0, 0, 5), (600.0, 0, 5), (900.0, 0, 3), (1800.0, 0, 6), (3600.0, 0, 6),
     ];
@@ -984,6 +1002,47 @@ fn ruler(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> El {
     ruler
 }
 
+/// The audio in view, rendered with its edits: the frame it starts at, its channel count and
+/// its interleaved samples. For views closer than the peak cache can show.
+fn rendered(s: &Studio, doc: &Doc, w: f32) -> Option<(u64, usize, Vec<f32>)> {
+    let mut renderer = Renderer::new(&doc.project, &s.paths).ok()?;
+    let total = renderer.total();
+    let first = (s.start.floor().max(0.0) as u64).min(total);
+    let last = ((s.start + w as f64 * s.fpp).ceil().max(0.0) as u64 + 2).min(total);
+    let mut samples = Vec::new();
+    renderer.read(first, (last - first) as usize, &mut samples).ok()?;
+    Some((first, renderer.channels().max(1), samples))
+}
+
+/// `cols` columns of `fpc` frames each from `start`, for one channel of rendered audio.
+fn sample_columns(first: u64, channels: usize, samples: &[f32], channel: usize, start: f64, fpc: f64, cols: usize) -> Vec<Column> {
+    let frames = samples.len() / channels;
+    let ch = channel.min(channels - 1);
+    (0..cols)
+        .map(|i| {
+            let t0 = (start + i as f64 * fpc).floor().max(0.0) as u64;
+            let t1 = ((start + (i + 1) as f64 * fpc).ceil().max(0.0) as u64).max(t0 + 1);
+            let (a, b) = (t0.saturating_sub(first) as usize, (t1.saturating_sub(first) as usize).min(frames));
+            if t0 < first || a >= b {
+                return Column::default();
+            }
+            let (mut min, mut max, mut squares) = (f32::INFINITY, f32::NEG_INFINITY, 0f64);
+            // Start from where the column before left off, so neighbouring columns always meet.
+            if a > 0 {
+                let before = samples[(a - 1) * channels + ch];
+                (min, max) = (before, before);
+            }
+            for f in a..b {
+                let v = samples[f * channels + ch];
+                min = min.min(v);
+                max = max.max(v);
+                squares += (v as f64) * (v as f64);
+            }
+            Column { min, max, rms: (squares / (b - a) as f64).sqrt() as f32, any: true }
+        })
+        .collect()
+}
+
 fn wave_shape(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32, scale: f32) -> Shape {
     let lanes = doc.project.channels.clamp(1, 2) as usize;
     let cols = (w * scale).round().max(1.0) as usize;
@@ -991,6 +1050,9 @@ fn wave_shape(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32, scale: f32) -> S
     let fpc = s.fpp * col_w as f64;
     let lane_h = h / lanes as f32;
     let selected = s.selection.map(|(a, b)| (((a - s.start) / fpc) as isize, ((b - s.start) / fpc) as isize));
+    // A column narrower than the peak cache's smallest bucket has nothing of its own to show
+    // there, so from that zoom inwards the lanes are drawn from the audio itself.
+    let fine = if fpc < peaks::BASE as f64 { rendered(s, doc, w) } else { None };
     let mut shape = Shape::new();
     for c in 0..lanes {
         let mid = lane_h * (c as f32 + 0.5);
@@ -998,8 +1060,39 @@ fn wave_shape(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32, scale: f32) -> S
         if c > 0 {
             shape = shape.line([0.0, lane_h * c as f32], [w, lane_h * c as f32], 1.0, LineCap::Butt, lk.rule);
         }
+        let amp = (lane_h * 0.5 - 10.0) * doc.magnify();
+        if let (Some((first, channels, samples)), true) = (&fine, s.fpp <= LINE_FPP) {
+            // Closest of all: a line through the samples, and a dot on each once they are apart.
+            let ch = c.min(channels - 1);
+            let points: Vec<[f32; 2]> = samples
+                .chunks_exact(*channels)
+                .enumerate()
+                .map(|(i, frame)| [(((first + i as u64) as f64 - s.start) / s.fpp) as f32, mid - frame[ch].clamp(-1.0, 1.0) * amp])
+                .collect();
+            if points.len() > 1 {
+                shape = shape.stroke(points.clone(), 1.25, lk.ink);
+            }
+            if s.fpp <= DOT_FPP {
+                for [x, y] in points.into_iter().filter(|p| p[0] >= -4.0 && p[0] <= w + 4.0) {
+                    shape = shape.line([x - 0.01, y], [x + 0.01, y], 4.5, LineCap::Round, lk.ink);
+                }
+            }
+            continue;
+        }
+        if let Some((first, channels, samples)) = &fine {
+            // Closer than a cycle of most sounds, a loudness body means nothing: draw the span
+            // the wave covers in each column, which is its true shape.
+            for (i, column) in sample_columns(*first, *channels, samples, c, s.start, fpc, cols).iter().enumerate().filter(|(_, column)| column.any) {
+                let chosen = selected.is_some_and(|(a, b)| (i as isize) >= a && (i as isize) < b);
+                let x = (i as f32 + 0.5) * col_w;
+                let (top, bottom) = (mid - column.max.clamp(-1.0, 1.0) * amp, mid - column.min.clamp(-1.0, 1.0) * amp);
+                let thin = (1.0 - (bottom - top)).max(0.0) * 0.5;
+                shape = shape.line([x, top - thin], [x, bottom + thin], col_w, LineCap::Butt, if chosen { lk.you } else { lk.ink });
+            }
+            continue;
+        }
         let columns = doc.columns(c, s.start, fpc, cols);
-        shape = lane(shape, &columns, col_w, mid, (lane_h * 0.5 - 10.0) * doc.magnify(), lk.ink, lk.ink_soft, |i| match selected {
+        shape = lane(shape, &columns, col_w, mid, amp, lk.ink, lk.ink_soft, |i| match selected {
             Some((a, b)) if (i as isize) >= a && (i as isize) < b => Some((lk.you, lk.you.alpha(0.38))),
             _ => None,
         });
@@ -1124,6 +1217,98 @@ fn note_card(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
     Some(card)
 }
 
+/// Opens the card for writing a label: over the selection, or at the playhead when there is none.
+fn begin_label(s: &mut Studio) {
+    let at = head(s);
+    s.labeling = Some(s.selection.filter(|(a, b)| b > a).unwrap_or((at, at)));
+    s.label_text = TextEdit::default();
+    s.label_text.focused = true;
+    s.hover_note = None;
+    reveal(s, s.labeling.map_or(at, |(a, _)| a));
+}
+
+fn cancel_label(s: &mut Studio) {
+    s.labeling = None;
+    s.label_text.focused = false;
+}
+
+/// Adds the label being written. An empty one is dropped.
+fn commit_label(s: &mut Studio) {
+    let Some((a, b)) = s.labeling else { return };
+    let text = s.label_text.text.trim().to_string();
+    if text.is_empty() {
+        return cancel_label(s);
+    }
+    let range = (a.round() as u64, b.round() as u64);
+    act(s, move |paths| edit::add_label(paths, &WriteOpts::default(), &you(), |_, _| Ok((range, text))).map(|_| ()));
+    // If it could not be added the card stays, with the reason in the transport.
+    if s.notice.is_none() {
+        cancel_label(s);
+    }
+}
+
+fn remove_label(s: &mut Studio, id: String) {
+    s.hover_note = None;
+    act(s, move |paths| edit::remove_label(paths, &WriteOpts::default(), &id).map(|_| ()));
+}
+
+/// The card a label is written in: what it will mark, and a field for the note.
+fn label_composer(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
+    let k = &lk.k;
+    let (a, b) = s.labeling?;
+    let x = ((a - s.start) / s.fpp) as f32;
+    let cw = 300.0;
+    let rate = doc.rate();
+    let marks = if b > a { format!("{}  \u{2192}  {}", timecode(a, rate), timecode(b, rate)) } else { timecode(a, rate) };
+    let field = TextInput::new(&s.label_text)
+        .placeholder("Note for this spot")
+        .on_edit(|s: &mut Studio| &mut s.label_text)
+        .on_submit(|s: &mut Studio, _| commit_label(s))
+        .on_key(|s: &mut Studio, e, _| {
+            let escape = matches!(e.key, Key::Escape);
+            if escape {
+                cancel_label(s);
+            }
+            escape
+        })
+        .build(k);
+    let mut card = col()
+        .key("label-composer")
+        .absolute((x - 2.0).min(w - cw - 8.0).max(8.0), 23.0)
+        .w(cw)
+        .radius(k.radius.md)
+        .clip_rounded(k.radius.md)
+        .fill(k.c.layer_03)
+        .border(1.0, k.c.border_base)
+        .child(
+            row()
+                .w_full()
+                .h(28.0)
+                .px(10.0)
+                .gap(6.0)
+                .center_y()
+                .fill(lk.you.alpha(0.14))
+                .child(icon(&BUBBLE, 13.0).color(lk.you))
+                .child(text("New label").font(k.ty.small_medium).color(lk.you))
+                .child(el().grow(1.0))
+                .child(text(marks).font(lk.num(k.ty.small)).color(k.c.text_muted)),
+        )
+        .child(
+            col()
+                .w_full()
+                .px(10.0)
+                .pt(9.0)
+                .pb(9.0)
+                .gap(7.0)
+                .child(field)
+                .child(text("Enter adds it \u{b7} Esc cancels").font(k.ty.small).color(k.c.text_faint)),
+        );
+    for shadow in &k.elevation.floating {
+        card = card.box_shadow(*shadow);
+    }
+    Some(card)
+}
+
 /// Selects what a label marks, or goes to it when it marks a point.
 fn pick_note(s: &mut Studio, i: usize) {
     let Some((a, b)) = s.doc.as_ref().and_then(|d| d.notes.get(i)).map(|n| (n.start as f64, n.end as f64)) else { return };
@@ -1147,7 +1332,12 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
             }
         })
         .on_wheel(|s: &mut Studio, e, _| {
-            pan(s, -(e.dx + e.dy) as f64);
+            // With Ctrl or Cmd held the wheel zooms about the pointer: one notch is about a third.
+            if e.mods.ctrl || e.mods.cmd {
+                zoom_about(s, e.x as f64, 2f64.powf((e.dy as f64 / 240.0).clamp(-2.0, 2.0)));
+            } else {
+                pan(s, -(e.dx + e.dy) as f64);
+            }
             true
         })
         .on_magnify(|s: &mut Studio, e, _| {
@@ -1260,6 +1450,14 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
         area = area.child(card);
     }
     if let Some(card) = note_card(s, doc, lk, w) {
+        area = area.child(card);
+    }
+    if let Some((a, b)) = s.labeling {
+        // What the new label will mark: its range, or a line where it marks a point.
+        let (x0, x1) = ((((a - s.start) / s.fpp) as f32).max(0.0), (((b - s.start) / s.fpp) as f32).min(w));
+        area = area.child(el().key("label-range").absolute(x0, 0.0).size((x1 - x0).max(1.5), h).fill(lk.you.alpha(if x1 - x0 > 1.5 { 0.10 } else { 0.8 })));
+    }
+    if let Some(card) = label_composer(s, doc, lk, w) {
         area = area.child(card);
     }
     area
@@ -1539,9 +1737,18 @@ fn activity(s: &Studio, doc: &Doc, lk: &Look) -> El {
 
 fn labels(doc: &Doc, lk: &Look) -> El {
     let k = &lk.k;
-    let mut list = col().key("label-list").w_full().gap(2.0);
+    let add = command("Add label\u{2026}");
+    let mut list = col().key("label-list").w_full().gap(2.0).child(
+        row()
+            .w_full()
+            .pb(6.0)
+            .gap(8.0)
+            .center_y()
+            .child(small_button(k, "Add label", "label-add".into(), add.run))
+            .child(text(format!("{} \u{b7} at the playhead, or over the selection", add.keys.label())).font(k.ty.small).color(k.c.text_faint).truncate()),
+    );
     if doc.notes.is_empty() {
-        return list.child(text("No labels yet. An agent leaves one with `scrubr label add`.").font(k.ty.small).color(k.c.text_faint).wrap());
+        return list.child(text("No labels yet. Agents leave them with `scrubr label add`.").font(k.ty.small).color(k.c.text_faint).wrap());
     }
     for (i, note) in doc.notes.iter().enumerate() {
         let color = lk.author(note.agent);
@@ -1570,7 +1777,19 @@ fn labels(doc: &Doc, lk: &Look) -> El {
                             .gap(6.0)
                             .child(text(shown_name(&note.author)).font(k.ty.small_medium).color(color))
                             .child(el().grow(1.0))
-                            .child(text(place).font(lk.num(k.ty.small)).color(k.c.text_faint)),
+                            .child(text(place).font(lk.num(k.ty.small)).color(k.c.text_faint))
+                            .child({
+                                let id = note.id.clone();
+                                row()
+                                    .key(format!("label-remove-{i}"))
+                                    .size(18.0, 18.0)
+                                    .radius(5.0)
+                                    .center()
+                                    .hover(k.c.text_base.alpha(0.08))
+                                    .help("Remove this label")
+                                    .on_press(move |s: &mut Studio| remove_label(s, id.clone()))
+                                    .child(icon(&CROSS, 11.0).color(k.c.text_faint))
+                            }),
                     )
                     .child(text(note.text.clone()).font(k.ty.ui).color(k.c.text_base).wrap()),
             )
@@ -1896,7 +2115,7 @@ fn has_splices(s: &Studio) -> bool {
     s.doc.as_ref().is_some_and(|d| !d.splices.is_empty())
 }
 
-static COMMANDS: [Command; 20] = [
+static COMMANDS: [Command; 21] = [
     Command { menu: 0, label: OPEN, keys: Keys::Cmd('o'), divide: false, built: true, enabled: always, run: |s| s.ask = Some(Ask::Open) },
     Command { menu: 0, label: "Export\u{2026}", keys: Keys::Cmd('e'), divide: false, built: true, enabled: |s| s.exporting.is_none(), run: |s| s.ask = Some(Ask::Export) },
     Command {
@@ -1919,6 +2138,7 @@ static COMMANDS: [Command; 20] = [
     },
     Command { menu: 1, label: "Cut selection", keys: Keys::Delete, divide: true, built: true, enabled: has_selection, run: cut_selection },
     Command { menu: 1, label: "Mute selection", keys: Keys::Char('m'), divide: false, built: true, enabled: has_selection, run: mute_selection },
+    Command { menu: 1, label: "Add label\u{2026}", keys: Keys::Char('l'), divide: true, built: true, enabled: always, run: begin_label },
     Command { menu: 1, label: "Set selection start", keys: Keys::Char('i'), divide: true, built: true, enabled: always, run: |s| mark_selection(s, true) },
     Command { menu: 1, label: "Set selection end", keys: Keys::Char('o'), divide: false, built: true, enabled: always, run: |s| mark_selection(s, false) },
     Command {
@@ -2192,6 +2412,15 @@ fn on_key(s: &mut Studio, e: &KeyEvent, tx: &mut Tx) -> bool {
     if s.menu && matches!(e.key, Key::Escape) {
         close_menu(s);
         return true;
+    }
+    // While a label is being written, keys are its text. If the field has lost the keyboard,
+    // Esc still closes the card and nothing else runs a command.
+    if s.labeling.is_some() {
+        let escape = matches!(e.key, Key::Escape);
+        if escape {
+            cancel_label(s);
+        }
+        return escape;
     }
     match COMMANDS.iter().find(|c| c.keys.pressed(e)) {
         Some(c) if c.available(s) => {

@@ -1,4 +1,5 @@
-//! The min/max peak pyramid a waveform is drawn from.
+//! The min/max peak pyramid a waveform is drawn from, with the RMS level of each bucket beside
+//! it so a view can show loudness inside the peaks.
 //!
 //! Level 0 holds one min/max pair per channel for every [`BASE`] frames. Each level above it
 //! merges [`FACTOR`] buckets of the level below. Drawing a column of the waveform picks the
@@ -21,6 +22,8 @@ struct Level {
     buckets: usize,
     /// `[bucket][channel][min, max]`, quantized to i16.
     data: Vec<i16>,
+    /// `[bucket][channel]`: the RMS level of the bucket's samples, quantized to u16.
+    rms: Vec<u16>,
 }
 
 pub struct Peaks {
@@ -30,6 +33,7 @@ pub struct Peaks {
 }
 
 const Q: f32 = 32767.0;
+const RMS_Q: f32 = 65535.0;
 
 fn quantize_min(v: f32) -> i16 {
     (v.clamp(-1.0, 1.0) * Q).floor() as i16
@@ -50,7 +54,7 @@ impl Peaks {
 
     /// Bytes held by every level.
     pub fn bytes(&self) -> usize {
-        self.levels.iter().map(|l| l.data.len() * 2).sum()
+        self.levels.iter().map(|l| (l.data.len() + l.rms.len()) * 2).sum()
     }
 
     pub fn level_count(&self) -> usize {
@@ -97,13 +101,106 @@ impl Peaks {
     }
 }
 
+const MAGIC: &[u8; 8] = b"SCRPEAK2";
+
+impl Peaks {
+    /// The min/max of `channel` over frames `start..end`, read from the coarsest level with at
+    /// least eight buckets in the range. The answer may reach up to one bucket past each end,
+    /// which is fine for drawing. An empty or out-of-file range is silent.
+    pub fn range(&self, channel: usize, start: u64, end: u64) -> MinMax {
+        if channel >= self.channels || start >= end || start >= self.frames {
+            return MinMax::default();
+        }
+        let len = end - start;
+        let level = self.levels.iter().rev().find(|l| l.frames_per_bucket * 8 <= len).unwrap_or(&self.levels[0]);
+        let lo = (start / level.frames_per_bucket) as usize;
+        let hi = (end.div_ceil(level.frames_per_bucket) as usize).min(level.buckets);
+        let stride = self.channels * 2;
+        let mut min = i16::MAX;
+        let mut max = i16::MIN;
+        for bucket in lo..hi {
+            let at = bucket * stride + channel * 2;
+            min = min.min(level.data[at]);
+            max = max.max(level.data[at + 1]);
+        }
+        if lo >= hi {
+            return MinMax::default();
+        }
+        MinMax { min: min as f32 / Q, max: max as f32 / Q }
+    }
+
+    /// The RMS level, 0.0 to 1.0, of `channel` over frames `start..end`, read at the same level
+    /// of detail as [`Peaks::range`]. An empty or out-of-file range is silent.
+    pub fn rms(&self, channel: usize, start: u64, end: u64) -> f32 {
+        if channel >= self.channels || start >= end || start >= self.frames {
+            return 0.0;
+        }
+        let len = end - start;
+        let level = self.levels.iter().rev().find(|l| l.frames_per_bucket * 8 <= len).unwrap_or(&self.levels[0]);
+        let lo = (start / level.frames_per_bucket) as usize;
+        let hi = (end.div_ceil(level.frames_per_bucket) as usize).min(level.buckets);
+        if lo >= hi {
+            return 0.0;
+        }
+        let squares: f64 = (lo..hi).map(|bucket| (level.rms[bucket * self.channels + channel] as f64).powi(2)).sum();
+        (squares / (hi - lo) as f64).sqrt() as f32 / RMS_Q
+    }
+
+    /// Writes the pyramid to `path`: a header, then the min/max of level 0 as little-endian i16
+    /// and its RMS as u16. The levels above it are rebuilt on load.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        out.write_all(MAGIC)?;
+        out.write_all(&(self.channels as u32).to_le_bytes())?;
+        out.write_all(&self.frames.to_le_bytes())?;
+        let level0 = &self.levels[0];
+        out.write_all(&(level0.data.len() as u64).to_le_bytes())?;
+        for v in &level0.data {
+            out.write_all(&v.to_le_bytes())?;
+        }
+        for v in &level0.rms {
+            out.write_all(&v.to_le_bytes())?;
+        }
+        out.flush()
+    }
+
+    /// Reads a pyramid written by [`Peaks::save`]. Any mismatch is an `InvalidData` error, and
+    /// the caller rebuilds the cache.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Peaks> {
+        use std::io::{Error, ErrorKind, Read};
+        let bad = |what: &str| Error::new(ErrorKind::InvalidData, format!("peak cache: {what}"));
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+        if bytes.len() < 28 || &bytes[..8] != MAGIC {
+            return Err(bad("not a scrubr peak file"));
+        }
+        let channels = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let frames = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+        let len = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
+        let buckets = frames.div_ceil(BASE) as usize;
+        // Min and max per bucket and channel, then one RMS value for each.
+        if channels == 0 || len != buckets * channels * 2 || bytes.len() != 28 + len * 3 {
+            return Err(bad("wrong size"));
+        }
+        let (minmax, rms) = bytes[28..].split_at(len * 2);
+        let level0: Vec<i16> = minmax.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
+        let level0_rms: Vec<u16> = rms.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+        let builder = PeakBuilder { channels, frames, in_bucket: 0, cur: vec![EMPTY; channels], squares: vec![0.0; channels], level0, level0_rms };
+        Ok(builder.finish())
+    }
+}
+
 /// Builds a [`Peaks`] from interleaved samples pushed in any chunk sizes.
 pub struct PeakBuilder {
     channels: usize,
     frames: u64,
     in_bucket: u64,
     cur: Vec<MinMax>,
+    /// Sum of squares per channel over the bucket being filled.
+    squares: Vec<f64>,
     level0: Vec<i16>,
+    level0_rms: Vec<u16>,
 }
 
 const EMPTY: MinMax = MinMax { min: f32::INFINITY, max: f32::NEG_INFINITY };
@@ -117,7 +214,9 @@ impl PeakBuilder {
             frames: 0,
             in_bucket: 0,
             cur: vec![EMPTY; channels],
+            squares: vec![0.0; channels],
             level0: Vec::with_capacity(buckets * channels * 2),
+            level0_rms: Vec::with_capacity(buckets * channels),
         }
     }
 
@@ -128,6 +227,7 @@ impl PeakBuilder {
                 let m = &mut self.cur[c];
                 m.min = m.min.min(s);
                 m.max = m.max.max(s);
+                self.squares[c] += s as f64 * s as f64;
             }
             self.in_bucket += 1;
             if self.in_bucket == BASE {
@@ -138,10 +238,13 @@ impl PeakBuilder {
     }
 
     fn flush(&mut self) {
-        for m in &mut self.cur {
+        for (m, squares) in self.cur.iter_mut().zip(&mut self.squares) {
             self.level0.push(quantize_min(m.min));
             self.level0.push(quantize_max(m.max));
+            let rms = (*squares / self.in_bucket.max(1) as f64).sqrt() as f32;
+            self.level0_rms.push((rms.clamp(0.0, 1.0) * RMS_Q).round() as u16);
             *m = EMPTY;
+            *squares = 0.0;
         }
         self.in_bucket = 0;
     }
@@ -151,15 +254,23 @@ impl PeakBuilder {
             self.flush();
         }
         let stride = self.channels * 2;
-        let mut levels = vec![Level { frames_per_bucket: BASE, buckets: self.level0.len() / stride, data: self.level0 }];
+        if self.level0.is_empty() {
+            // An empty file still gets one silent bucket, so every query has a level to read.
+            self.level0.resize(stride, 0);
+            self.level0_rms.resize(self.channels, 0);
+        }
+        let mut levels = vec![Level { frames_per_bucket: BASE, buckets: self.level0.len() / stride, data: self.level0, rms: self.level0_rms }];
         while levels.last().unwrap().buckets > 1 {
             let below = levels.last().unwrap();
             let buckets = below.buckets.div_ceil(FACTOR as usize);
             let mut data = Vec::with_capacity(buckets * stride);
+            let mut rms = Vec::with_capacity(buckets * self.channels);
             for bucket in 0..buckets {
                 let from = bucket * FACTOR as usize;
                 let to = (from + FACTOR as usize).min(below.buckets);
                 for c in 0..self.channels {
+                    let squares: f64 = (from..to).map(|b| (below.rms[b * self.channels + c] as f64).powi(2)).sum();
+                    rms.push((squares / (to - from) as f64).sqrt().round() as u16);
                     let mut min = i16::MAX;
                     let mut max = i16::MIN;
                     for b in from..to {
@@ -171,7 +282,7 @@ impl PeakBuilder {
                     data.push(max);
                 }
             }
-            levels.push(Level { frames_per_bucket: below.frames_per_bucket * FACTOR, buckets, data });
+            levels.push(Level { frames_per_bucket: below.frames_per_bucket * FACTOR, buckets, data, rms });
         }
         Peaks { channels: self.channels, frames: self.frames, levels }
     }
@@ -258,6 +369,44 @@ mod tests {
                 assert!(m.max >= hi - 1e-3 && m.max <= hi + slack, "fpc {fpc} col {i}: max {} vs {hi}", m.max);
             }
         }
+    }
+
+    #[test]
+    fn a_saved_pyramid_loads_back_identical() {
+        let p = ramp(100_000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.peaks");
+        p.save(&path).unwrap();
+        let q = Peaks::load(&path).unwrap();
+        assert_eq!(q.frames(), p.frames());
+        assert_eq!(q.level_count(), p.level_count());
+        for (a, b) in p.levels.iter().zip(&q.levels) {
+            assert_eq!(a.data, b.data);
+            assert_eq!(a.rms, b.rms);
+        }
+        let m = q.range(0, 25_000, 75_000);
+        assert!((m.min - 0.25).abs() < 0.05 && (m.max - 0.75).abs() < 0.05, "{m:?}");
+        std::fs::write(&path, b"junk").unwrap();
+        assert!(Peaks::load(&path).is_err());
+    }
+
+    #[test]
+    fn rms_sits_inside_the_peaks_at_every_level() {
+        // A full-scale square wave has an RMS of 1.0; a sine at 0.5 has 0.5 / sqrt(2).
+        let square: Vec<f32> = (0..50_000).map(|f| if f / 50 % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let sine: Vec<f32> = (0..50_000).map(|f| (f as f32 * 0.05).sin() * 0.5).collect();
+        let mut b = PeakBuilder::new(2, 50_000);
+        let interleaved: Vec<f32> = square.iter().zip(&sine).flat_map(|(a, b)| [*a, *b]).collect();
+        b.push(&interleaved);
+        let p = b.finish();
+        for (start, end) in [(0u64, 50_000u64), (1_000, 9_000), (20_000, 20_640), (100, 164)] {
+            assert!((p.rms(0, start, end) - 1.0).abs() < 0.001, "square {start}..{end}: {}", p.rms(0, start, end));
+            let sine_rms = p.rms(1, start, end);
+            assert!((sine_rms - 0.3536).abs() < 0.03, "sine {start}..{end}: {sine_rms}");
+            assert!(sine_rms < p.range(1, start, end).max);
+        }
+        assert_eq!(p.rms(0, 60_000, 70_000), 0.0);
+        assert_eq!(p.rms(2, 0, 100), 0.0);
     }
 
     #[test]

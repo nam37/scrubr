@@ -1,9 +1,21 @@
 [package]
 name = "scrubr-core"
-description = "scrubr's engine: decoding, the peak cache and (later) the edit log. No UI dependencies."
+description = "scrubr's engine: project file, edit log, decoding and encoding, DSP, analysis, peak cache and PNG rendering. No UI dependencies."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
 [dependencies]
 hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1.8"
+fd-lock = "4"
+ebur128 = "0.1"
+flacenc = { version = "0.5", default-features = false }
+rubato = "5"
+symphonia = { version = "0.5", features = ["mp3"] }
+tiny-skia = "0.11"
+
+[dev-dependencies]
+tempfile = "3"

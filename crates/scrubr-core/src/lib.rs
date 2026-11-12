@@ -1,44 +1,34 @@
-//! scrubr's engine. M0 holds only what the Rune spike needs: streaming WAV reads and the
-//! min/max peak pyramid the waveform is drawn from.
+//! scrubr's engine: the project file and its edit log, the timeline computed from it, streaming
+//! decode and render, analysis, waveform images and export. No UI dependencies.
+//!
+//! Audio always streams. Sources are read in blocks and never held whole in memory.
 
+pub mod analysis;
+pub mod edit;
+pub mod error;
+pub mod export;
+pub mod image;
 pub mod peaks;
+pub mod project;
+pub mod render;
+pub mod source;
+pub mod timeline;
 pub mod wav;
 
-use std::fmt;
 use std::path::Path;
 
+pub use error::{Error, Kind, Result};
 pub use peaks::{MinMax, PeakBuilder, Peaks};
+pub use project::{Paths, Project};
+pub use timeline::Timeline;
 pub use wav::{WavFile, WavInfo};
-
-#[derive(Debug)]
-pub enum Error {
-    Wav(hound::Error),
-    Unsupported(String),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Wav(e) => write!(f, "could not read the WAV file: {e}"),
-            Error::Unsupported(what) => write!(f, "unsupported audio: {what}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<hound::Error> for Error {
-    fn from(e: hound::Error) -> Self {
-        Error::Wav(e)
-    }
-}
 
 /// Frames decoded per read while building peaks. Audio streams through this buffer; the file is
 /// never held in memory.
 const BUILD_CHUNK_FRAMES: usize = 1 << 16;
 
 /// Streams `path` once and builds its peak pyramid. `progress` hears 0.0..=1.0.
-pub fn build_peaks(path: impl AsRef<Path>, mut progress: impl FnMut(f32)) -> Result<(WavInfo, Peaks), Error> {
+pub fn build_peaks(path: impl AsRef<Path>, mut progress: impl FnMut(f32)) -> Result<(WavInfo, Peaks)> {
     let mut wav = WavFile::open(path)?;
     let info = wav.info().clone();
     let mut builder = PeakBuilder::new(info.channels as usize, info.frames);

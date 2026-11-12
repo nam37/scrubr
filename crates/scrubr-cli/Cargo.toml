@@ -1,0 +1,24 @@
+[package]
+name = "scrubr-cli"
+description = "scrubr's command line: argument and time parsing, JSON and text output."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "scrubr"
+path = "src/main.rs"
+
+[features]
+# Speech-to-text for `scrubr transcribe`. Off by default; no engine is chosen yet, so the
+# feature adds no dependency and the command reports that plainly either way.
+transcribe = []
+
+[dependencies]
+scrubr-core = { path = "../scrubr-core" }
+clap = { version = "4", features = ["derive", "env"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3"
+hound = "3.5"

@@ -32,9 +32,15 @@ pub struct WavFile {
 
 impl WavFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_buffered(path, 1 << 20)
+    }
+
+    /// Like [`WavFile::open`] with a read buffer of `buffer` bytes. A seek drops the buffer, so
+    /// a reader that hops around the file for short reads wants a small one.
+    pub fn open_buffered(path: impl AsRef<Path>, buffer: usize) -> Result<Self, Error> {
         let path = path.as_ref();
         let file = File::open(path).map_err(hound::Error::IoError)?;
-        let reader = WavReader::new(BufReader::with_capacity(1 << 20, file))?;
+        let reader = WavReader::new(BufReader::with_capacity(buffer, file))?;
         let spec = reader.spec();
         if spec.channels == 0 {
             return Err(Error::Unsupported("a WAV file with no channels".into()));

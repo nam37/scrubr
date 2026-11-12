@@ -9,6 +9,7 @@
 //!   prints frame and audio statistics, and exits.
 
 mod audio;
+mod studio;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -622,6 +623,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
 }
 
 fn main() {
+    // A project opens in the project view; a bare WAV still opens the M0 spike below.
+    if let Some(project) = rune::extra_args().iter().find(|a| a.ends_with(".scrubr")) {
+        return studio::run(PathBuf::from(project));
+    }
     let spec = AppSpec::<State> {
         poll: Some(poll),
         on_key: Some(on_key),

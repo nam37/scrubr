@@ -93,6 +93,10 @@ enum Command {
         /// RMS level in dBFS per window of this length (1s).
         #[arg(long, value_name = "WINDOW")]
         envelope: Option<String>,
+        /// The quietest moment in a range: where to put a cut between two words. Takes its own
+        /// range and can be given several times.
+        #[arg(long, value_name = "RANGE")]
+        quietest: Vec<String>,
         /// Measure only this part of the timeline.
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
@@ -357,7 +361,7 @@ fn run(cli: Cli) -> Result<Reply, Error> {
     match command {
         Command::New { project, from, force, author, session } => commands::new(&project, &from, force, author, session),
         Command::Info { project } => commands::info(&project),
-        Command::Analyze { project, loudness, peaks, silence, envelope, range } => commands::analyze(&project, loudness, peaks, silence, envelope, range),
+        Command::Analyze { project, loudness, peaks, silence, envelope, quietest, range } => commands::analyze(&project, loudness, peaks, silence, envelope, quietest, range),
         Command::Render { project, png, range, width, height } => commands::render(&project, &png, range, width, height),
         Command::Transcribe { project, model, range, fetch_model } => commands::transcribe(project.as_deref(), model, range, fetch_model),
         Command::Cut { project, range, crossfade, edit } => commands::cut(&project, &range, crossfade, &edit, false),

@@ -616,6 +616,30 @@ fn silence_envelope_and_clipping_are_found_where_they_are() {
     assert_eq!(part.silence.unwrap(), vec![(60_000, 100_000)]);
 }
 
+#[test]
+fn the_quietest_stretch_is_the_pause_whatever_the_level() {
+    // Tone, then 1.0-2.5 s of faint noise, then tone: once at a normal level and once 40 dB down,
+    // where the "speech" itself is under any usual silence threshold.
+    for scale in [1.0f32, 0.01] {
+        let fx = Fixture::with(RATE as u64 * 3, 2, move |f, _, noise| {
+            let t = f as f32 / RATE as f32;
+            scale * if (1.0..2.5).contains(&t) { noise.next() * 0.0005 } else { (TAU * 220.0 * t).cos() * 0.25 }
+        });
+        let project = fx.project();
+        let mut renderer = Renderer::new(&project, &fx.paths).unwrap();
+        let quiet = analysis::quietest(&mut renderer, RATE as u64 / 2, RATE as u64 * 3, RATE).unwrap();
+        let near = |frame: u64, seconds: f64| (frame as f64 / RATE as f64 - seconds).abs() < 0.011;
+        assert!(near(quiet.start, 1.0) && near(quiet.end, 2.5) && near(quiet.at(), 1.75), "scale {scale}: {quiet:?}");
+        assert!(quiet.rms_db < -65.0 + 20.0 * (scale as f64).log10(), "{quiet:?}");
+        // A range inside the tone has no pause: the answer still lies inside the range.
+        let none = analysis::quietest(&mut renderer, 0, RATE as u64 / 2, RATE).unwrap();
+        assert!(none.start < none.end && none.end <= RATE as u64 / 2, "{none:?}");
+        // A range shorter than the 0.1 s looked for comes back whole.
+        let short = analysis::quietest(&mut renderer, 1000, 1100, RATE).unwrap();
+        assert_eq!((short.start, short.end, short.at()), (1000, 1100, 1050));
+    }
+}
+
 // ---- inserts and other formats ---------------------------------------------------------------
 
 #[test]

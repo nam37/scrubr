@@ -58,6 +58,81 @@ pub struct Report {
     pub envelope: Option<Vec<f64>>,
 }
 
+/// The length of quiet [`quietest`] looks for, in seconds.
+pub const QUIET_SECONDS: f64 = 0.1;
+
+/// How many steps the quiet window moves through in its own length.
+const QUIET_STEPS: usize = 10;
+
+/// The quietest stretch of a range, in timeline frames: where a cut is least likely to be heard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Quiet {
+    pub start: u64,
+    pub end: u64,
+    /// RMS level in dBFS of the quietest [`QUIET_SECONDS`] in the range, over all channels.
+    pub rms_db: f64,
+}
+
+impl Quiet {
+    /// The middle of the stretch: the place to cut.
+    pub fn at(&self) -> u64 {
+        self.start + (self.end - self.start) / 2
+    }
+}
+
+/// Finds the quietest [`QUIET_SECONDS`] of timeline range `t0..t1`, then widens it over the
+/// audio around it that is no more than 3 dB louder, so the stretch covers a whole pause and its
+/// middle leaves room on both sides. No threshold is involved, so it works the same on a quiet
+/// recording and a loud one. A range shorter than the window comes back whole.
+pub fn quietest(renderer: &mut Renderer, t0: u64, t1: u64, sample_rate: u32) -> Result<Quiet> {
+    let ch = renderer.channels();
+    let t1 = t1.min(renderer.total());
+    let hop = ((sample_rate as f64 * QUIET_SECONDS).round() as u64 / QUIET_STEPS as u64).max(1);
+    let mut hops: Vec<f64> = Vec::new();
+    let mut energy = 0f64;
+    let mut in_hop = 0u64;
+    let mut all = 0f64;
+    walk(renderer, t0, t1, |_, block| {
+        for frame in block.chunks_exact(ch) {
+            energy += frame.iter().map(|&s| s as f64 * s as f64).sum::<f64>();
+            in_hop += 1;
+            if in_hop == hop {
+                hops.push(energy);
+                all += energy;
+                energy = 0.0;
+                in_hop = 0;
+            }
+        }
+        Ok(())
+    })?;
+    let level = |energy: f64, frames: u64| to_db((energy / (frames * ch as u64).max(1) as f64).sqrt());
+    if hops.len() <= QUIET_STEPS {
+        return Ok(Quiet { start: t0, end: t1, rms_db: level(all + energy, t1.saturating_sub(t0)) });
+    }
+    // The energy of each window of QUIET_STEPS hops, one hop apart.
+    let mut sums = Vec::with_capacity(hops.len() - QUIET_STEPS + 1);
+    let mut sum: f64 = hops[..QUIET_STEPS].iter().sum();
+    sums.push(sum);
+    for i in QUIET_STEPS..hops.len() {
+        // Recomputed rather than updated in place, so rounding cannot leave silence above zero.
+        sum = hops[i + 1 - QUIET_STEPS..=i].iter().sum();
+        sums.push(sum);
+    }
+    let best = (0..sums.len()).min_by(|&a, &b| sums[a].total_cmp(&sums[b])).unwrap_or(0);
+    let window = hop * QUIET_STEPS as u64;
+    // Twice the energy is 3 dB. The small constant lets digital silence match itself.
+    let limit = sums[best] * 2.0 + 1e-12 * (window * ch as u64) as f64;
+    let mut first = best;
+    while first > 0 && sums[first - 1] <= limit {
+        first -= 1;
+    }
+    let mut last = best;
+    while last + 1 < sums.len() && sums[last + 1] <= limit {
+        last += 1;
+    }
+    Ok(Quiet { start: t0 + first as u64 * hop, end: t0 + last as u64 * hop + window, rms_db: level(sums[best], window) })
+}
+
 fn meter_failed(e: ebur128::Error) -> Error {
     Error::codec("analysis_failed", format!("The loudness meter failed: {e}"))
 }

@@ -230,6 +230,29 @@ fn a_dry_run_reports_the_change_and_writes_nothing() {
 }
 
 #[test]
+fn the_quietest_moment_in_a_range_is_where_to_cut() {
+    let bench = Bench::with_project();
+    // The gaps are at 3.0-4.5 s and 8.0-9.2 s. Each search has its own range.
+    let reply = bench.run(&["analyze", "ep.scrubr", "--quietest", "2.5..5", "--quietest", "7.9..9.5"]).ok();
+    let found = reply["quietest"].as_array().unwrap();
+    assert_eq!(found.len(), 2);
+    let near = |value: &Value, seconds: f64| (value.as_f64().unwrap() - seconds).abs() < 0.011;
+    assert!(near(&found[0]["at"], 3.75) && near(&found[0]["start"], 3.0) && near(&found[0]["end"], 4.5), "{reply}");
+    assert!(near(&found[1]["at"], 8.6) && near(&found[1]["start"], 8.0) && near(&found[1]["end"], 9.2), "{reply}");
+    assert_eq!((found[0]["range"].clone(), found[0]["rms_dbfs"].clone()), (json!({ "start": 2.5, "end": 5.0 }), json!(-120.0)));
+    // Asked for alone, nothing else is measured.
+    assert!(reply["loudness"].is_null() && reply["peaks"].is_null(), "{reply}");
+    // Beside other measures it is added to them.
+    let reply = bench.run(&["analyze", "ep.scrubr", "--peaks", "--quietest", "0..12"]).ok();
+    assert!(reply["peaks"].is_object() && reply["quietest"][0]["rms_dbfs"] == json!(-120.0), "{reply}");
+    // The reply's `at` cuts cleanly when passed straight back.
+    let at = (found[0]["at"].as_f64().unwrap(), found[1]["at"].as_f64().unwrap());
+    let cut = bench.run(&["cut", "ep.scrubr", &format!("{}..{}", at.0, at.1)]).ok();
+    assert!((cut["timeline_seconds"].as_f64().unwrap() - (12.0 - (at.1 - at.0))).abs() < 1e-6, "{cut}");
+    bench.run(&["analyze", "ep.scrubr", "--quietest", "5..99"]).fails(1, "range_out_of_bounds");
+}
+
+#[test]
 fn negative_levels_are_values_not_flags() {
     let bench = Bench::with_project();
     let reply = bench.run(&["gain", "ep.scrubr", "-3dB", "--range", "0..0:02"]).ok();

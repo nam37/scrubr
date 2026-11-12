@@ -44,6 +44,7 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr new P --from a.wav [b.wav ...]` | Create a project. WAV, FLAC, MP3, OGG and AAC (.m4a) are read; files at another rate are resampled |
 | `scrubr info P` | Timeline length, format, sources, head, version |
 | `scrubr analyze P [--loudness] [--peaks] [--silence -45dB:1s] [--envelope 1s] [--range R]` | Measurements. With no flags: loudness and peaks |
+| `scrubr analyze P --quietest R [--quietest R ...]` | The quietest moment in each range, as `at`: where to put a cut between two words |
 | `scrubr render P --png out.png [--range R] [--width 1600] [--height 480]` | Waveform image. The reply gives `start` and `seconds_per_pixel`, so pixel x is at `start + x * seconds_per_pixel` |
 | `scrubr transcribe P [--range R] [--model base.en]` | Every word spoken, with `start` and `end`. Only in builds with the transcription feature; other builds say so |
 | `scrubr cut P R` | Remove a range |
@@ -96,12 +97,27 @@ positions after a cut move earlier by its length. A batch is one edit and one un
   `"limited_by": "true_peak"` with the `achieved_lufs`. Report that to the person; do not add gain
   on top.
 - **Silence ranges** from `analyze --silence` are exact. Cutting them whole butts words together;
-  leave some of each pause, for example 0.15 s at each end.
-- **Transcripts.** `transcribe` runs a local speech model, at several times real time, and
-  prints progress on stderr. Word times are typically within 0.1 s but can be off by more, so do
-  not cut on them directly: find the phrase in `words`, then move each end to the middle of the
-  nearest pause from `analyze --silence -45dB:0.25s`. If the reply is `model_not_installed`,
-  tell the person; `scrubr transcribe --fetch-model base.en` downloads it once.
+  leave some of each pause, for example 0.15 s at each end. The threshold is a fixed level, not
+  relative to the recording. In a quiet recording, or under a quiet speaker, speech itself falls
+  below -45 dB and is reported as silence. Run `analyze --loudness` first; if the integrated
+  loudness is below about -30 LUFS, lower the threshold (-55 dB suited a recording at -41 LUFS)
+  and check a few of the ranges with `--envelope` or `transcribe --range` before cutting.
+- **Transcripts.** `transcribe` runs a local speech model, several times faster than real time,
+  and prints progress on stderr. Expect some wrong words, and many where people talk over each
+  other. A sound can come back as a word, such as `MUSIC`. A word can have the same `start` and
+  `end`. Word times are typically within 0.1 s, but about one in ten is off by 0.5 s or more, so
+  do not cut on them directly.
+- **Removing a phrase.** Find it in `words`. For each end of the cut, take the word inside and
+  the word outside, and run `analyze --quietest A..B`, with A 0.3 s before the end of the
+  earlier word and B 0.3 s after the start of the later one. Cut at the `at` it returns: the
+  middle of the quietest stretch between the two words (`start`, `end` and `rms_dbfs` describe
+  that stretch). It uses no threshold, so it works on quiet recordings and where talk is too
+  fast for `--silence` to find a pause. Give both ends in one command. Then run
+  `transcribe --range` across each join and compare with the first transcript: the phrase must
+  be gone and the words either side still there. If not, `undo` and label the place for the
+  person. On hard recordings about one end in six lands a word out.
+- **Models.** If the reply is `model_not_installed`, tell the person;
+  `scrubr transcribe --fetch-model base.en` downloads it once.
 - **Undo.** After `undo`, a new edit discards the undone ones. `undo --edit` and `--of-session`
   add a revert instead, so later edits and labels stay where they are; undo the revert to bring
   the edits back.

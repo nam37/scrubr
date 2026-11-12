@@ -247,7 +247,7 @@ pub fn history(project: &Path) -> Result<Reply> {
 
 // ---- analyze, render, export -----------------------------------------------------------------
 
-pub fn analyze(project: &Path, loudness: bool, peaks: bool, silence: Option<String>, envelope: Option<String>, range: Option<String>) -> Result<Reply> {
+pub fn analyze(project: &Path, loudness: bool, peaks: bool, silence: Option<String>, envelope: Option<String>, quietest: Vec<String>, range: Option<String>) -> Result<Reply> {
     let paths = Paths::new(project);
     let p = project::open(&paths)?;
     let rate = p.sample_rate;
@@ -271,12 +271,23 @@ pub fn analyze(project: &Path, loudness: bool, peaks: bool, silence: Option<Stri
     if options.envelope == Some(0) {
         return Err(Error::usage("bad_time", "The envelope window must be longer than zero.").hint("Use a window such as --envelope 1s."));
     }
+    let mut searches = Vec::new();
+    for text in &quietest {
+        let search = time::parse_range(text, scale)?;
+        edit::check_range(&p, &paths, renderer.timeline(), search)?;
+        searches.push(search);
+    }
     // With nothing asked for, report the two measures an agent needs first.
-    if !loudness && !peaks && options.silence.is_none() && options.envelope.is_none() {
+    let nothing_measured = !loudness && !peaks && options.silence.is_none() && options.envelope.is_none();
+    if nothing_measured && searches.is_empty() {
         options.loudness = true;
         options.peaks = true;
     }
-    let report = analysis::analyze(&mut renderer, t0, t1, &options, rate)?;
+    // Quietest moments read only their own short ranges, so asking for them alone is quick.
+    let report = match nothing_measured && !searches.is_empty() {
+        true => analysis::Report::default(),
+        false => analysis::analyze(&mut renderer, t0, t1, &options, rate)?,
+    };
 
     let mut fields = Map::new();
     let mut text = format!("timeline {}", timecode(total, rate));
@@ -324,6 +335,22 @@ pub fn analyze(project: &Path, loudness: bool, peaks: bool, silence: Option<Stri
             json!({ "start": seconds(t0, rate), "window": seconds(window, rate), "rms_dbfs": levels.iter().map(|&v| (v * 10.0).round() / 10.0).collect::<Vec<_>>() }),
         );
         text.push_str(&format!("\nenvelope: {} windows of {} (use --json for the levels)", levels.len(), timecode(window, rate)));
+    }
+    if !searches.is_empty() {
+        let mut found = Vec::new();
+        for &search in &searches {
+            let quiet = analysis::quietest(&mut renderer, search.0, search.1, rate)?;
+            let level = (quiet.rms_db * 10.0).round() / 10.0;
+            found.push(json!({
+                "range": { "start": seconds(search.0, rate), "end": seconds(search.1, rate) },
+                "at": seconds(quiet.at(), rate),
+                "start": seconds(quiet.start, rate),
+                "end": seconds(quiet.end, rate),
+                "rms_dbfs": level,
+            }));
+            text.push_str(&format!("\nquietest in {}: {} ({}, {level:.1} dBFS)", range_text(search, rate), timecode(quiet.at(), rate), range_text((quiet.start, quiet.end), rate)));
+        }
+        fields.insert("quietest".into(), Value::Array(found));
     }
     Ok(Reply { version: Some(p.version), fields, text })
 }
@@ -847,7 +874,10 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[1].starts_with("e2    cut 0:00.500..0:01.000") && lines[1].contains("you/s1"), "{text}");
         assert!(lines[3].starts_with("e4    normalize -12 LUFS") && lines[3].ends_with("<- head"), "{text}");
-        let text = analyze(&project, true, true, Some("-50dB:0.5s".into()), Some("1s".into()), None).unwrap().text;
+        let text = analyze(&project, false, false, None, None, vec!["1..3".into()], None).unwrap().text;
+        assert_eq!(text, "timeline 0:03.500
+quietest in 0:01.000..0:03.000: 0:02.000 (0:01.500..0:02.500, -120.0 dBFS)");
+        let text = analyze(&project, true, true, Some("-50dB:0.5s".into()), Some("1s".into()), Vec::new(), None).unwrap().text;
         assert!(text.starts_with("timeline 0:03.500\nloudness: -12.0 LUFS, true peak "), "{text}");
         assert!(text.contains("\nsilence under -50 dBFS for 0:00.500 or more: 1 ranges\n  0:01.500..0:02.500\n"), "{text}");
         assert!(text.contains("clipped samples") && text.ends_with("envelope: 4 windows of 0:01.000 (use --json for the levels)"), "{text}");

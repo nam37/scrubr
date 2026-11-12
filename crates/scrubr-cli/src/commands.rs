@@ -752,22 +752,58 @@ pub fn open(project: Option<&Path>) -> Result<Reply> {
         .hint("Run `scrubr help` for the commands, or `scrubr help --agent` for the agent guide."))
 }
 
-pub fn transcribe(project: &Path) -> Result<Reply> {
+#[cfg(not(feature = "transcribe"))]
+pub fn transcribe(project: Option<&Path>, _model: Option<String>, _range: Option<String>, _fetch_model: Option<String>) -> Result<Reply> {
     // Make sure the project is real before talking about features, so a wrong path reads as one.
-    project::open(&Paths::new(project))?;
-    if cfg!(feature = "transcribe") {
-        Err(Error::usage(
-            "feature_not_built",
-            "Transcription is not built yet: the `transcribe` feature is switched on, but scrubr has no speech-to-text engine behind it. The engine has not been chosen.",
-        )
-        .hint("Transcribe outside scrubr for now and cut by time, or leave a label for the person with `scrubr label <project> add`."))
-    } else {
-        Err(Error::usage(
-            "feature_not_built",
-            "This build of scrubr has no transcription. It is an optional feature, off by default, and its speech-to-text engine has not been chosen yet.",
-        )
-        .hint("Transcribe outside scrubr for now and cut by time, or leave a label for the person with `scrubr label <project> add`."))
+    if let Some(project) = project {
+        project::open(&Paths::new(project))?;
     }
+    Err(Error::usage("feature_not_built", "This build of scrubr has no transcription. It is an optional feature, off by default.")
+        .hint("Build scrubr with `--features transcribe`, or transcribe outside scrubr and cut by time. You can also leave a label for the person with `scrubr label <project> add`."))
+}
+
+#[cfg(feature = "transcribe")]
+pub fn transcribe(project: Option<&Path>, model: Option<String>, range: Option<String>, fetch_model: Option<String>) -> Result<Reply> {
+    use scrubr_core::transcribe::{self as speech, Engine, whisper};
+
+    if let Some(name) = fetch_model {
+        let weights = whisper::fetch(&name)?;
+        let bytes = std::fs::metadata(&weights).map(|m| m.len()).unwrap_or(0);
+        let text = format!("The {name} model is installed: {} ({bytes} bytes).", weights.display());
+        return Ok(Reply::new(None, json!({ "model": name, "path": weights.to_string_lossy(), "bytes": bytes }), text));
+    }
+    let Some(project) = project else {
+        return Err(Error::usage("bad_usage", "Transcribe needs a project.").hint("For example `scrubr transcribe <project>`, or `scrubr transcribe --fetch-model base.en` to install a model."));
+    };
+    let paths = Paths::new(project);
+    let p = project::open(&paths)?;
+    let rate = p.sample_rate;
+    let tl = Timeline::build(&p)?;
+    let range = range.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?;
+    let name = model.unwrap_or_else(|| whisper::DEFAULT_MODEL.to_string());
+    let mut engine = whisper::Whisper::load(&name)?;
+    let began = std::time::Instant::now();
+    // Progress goes to stderr, so stdout stays one JSON reply.
+    let words = speech::transcribe(&p, &paths, range, &mut engine, &mut |done, total| {
+        eprintln!("transcribe: {} of {}", timecode(done, rate), timecode(total, rate));
+    })?;
+    let took = began.elapsed().as_secs_f64();
+    let (start, end) = range.unwrap_or((0, tl.total()));
+    let text = speech::text(&words);
+    let listed: Vec<Value> = words
+        .iter()
+        .map(|w| json!({ "word": w.text, "start": seconds(w.start, rate), "end": seconds(w.end, rate), "p": (w.probability * 1000.0).round() / 1000.0 }))
+        .collect();
+    let mut fields = Map::new();
+    fields.insert("timeline_seconds".into(), json!(seconds(tl.total(), rate)));
+    fields.insert("range".into(), json!({ "start": seconds(start, rate), "end": seconds(end, rate) }));
+    fields.insert("engine".into(), json!(engine.name()));
+    fields.insert("took_seconds".into(), json!((took * 10.0).round() / 10.0));
+    fields.insert("word_count".into(), json!(words.len()));
+    fields.insert("text".into(), json!(text));
+    fields.insert("words".into(), Value::Array(listed));
+    let shown = format!("{} words in {} by {}, in {took:.1} s (use --json for word times):\n{text}", words.len(), range_text((start, end), rate), engine.name());
+    Ok(Reply { version: Some(p.version), fields, text: shown })
 }
 
 #[cfg(test)]
@@ -791,7 +827,7 @@ mod tests {
         let project = dir.path().join("ep.scrubr");
         let opts = |dry_run: bool| EditOpts { dry_run, if_version: None, author: Some("you".into()), session: Some("s1".into()) };
 
-        let text = new(&project, &[wav.clone()], false, None, None).unwrap().text;
+        let text = new(&project, std::slice::from_ref(&wav), false, None, None).unwrap().text;
         assert!(text.starts_with("Created ") && text.contains("from 1 file: 0:04.000 at 48000 Hz, 2 channels.") && text.ends_with("Version 1."), "{text}");
         assert_eq!(cut(&project, "0.5..1", None, &opts(false), false).unwrap().text, "cut 0:00.500..0:01.000: removed 0:00.500. Timeline 0:04.000 -> 0:03.500. Edit e2, version 2.");
         assert_eq!(gain(&project, "-3dB", None, &opts(false)).unwrap().text, "gain -3 dB over the whole timeline. Timeline 0:03.500. Edit e3, version 3.");

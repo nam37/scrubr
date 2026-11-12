@@ -13,6 +13,7 @@ pub mod project;
 pub mod render;
 pub mod source;
 pub mod timeline;
+pub mod transcribe;
 pub mod wav;
 
 use std::path::Path;

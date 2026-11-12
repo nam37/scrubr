@@ -355,7 +355,8 @@ fn the_agent_guide_is_agents_md() {
 fn features_not_in_this_build_say_so() {
     let bench = Bench::with_project();
     let error = bench.run(&["transcribe", "ep.scrubr"]).fails(1, "feature_not_built");
-    assert!(error["message"].as_str().unwrap().contains("engine has not been chosen"));
+    assert!(error["message"].as_str().unwrap().contains("optional feature"));
+    assert!(error["hint"].as_str().unwrap().contains("--features transcribe"));
     bench.run(&["transcribe", "nope.scrubr"]).fails(2, "project_not_found");
     bench.run(&["open", "ep.scrubr"]).fails(1, "gui_not_available");
     bench.run(&[]).fails(1, "gui_not_available");

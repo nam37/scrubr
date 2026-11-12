@@ -711,3 +711,99 @@ fn waveform_images_are_written_from_peaks_and_from_audio() {
     let err = image::render_png(&project, &fx.paths, &wide, &image::Options { width: 400, height: 200, range: Some((0, 999_999)) }).unwrap_err();
     assert_eq!(err.code(), "range_out_of_bounds");
 }
+
+#[test]
+fn an_m4a_file_imports_as_a_source() {
+    // One second of a 440 Hz tone at an eighth of full scale, encoded as AAC in an M4A file.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tone.m4a");
+    fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.m4a"), &file).unwrap();
+    let paths = Paths::new(dir.path().join("aac.scrubr"));
+    let project = edit::new_project(&paths, &[file], &me(), false).unwrap();
+    let source = &project.sources[0];
+    assert!(source.conformed);
+    assert_eq!((source.sample_rate, source.channels), (48_000, 1), "the file does not state its channels; the audio does");
+    // The second of audio, with the 1024 frames an AAC encoder puts in front of it.
+    assert_eq!(source.frames, 49_024);
+
+    let mut renderer = Renderer::new(&project, &paths).unwrap();
+    let mut audio = Vec::new();
+    renderer.read(0, 49_024, &mut audio).unwrap();
+    let body = &audio[4_800..43_200];
+    let crossings = body.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+    assert!((351..=353).contains(&crossings), "0.8 s of 440 Hz has 352 rising crossings, not {crossings}");
+    let peak = body.iter().fold(0f32, |m, &s| m.max(s.abs()));
+    assert!((peak - 0.125).abs() < 0.02, "peak {peak}");
+}
+
+// ---- transcription pipeline, with a stand-in for the speech model -----------------------------
+
+/// Hears one word, a second into every piece of audio it is given, and notes each piece's length.
+#[derive(Default)]
+struct OneWordPerPiece {
+    pieces: Vec<usize>,
+}
+
+impl scrubr_core::transcribe::Engine for OneWordPerPiece {
+    fn name(&self) -> String {
+        "stand-in".into()
+    }
+
+    fn transcribe(&mut self, audio: &[f32]) -> scrubr_core::Result<Vec<scrubr_core::transcribe::Heard>> {
+        self.pieces.push(audio.len());
+        Ok(vec![scrubr_core::transcribe::Heard { text: format!(" word{} ", self.pieces.len()), start: 1.0, end: 1.5, probability: 0.9 }])
+    }
+}
+
+#[test]
+fn transcript_words_come_back_as_timeline_frames() {
+    use scrubr_core::transcribe::{Word, transcribe};
+    // A 48 kHz stereo project. The engine is given 16 kHz mono, and its seconds become frames.
+    let fx = Fixture::noise(RATE as u64 * 6);
+    let mut engine = OneWordPerPiece::default();
+    let mut progress = Vec::new();
+    let words = transcribe(&fx.project(), &fx.paths, Some((96_000, 240_000)), &mut engine, &mut |done, total| progress.push((done, total))).unwrap();
+    assert_eq!(engine.pieces, vec![48_000], "three seconds of timeline is 48,000 samples at 16 kHz");
+    assert_eq!(words, vec![Word { text: "word1".into(), start: 96_000 + 48_000, end: 96_000 + 72_000, probability: 0.9 }]);
+    assert_eq!(progress, vec![(144_000, 144_000)]);
+
+    // The transcript is of the edited timeline: after a cut, there is less to hear.
+    fx.apply(vec![cut(0, 48_000, 0)]);
+    let mut engine = OneWordPerPiece::default();
+    let words = transcribe(&fx.project(), &fx.paths, None, &mut engine, &mut |_, _| {}).unwrap();
+    assert_eq!(engine.pieces, vec![80_000]);
+    assert_eq!((words[0].start, words[0].end), (48_000, 72_000));
+
+    let err = transcribe(&fx.project(), &fx.paths, Some((0, 999_999)), &mut engine, &mut |_, _| {}).unwrap_err();
+    assert_eq!(err.code(), "range_out_of_bounds");
+}
+
+#[test]
+fn long_audio_reaches_the_engine_in_pieces_split_at_a_pause() {
+    use scrubr_core::transcribe::transcribe;
+    // Six minutes at 16 kHz mono: a tone, silent only from 4:50 to 4:51.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("long.wav");
+    write_wav(&file, 16_000, 1, 16, 16_000 * 360, |f, _| if (16_000 * 290..16_000 * 291).contains(&f) { 0.0 } else { (f as f32 * 0.05).sin() * 0.3 });
+    let paths = Paths::new(dir.path().join("long.scrubr"));
+    let project = edit::new_project(&paths, &[file], &me(), false).unwrap();
+    let mut engine = OneWordPerPiece::default();
+    let words = transcribe(&project, &paths, None, &mut engine, &mut |_, _| {}).unwrap();
+    // No piece is longer than five minutes, and the first ends inside the pause.
+    assert_eq!(engine.pieces.len(), 2);
+    let first = engine.pieces[0];
+    assert!((16_000 * 290 + 1_600..16_000 * 291 - 1_600).contains(&first), "first piece ends at {:.2} s", first as f64 / 16_000.0);
+    assert_eq!(engine.pieces[1], 16_000 * 360 - first);
+    // The second piece's word is placed after the first piece, not at the start of the timeline.
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[1].start, first as u64 + 16_000);
+}
+
+#[test]
+fn silence_is_not_sent_to_the_engine() {
+    use scrubr_core::transcribe::transcribe;
+    let fx = Fixture::with(RATE as u64 * 2, 1, |_, _, _| 0.0);
+    let mut engine = OneWordPerPiece::default();
+    let words = transcribe(&fx.project(), &fx.paths, None, &mut engine, &mut |_, _| {}).unwrap();
+    assert!(engine.pieces.is_empty() && words.is_empty());
+}

@@ -41,10 +41,11 @@ is seconds, so write `5ms`, not `5`.
 
 | Command | What it does |
 |---|---|
-| `scrubr new P --from a.wav [b.wav ...]` | Create a project. WAV, FLAC, MP3 and OGG are read; files at another rate are resampled |
+| `scrubr new P --from a.wav [b.wav ...]` | Create a project. WAV, FLAC, MP3, OGG and AAC (.m4a) are read; files at another rate are resampled |
 | `scrubr info P` | Timeline length, format, sources, head, version |
 | `scrubr analyze P [--loudness] [--peaks] [--silence -45dB:1s] [--envelope 1s] [--range R]` | Measurements. With no flags: loudness and peaks |
 | `scrubr render P --png out.png [--range R] [--width 1600] [--height 480]` | Waveform image. The reply gives `start` and `seconds_per_pixel`, so pixel x is at `start + x * seconds_per_pixel` |
+| `scrubr transcribe P [--range R] [--model base.en]` | Every word spoken, with `start` and `end`. Only in builds with the transcription feature; other builds say so |
 | `scrubr cut P R` | Remove a range |
 | `scrubr keep P R` | Remove everything outside a range |
 | `scrubr mute P R` | Silence a range and keep its length |
@@ -60,8 +61,7 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr export P out.flac [--bits 16\|24\|32\|32f] [--range R]` | Render to `.wav` or `.flac` |
 
 Edit commands (`cut` to `redo`, and `label add`/`rm`) accept `--dry-run`, `--if-version N`,
-`--author` and `--session`. Not in this build: `scrubr open` (the GUI), `scrubr transcribe`
-(optional feature, engine not chosen), MP3 export.
+`--author` and `--session`. Not in this build: `scrubr open` (the GUI) and MP3 export.
 
 ## Batches
 
@@ -97,6 +97,11 @@ positions after a cut move earlier by its length. A batch is one edit and one un
   on top.
 - **Silence ranges** from `analyze --silence` are exact. Cutting them whole butts words together;
   leave some of each pause, for example 0.15 s at each end.
+- **Transcripts.** `transcribe` runs a local speech model, at several times real time, and
+  prints progress on stderr. Word times are typically within 0.1 s but can be off by more, so do
+  not cut on them directly: find the phrase in `words`, then move each end to the middle of the
+  nearest pause from `analyze --silence -45dB:0.25s`. If the reply is `model_not_installed`,
+  tell the person; `scrubr transcribe --fetch-model base.en` downloads it once.
 - **Undo.** After `undo`, a new edit discards the undone ones. `undo --edit` and `--of-session`
   add a revert instead, so later edits and labels stay where they are; undo the revert to bring
   the edits back.

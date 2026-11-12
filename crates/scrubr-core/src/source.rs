@@ -26,7 +26,7 @@ use crate::wav::WavFile;
 const CHUNK_FRAMES: usize = 1 << 15;
 
 /// A stream of decoded audio: interleaved `f32` frames at the file's own rate.
-trait Frames {
+pub(crate) trait Frames {
     fn sample_rate(&self) -> u32;
     fn channels(&self) -> usize;
     /// Replaces `out` with the next frames. An empty `out` is the end.
@@ -47,20 +47,27 @@ impl Frames for WavFile {
     }
 }
 
-/// Any format symphonia reads: FLAC, MP3, OGG Vorbis and the WAV variants hound does not.
+/// Any format symphonia reads: FLAC, MP3, OGG Vorbis, AAC (bare or in an M4A/MP4 file) and the
+/// WAV variants hound does not.
 struct Decoded {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
     track: u32,
     rate: u32,
+    /// Zero until the first packet is decoded, for files whose header does not say.
     channels: usize,
     bits: u16,
     buf: Option<SampleBuffer<f32>>,
+    /// Audio decoded while opening the file, handed out by the first read.
+    first: Option<Vec<f32>>,
+    /// Frames still to hand out, when the file states its length. Decoders can run past it
+    /// with the encoder's padding.
+    left: Option<u64>,
 }
 
 fn decode_error(path: &Path, e: impl std::fmt::Display) -> Error {
     Error::codec("decode_failed", format!("Could not decode {}: {e}", path.display()))
-        .hint("scrubr reads WAV, FLAC, MP3 and OGG Vorbis. Convert other formats to WAV first.")
+        .hint("scrubr reads WAV, FLAC, MP3, OGG Vorbis and AAC (.m4a, .mp4, .aac). Convert other formats to WAV first.")
 }
 
 impl Decoded {
@@ -92,18 +99,31 @@ impl Decoded {
             channels: params.channels.map_or(0, |c| c.count()),
             bits: params.bits_per_sample.unwrap_or(16) as u16,
             buf: None,
+            first: None,
+            left: params.n_frames,
         };
         if decoded.channels == 0 {
-            // Some formats only reveal the channel layout with the first packet.
+            // An M4A file leaves the channel count to the audio itself: decode the first packet
+            // to learn it, and keep what it held for the first read.
             let mut first = Vec::new();
             decoded.decode_next(path, &mut first)?;
-            return Err(decode_error(path, "it does not state its channel count"));
+            if decoded.channels == 0 {
+                return Err(decode_error(path, "it holds no audio"));
+            }
+            decoded.first = Some(first);
         }
         Ok(decoded)
     }
 
     fn decode_next(&mut self, path: &Path, out: &mut Vec<f32>) -> Result<()> {
         out.clear();
+        if let Some(first) = self.first.take() {
+            *out = first;
+            return Ok(());
+        }
+        if self.left == Some(0) {
+            return Ok(());
+        }
         loop {
             let packet = match self.format.next_packet() {
                 Ok(packet) => packet,
@@ -117,6 +137,9 @@ impl Decoded {
             match self.decoder.decode(&packet) {
                 Ok(audio) => {
                     let spec = *audio.spec();
+                    if self.channels == 0 {
+                        self.channels = spec.channels.count();
+                    }
                     if spec.channels.count() != self.channels || spec.rate != self.rate {
                         return Err(decode_error(path, "its format changes partway through"));
                     }
@@ -127,6 +150,11 @@ impl Decoded {
                     buf.copy_interleaved_ref(audio);
                     if !buf.samples().is_empty() {
                         out.extend_from_slice(buf.samples());
+                        if let Some(left) = &mut self.left {
+                            let frames = (out.len() / self.channels) as u64;
+                            out.truncate((*left).min(frames) as usize * self.channels);
+                            *left = left.saturating_sub(frames);
+                        }
                         return Ok(());
                     }
                 }
@@ -199,7 +227,7 @@ fn open_frames<'a>(path: &'a Path, wav: bool) -> Result<Box<dyn Frames + 'a>> {
 
 /// Streams `input` through a resampler to `rate`, handing interleaved frames to `sink`. The
 /// output is trimmed of the resampler's delay and is `ceil(frames * rate / input rate)` long.
-fn resample(input: &mut dyn Frames, rate: u32, sink: &mut dyn FnMut(&[f32]) -> Result<()>) -> Result<()> {
+pub(crate) fn resample(input: &mut dyn Frames, rate: u32, sink: &mut dyn FnMut(&[f32]) -> Result<()>) -> Result<()> {
     let channels = input.channels();
     let in_rate = input.sample_rate();
     let failed = |e: &dyn std::fmt::Display| Error::codec("resample_failed", format!("Could not resample from {in_rate} Hz to {rate} Hz: {e}"));

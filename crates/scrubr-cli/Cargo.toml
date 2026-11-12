@@ -10,9 +10,9 @@ name = "scrubr"
 path = "src/main.rs"
 
 [features]
-# Speech-to-text for `scrubr transcribe`. Off by default; no engine is chosen yet, so the
-# feature adds no dependency and the command reports that plainly either way.
-transcribe = []
+# Speech-to-text for `scrubr transcribe`: Whisper in pure Rust. Off by default; without it the
+# command reports that the feature is not built.
+transcribe = ["scrubr-core/transcribe"]
 
 [dependencies]
 scrubr-core = { path = "../scrubr-core" }

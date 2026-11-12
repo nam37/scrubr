@@ -111,7 +111,19 @@ enum Command {
         height: u32,
     },
     /// Words with start and end times as JSON. Needs the optional transcription feature.
-    Transcribe { project: PathBuf },
+    Transcribe {
+        project: Option<PathBuf>,
+        /// The Whisper model: a name such as tiny.en or base.en, or a folder holding one.
+        /// [default: base.en]
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Transcribe only this part of the timeline.
+        #[arg(long, value_name = "RANGE")]
+        range: Option<String>,
+        /// Download a model from huggingface.co and exit. The only step that uses the network.
+        #[arg(long, value_name = "MODEL", conflicts_with_all = ["project", "model", "range"])]
+        fetch_model: Option<String>,
+    },
     /// Remove a range. The join gets a short crossfade.
     Cut {
         project: PathBuf,
@@ -347,7 +359,7 @@ fn run(cli: Cli) -> Result<Reply, Error> {
         Command::Info { project } => commands::info(&project),
         Command::Analyze { project, loudness, peaks, silence, envelope, range } => commands::analyze(&project, loudness, peaks, silence, envelope, range),
         Command::Render { project, png, range, width, height } => commands::render(&project, &png, range, width, height),
-        Command::Transcribe { project } => commands::transcribe(&project),
+        Command::Transcribe { project, model, range, fetch_model } => commands::transcribe(project.as_deref(), model, range, fetch_model),
         Command::Cut { project, range, crossfade, edit } => commands::cut(&project, &range, crossfade, &edit, false),
         Command::Keep { project, range, crossfade, edit } => commands::cut(&project, &range, crossfade, &edit, true),
         Command::Gain { project, db, range, edit } => commands::gain(&project, &db, range, &edit),

@@ -63,7 +63,8 @@ impl Bench {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_scrubr"));
-        command.args(args).current_dir(&self.root).env_remove("SCRUBR_AUTHOR").env_remove("SCRUBR_SESSION");
+        // No test opens a real window: the window's program is pointed at a file that is not there.
+        command.args(args).current_dir(&self.root).env_remove("SCRUBR_AUTHOR").env_remove("SCRUBR_SESSION").env("SCRUBR_GUI", "no-such-scrubr-window");
         command
     }
 
@@ -381,8 +382,11 @@ fn features_not_in_this_build_say_so() {
     assert!(error["message"].as_str().unwrap().contains("optional feature"));
     assert!(error["hint"].as_str().unwrap().contains("--features transcribe"));
     bench.run(&["transcribe", "nope.scrubr"]).fails(2, "project_not_found");
-    bench.run(&["open", "ep.scrubr"]).fails(1, "gui_not_available");
-    bench.run(&[]).fails(1, "gui_not_available");
+    // The window is a program of its own; without it `open` says where it looked.
+    let error = bench.run(&["open", "ep.scrubr"]).fails(2, "gui_not_found");
+    assert!(error["hint"].as_str().unwrap().contains("SCRUBR_GUI"));
+    bench.run(&["open", "nope.scrubr"]).fails(2, "project_not_found");
+    bench.run(&[]).fails(2, "gui_not_found");
 }
 
 #[test]

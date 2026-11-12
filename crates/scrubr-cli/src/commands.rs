@@ -398,7 +398,7 @@ pub fn export(project: &Path, out: &Path, bits: Option<String>, range: Option<St
     };
     let tl = Timeline::build(&p)?;
     let range = range.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?;
-    let report = export::export(&p, &paths, out, &export::Options { depth, range })?;
+    let report = export::export(&p, &paths, out, &export::Options { depth, range, progress: None })?;
     let (bits, float) = match report.depth {
         Depth::Int(bits) => (bits, false),
         Depth::Float => (32, true),
@@ -768,15 +768,74 @@ pub fn label(project: &Path, action: LabelAction) -> Result<Reply> {
     }
 }
 
-// ---- not in this build -----------------------------------------------------------------------
+// ---- the window ------------------------------------------------------------------------------
 
+/// The window is its own program, `scrubr-gui`, kept beside this one. `SCRUBR_GUI` names another.
+fn gui_program() -> PathBuf {
+    match std::env::var_os("SCRUBR_GUI") {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.join(format!("scrubr-gui{}", std::env::consts::EXE_SUFFIX))))
+            .unwrap_or_else(|| PathBuf::from("scrubr-gui")),
+    }
+}
+
+/// Stops programs this one starts from inheriting its input and output.
+#[cfg(windows)]
+fn keep_own_handles() {
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    let handles = [std::io::stdin().as_raw_handle(), std::io::stdout().as_raw_handle(), std::io::stderr().as_raw_handle()];
+    for handle in handles {
+        if !handle.is_null() {
+            // SAFETY: the handle is this process's own and stays open while it runs. The call
+            // clears one flag on it and touches nothing else.
+            unsafe { SetHandleInformation(handle.cast(), HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+
+/// Starts the window on a project, or empty, and returns at once: the window runs on its own.
 pub fn open(project: Option<&Path>) -> Result<Reply> {
-    let what = match project {
-        Some(project) => format!("`scrubr open {}`", project.display()),
-        None => "The scrubr window".to_string(),
+    open_with(project, &gui_program())
+}
+
+fn open_with(project: Option<&Path>, gui: &Path) -> Result<Reply> {
+    // A wrong project path should read as one here, not in a window that opens on an error.
+    let opened = match project {
+        Some(project) => Some((std::path::absolute(project).unwrap_or_else(|_| project.to_path_buf()), project::open(&Paths::new(project))?.version)),
+        None => None,
     };
-    Err(Error::usage("gui_not_available", format!("{what} is not available yet: the GUI arrives in milestone M2, and this build is the command line only."))
-        .hint("Run `scrubr help` for the commands, or `scrubr help --agent` for the agent guide."))
+    if !gui.is_file() {
+        return Err(Error::not_found("gui_not_found", format!("The scrubr window's program was not found at {}.", gui.display()))
+            .hint("Build it with `cargo build --release -p scrubr-gui` so that it sits beside `scrubr`, or set SCRUBR_GUI to its path."));
+    }
+    let mut command = std::process::Command::new(gui);
+    if let Some((path, _)) = &opened {
+        command.arg(path);
+    }
+    // The window must not hold on to this command's output. On Windows a child inherits the
+    // caller's handles unless told not to, and a caller reading the reply, such as an agent,
+    // would then wait until the window closed.
+    #[cfg(windows)]
+    keep_own_handles();
+    use std::process::Stdio;
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| Error::codec("gui_failed", format!("Could not start {}: {e}", gui.display())).hint("Check that the file is the scrubr window's program and can be run."))?;
+    let text = match &opened {
+        Some((path, _)) => format!("Opened {} in the scrubr window.", path.display()),
+        None => "Opened the scrubr window.".to_string(),
+    };
+    let fields = json!({ "opened": opened.as_ref().map(|(path, _)| path.to_string_lossy()), "pid": child.id() });
+    Ok(Reply::new(opened.map(|(_, version)| version), fields, text))
 }
 
 #[cfg(not(feature = "transcribe"))]
@@ -885,7 +944,9 @@ quietest in 0:01.000..0:03.000: 0:02.000 (0:01.500..0:02.500, -120.0 dBFS)");
         assert_eq!(text, "Undid e4. Head is e3. Timeline 0:03.500 -> 0:03.500. Version 6.");
         let text = export(&project, &dir.path().join("out.wav"), None, Some("0..1".into())).unwrap().text;
         assert!(text.starts_with("Exported 0:01.000 to ") && text.contains("WAV 16-bit, 48000 Hz, 2 ch, 192044 bytes."), "{text}");
-        let err = open(Some(&project)).unwrap_err();
-        assert!(err.to_string().contains("milestone M2") && err.hint_text().is_some());
+        let err = open_with(Some(&project), &dir.path().join("no-such-window")).unwrap_err();
+        assert!(err.to_string().contains("was not found at") && err.hint_text().is_some_and(|h| h.contains("SCRUBR_GUI")), "{err}");
+        let err = open_with(Some(&dir.path().join("nope.scrubr")), &dir.path().join("no-such-window")).unwrap_err();
+        assert!(err.to_string().contains("nope.scrubr"), "{err}");
     }
 }

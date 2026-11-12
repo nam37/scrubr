@@ -485,7 +485,7 @@ fn flac_and_wav_exports_hold_the_same_samples() {
     assert!(project.sources[0].conformed);
     assert_eq!((project.sources[0].frames, project.sources[0].bits), (47_655, 24));
     let back = fx.root.join("back.wav");
-    export::export(&project, &paths, &back, &export::Options { depth: Some(Depth::Int(24)), range: None }).unwrap();
+    export::export(&project, &paths, &back, &export::Options { depth: Some(Depth::Int(24)), ..Default::default() }).unwrap();
     assert_eq!(read_ints(&back), read_ints(&wav));
 }
 

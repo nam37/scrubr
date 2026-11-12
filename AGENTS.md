@@ -60,9 +60,11 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr history P` | Every edit with author, session and state |
 | `scrubr label P add R "text"` / `label P list` / `label P rm l1` | Notes for the reviewer. A single time instead of a range marks a point |
 | `scrubr export P out.flac [--bits 16\|24\|32\|32f] [--range R]` | Render to `.wav` or `.flac` |
+| `scrubr open P` | Open the project in the window, for the person to review. Returns at once |
 
 Edit commands (`cut` to `redo`, and `label add`/`rm`) accept `--dry-run`, `--if-version N`,
-`--author` and `--session`. Not in this build: `scrubr open` (the GUI) and MP3 export.
+`--author` and `--session`. `scrubr open` needs the window's program, `scrubr-gui`, beside
+`scrubr`; without it the reply is `gui_not_found`. Not in this build: MP3 export.
 
 ## Batches
 

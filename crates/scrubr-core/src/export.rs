@@ -6,6 +6,8 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use flacenc::bitsink::MemSink;
 use flacenc::component::{BitRepr, Stream, StreamInfo};
@@ -44,6 +46,9 @@ pub struct Options {
     pub depth: Option<Depth>,
     /// Timeline range in frames. The default is the whole timeline.
     pub range: Option<(u64, u64)>,
+    /// Set to the number of frames written as the export goes, for a caller on another thread
+    /// to show progress.
+    pub progress: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,8 +146,8 @@ pub fn export(project: &Project, paths: &Paths, out: &Path, options: &Options) -
     part.push(".part");
     let part = PathBuf::from(part);
     let written = match format {
-        Format::Wav => write_wav(project, &mut renderer, &part, depth, t0, t1),
-        Format::Flac => write_flac(project, &mut renderer, &part, depth, t0, t1),
+        Format::Wav => write_wav(project, &mut renderer, &part, depth, t0, t1, options.progress.as_deref()),
+        Format::Flac => write_flac(project, &mut renderer, &part, depth, t0, t1, options.progress.as_deref()),
     };
     let clipped_samples = match written {
         Ok(clipped) => clipped,
@@ -156,7 +161,19 @@ pub fn export(project: &Project, paths: &Paths, out: &Path, options: &Options) -
     Ok(Report { path: out.to_path_buf(), format, depth, frames: t1 - t0, bytes, clipped_samples })
 }
 
-fn write_wav(project: &Project, renderer: &mut Renderer, path: &Path, depth: Depth, t0: u64, t1: u64) -> Result<u64> {
+/// [`walk`], telling `progress` how many frames are done after each block.
+fn walk_counted(renderer: &mut Renderer, t0: u64, t1: u64, progress: Option<&AtomicU64>, mut each: impl FnMut(&[f32]) -> Result<()>) -> Result<()> {
+    let channels = renderer.channels().max(1);
+    walk(renderer, t0, t1, |at, block| {
+        each(block)?;
+        if let Some(progress) = progress {
+            progress.store(at - t0 + (block.len() / channels) as u64, Relaxed);
+        }
+        Ok(())
+    })
+}
+
+fn write_wav(project: &Project, renderer: &mut Renderer, path: &Path, depth: Depth, t0: u64, t1: u64, progress: Option<&AtomicU64>) -> Result<u64> {
     let spec = hound::WavSpec {
         channels: project.channels,
         sample_rate: project.sample_rate,
@@ -169,7 +186,7 @@ fn write_wav(project: &Project, renderer: &mut Renderer, path: &Path, depth: Dep
     let mut writer = hound::WavWriter::create(path, spec)?;
     let mut ints = Vec::new();
     let mut clipped = 0;
-    walk(renderer, t0, t1, |_, block| {
+    walk_counted(renderer, t0, t1, progress, |block| {
         match depth {
             Depth::Float => {
                 for &s in block {
@@ -189,7 +206,7 @@ fn write_wav(project: &Project, renderer: &mut Renderer, path: &Path, depth: Dep
     Ok(clipped)
 }
 
-fn write_flac(project: &Project, renderer: &mut Renderer, path: &Path, depth: Depth, t0: u64, t1: u64) -> Result<u64> {
+fn write_flac(project: &Project, renderer: &mut Renderer, path: &Path, depth: Depth, t0: u64, t1: u64, progress: Option<&AtomicU64>) -> Result<u64> {
     let Depth::Int(bits) = depth else { unreachable!("float FLAC is refused before this") };
     let channels = project.channels as usize;
     let failed = |e: &dyn std::fmt::Debug| encode_failed(path, e);
@@ -240,7 +257,7 @@ fn write_flac(project: &Project, renderer: &mut Renderer, path: &Path, depth: De
         Ok(())
     };
     let block = FLAC_BLOCK * channels;
-    walk(renderer, t0, t1, |_, samples| {
+    walk_counted(renderer, t0, t1, progress, |samples| {
         clipped += quantize(samples, bits, &mut ints);
         pending.extend_from_slice(&ints);
         let mut at = 0;

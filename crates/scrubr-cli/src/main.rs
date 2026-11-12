@@ -261,7 +261,7 @@ enum Command {
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
     },
-    /// Open the GUI. Not in this build yet.
+    /// Open the window on a project, for a person to review. It runs on its own.
     Open { project: Option<PathBuf> },
     /// Print help, or the agent guide with --agent.
     Help {

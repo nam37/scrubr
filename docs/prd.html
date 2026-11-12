@@ -448,7 +448,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <div class="cmd"><code>scrubr info ep42.scrubr</code><span>Timeline length, format, sources, head and version.</span></div>
       <div class="cmd"><code>scrubr analyze ep42.scrubr --loudness --silence -45dB:1s</code><span>Measurements as JSON. See Analysis.</span></div>
       <div class="cmd"><code>scrubr render ep42.scrubr --png check.png --range 11:50..12:20</code><span>Waveform image of the timeline or a range.</span></div>
-      <div class="cmd"><code>scrubr cut ep42.scrubr 12:03.25..12:09.9</code><span>Remove a range.</span></div>
+      <div class="cmd"><code>scrubr transcribe ep42.scrubr</code><span>Words with start and end times as JSON. Needs the optional transcription feature.</span></div>
+      <div class="cmd"><code>scrubr cut ep42.scrubr 12:03.25..12:09.9</code><span>Remove a range. The join gets a short crossfade.</span></div>
       <div class="cmd"><code>scrubr keep ep42.scrubr 0:41..58:10</code><span>Remove everything outside a range.</span></div>
       <div class="cmd"><code>scrubr gain ep42.scrubr +2dB --range 0..0:41</code><span>Change the level of the timeline or a range.</span></div>
       <div class="cmd"><code>scrubr fade ep42.scrubr in 0.5s</code><span>Fade in or out at either end, or across a range.</span></div>
@@ -478,6 +479,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     </div>
 
     <p class="key"><span class="tag">Batch rule</span>In <code>scrubr apply</code>, every range refers to the timeline as it was before the batch. The engine resolves them all against that one timeline. An agent can cut all 38 silences found by one <code>analyze</code> call in one step, without recomputing positions after each cut.</p>
+
+    <p class="key"><span class="tag">Joins</span>Cuts, keeps and inserts crossfade across each join, 5 ms by default, because an agent can't hear a click. <code>--crossfade 0</code> gives a hard, sample-exact join.</p>
 
     <h3>Example session</h3>
     <p>You imported the episode and trimmed both ends. The agent takes it from there:</p>
@@ -684,7 +687,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Level envelope</td><td><code>analyze --envelope 1s</code></td><td>RMS level in dBFS per window, for finding loud and quiet stretches</td></tr>
           <tr><td>Waveform image</td><td><code>render --png</code></td><td>PNG of the timeline or a range, drawn by the core without a GPU</td></tr>
           <tr><td>Spectrogram (M4)</td><td><code>render --spectrogram</code></td><td>PNG for spotting hum, hiss and clicks</td></tr>
-          <tr><td>Transcript (M4)</td><td><code>transcribe</code></td><td>Words with start and end times, so an agent can cut by phrase</td></tr>
+          <tr><td>Transcript (optional)</td><td><code>transcribe</code></td><td>Words with start and end times, so an agent can find what was said and cut by phrase</td></tr>
         </tbody>
       </table>
     </div>
@@ -710,7 +713,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td><code>notify</code></td><td>File watching in the GUI</td><td></td></tr>
           <tr><td><code>blake3</code></td><td>Source hashing</td><td></td></tr>
           <tr><td><code>fd-lock</code></td><td>Project write lock</td><td>OS advisory lock, released if the process dies</td></tr>
-          <tr><td><code>whisper-rs</code></td><td>Transcription (M4)</td><td>Local model, no cloud</td></tr>
+          <tr><td>Speech-to-text, such as <code>whisper-rs</code></td><td>Transcription (M1)</td><td>Optional feature, off by default. Open source, local model, no cloud. Engine to be chosen.</td></tr>
         </tbody>
       </table>
     </div>
@@ -749,15 +752,15 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
         <span class="id">M1</span>
         <div class="body">
           <h3>Core and CLI</h3>
-          <p>Project file, edit log in source coordinates, locked and versioned atomic writes with <code>--if-version</code>, decoding, the edit commands, undo and history, analysis (loudness, peaks, silence, envelope), PNG rendering, WAV and FLAC export, <code>help --agent</code> and <code>AGENTS.md</code>.</p>
-          <p class="exit"><b>Exit test</b>An agent with only the binary and the guide cleans up a 1-hour podcast: removes long silences, cuts a named segment, hits −16 LUFS with true peak at or under −1 dBTP, fades both ends and exports FLAC. The result passes a listening check.</p>
+          <p>Project file, edit log in source coordinates, locked and versioned atomic writes with <code>--if-version</code>, decoding, the edit commands with default crossfades at joins, author and session on every edit, undo and history, analysis (loudness, peaks, silence, envelope), optional transcription with word timestamps, PNG rendering, WAV and FLAC export, <code>help --agent</code> and <code>AGENTS.md</code>.</p>
+          <p class="exit"><b>Exit test</b>An agent with only the binary and the guide cleans up a 1-hour podcast: removes long silences, finds a named segment in the transcript and cuts it, hits −16 LUFS with true peak at or under −1 dBTP, fades both ends and exports FLAC. The result passes a listening check.</p>
         </div>
       </li>
       <li>
         <span class="id">M2</span>
         <div class="body">
           <h3>GUI</h3>
-          <p>Open a project, stereo waveform, timecode ruler, selection, playback, history panel, undo and redo, keyboard shortcuts and export.</p>
+          <p>Open a project, stereo waveform, timecode ruler, selection, playback, history panel showing author and session, live reload when the project file changes, undo and redo, keyboard shortcuts and export.</p>
           <p class="exit"><b>Exit test</b>You can audit and fix the M1 agent's work without touching the CLI.</p>
         </div>
       </li>
@@ -765,7 +768,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
         <span class="id">M3</span>
         <div class="body">
           <h3>Shared editing</h3>
-          <p>File watching with reload, author and session on every edit, session undo, the labels lane, and notices for outside edits.</p>
+          <p>Session undo, the labels lane, notices naming each outside edit, and GUI write retries after a version conflict. Authorship arrives in M1 and live reload in M2.</p>
           <p class="exit"><b>Exit test</b>An agent and a person edit the same project in one sitting and no edits are lost.</p>
         </div>
       </li>
@@ -773,7 +776,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
         <span class="id">M4</span>
         <div class="body">
           <h3>Extras</h3>
-          <p>MP3 export, spectrograms, transcription with word timestamps and cut-by-words, then effects such as noise reduction, EQ and compression. Multitrack only if it is still wanted.</p>
+          <p>MP3 export, spectrograms, cut-by-words commands on top of the transcript, then effects such as noise reduction, EQ and compression. Multitrack only if it is still wanted.</p>
         </div>
       </li>
     </ol>
@@ -791,7 +794,9 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Long files are slow to draw and scrub</td><td>Peak pyramid cache, streaming decode, seek tables for compressed formats.</td></tr>
           <tr><td>Agent and person write at the same moment</td><td>A file lock around each write, and <code>--if-version</code> with exit code 3 for stale positions. The GUI retries after reloading.</td></tr>
           <tr><td>Normalize can't reach its target without clipping</td><td>Gain stops at the true-peak ceiling and the reply reports the loudness achieved. A limiter is an open question.</td></tr>
-          <tr><td>Agents misjudge audio from numbers alone</td><td>Labels for human review, PNG renders, transcripts in M4.</td></tr>
+          <tr><td>Agents misjudge audio from numbers alone</td><td>Labels for human review, PNG renders, and transcripts from M1.</td></tr>
+          <tr><td>Hard cuts click, and an agent can't hear it</td><td>Joins crossfade by default.</td></tr>
+          <tr><td>Transcription brings a heavy dependency and a large model</td><td>Optional feature. The binary builds and works without it, and no model is bundled.</td></tr>
           <tr><td>License contamination</td><td>No Audacity code. LAME only as an optional, dynamically linked feature.</td></tr>
         </tbody>
       </table>
@@ -806,6 +811,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>One project file plus a cache folder, or a single project folder?</li>
       <li>Does v1 need a limiter so normalize can reach −16 LUFS on peaky speech, or is stopping at the ceiling and reporting enough?</li>
       <li>When a cut covers audio that an earlier edit had already removed, should it claim that hidden audio too, so it stays hidden if the earlier edit is reverted?</li>
+      <li>Which open-source speech-to-text engine backs <code>transcribe</code>, and how does its model get installed?</li>
       <li>Is multitrack a v2 goal, or out of scope for good?</li>
       <li>Should recording from a microphone ever be in scope?</li>
       <li>Is a browser build through Rune's WebGPU target worth revisiting once it matures?</li>

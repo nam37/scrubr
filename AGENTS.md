@@ -47,7 +47,9 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr analyze P --quietest R [--quietest R ...]` | The quietest moment in each range, as `at`: where to put a cut between two words |
 | `scrubr render P --png out.png [--range R] [--width 1600] [--height 480]` | Waveform image. The reply gives `start` and `seconds_per_pixel`, so pixel x is at `start + x * seconds_per_pixel` |
 | `scrubr transcribe P [--range R] [--model base.en]` | Every word spoken, with `start` and `end`. Only in builds with the transcription feature; other builds say so |
+| `scrubr find P "words" [--within R]` | Where a phrase is said, and the cut that would take it out. Changes nothing. Needs the transcription feature |
 | `scrubr cut P R` | Remove a range |
+| `scrubr cut P --phrase "words" [--within R] [--occurrence N \| --all]` | Remove a phrase by its words, checked before it is written. Needs the transcription feature |
 | `scrubr keep P R` | Remove everything outside a range |
 | `scrubr mute P R` | Silence a range and keep its length |
 | `scrubr gain P +2dB [--range R]` | Change level, of everything or of a range |
@@ -138,15 +140,24 @@ a track by its name or its id (`t2`).
   other. A sound can come back as a word, such as `MUSIC`. A word can have the same `start` and
   `end`. Word times are typically within 0.1 s, but about one in ten is off by 0.5 s or more, so
   do not cut on them directly.
-- **Removing a phrase.** Find it in `words`. For each end of the cut, take the word inside and
-  the word outside, and run `analyze --quietest A..B`, with A 0.3 s before the end of the
-  earlier word and B 0.3 s after the start of the later one. Cut at the `at` it returns: the
-  middle of the quietest stretch between the two words (`start`, `end` and `rms_dbfs` describe
-  that stretch). It uses no threshold, so it works on quiet recordings and where talk is too
-  fast for `--silence` to find a pause. Give both ends in one command. Then run
-  `transcribe --range` across each join and compare with the first transcript: the phrase must
-  be gone and the words either side still there. If not, `undo` and label the place for the
-  person. On hard recordings about one end in six lands a word out.
+- **Removing a phrase.** `scrubr cut P --phrase "you know"` does it in one step. It transcribes,
+  finds the words, cuts at the quietest moment either side (never on the word times), and
+  listens across the join as it would sound before writing anything. If the words either side
+  would not be left as they were, it writes nothing and replies `cut_not_clean` (exit 1): label
+  the place for the person and move on. A sentence between pauses cuts cleanly; a few words in
+  the middle of running speech often do not, and are refused.
+  - On a long recording give `--within START..END`, a window of a minute or so around the
+    phrase from an earlier `transcribe`. Without it the whole timeline is transcribed first.
+  - Said more than once: the reply is `phrase_ambiguous` and lists the places. Pick one with
+    `--occurrence N` or take them all with `--all`, which is one edit.
+  - `--dry-run` listens and checks and writes nothing. `scrubr find` only lists the places.
+  - `--heard-on T` listens for the phrase on one track. The cut is still made on every track.
+  - Each cut shortens the timeline, so times after it move earlier by `removed_seconds`.
+  - The model has to hear the words as you wrote them. If the reply is `phrase_not_found`, look
+    at `transcribe` for how they were heard.
+  - By hand, the same rule: for each end run `analyze --quietest A..B`, with A 0.3 s before the
+    end of the earlier word and B 0.3 s after the start of the later one, cut at the `at` it
+    returns, then `transcribe --range` across the join to check.
 - **Models.** If the reply is `model_not_installed`, tell the person;
   `scrubr transcribe --fetch-model base.en` downloads it once.
 - **Undo.** After `undo`, a new edit discards the undone ones. `undo --edit` and `--of-session`

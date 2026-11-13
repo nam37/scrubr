@@ -11,7 +11,9 @@ use scrubr_core::edit::{self, DEFAULT_CEILING_DBTP, Request, Revert, Target};
 use scrubr_core::export::{self, Depth};
 use scrubr_core::image;
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts};
+use scrubr_core::phrase::{self, Pick};
 use scrubr_core::render::Renderer;
+use scrubr_core::transcribe::{self, Heard};
 use scrubr_core::{Kind, Timeline, WavFile};
 
 const RATE: u32 = 48_000;
@@ -1034,4 +1036,162 @@ fn track_mistakes_are_refused_with_a_reason() {
     // A file from a newer scrubr is refused, not misread.
     let newer = fx.project().to_json().replacen("\"format\": 2", "\"format\": 3", 1);
     assert!(Project::parse(&newer, Path::new("p.scrubr")).unwrap_err().to_string().contains("format 3"));
+}
+
+// ---- cutting by words ------------------------------------------------------------------------
+
+const SPOKEN: [&str; 6] = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+
+/// The pitch a stand-in word is "spoken" at.
+fn pitch(word: usize) -> f32 {
+    400.0 + 300.0 * word as f32
+}
+
+/// A recording of "alpha bravo charlie delta echo bravo foxtrot": each word a burst of its own
+/// pitch 0.35 s long, with 0.25 s of silence before the next. The first starts at 0.5 s.
+fn spoken() -> Fixture {
+    let said = [0usize, 1, 2, 3, 4, 1, 5];
+    Fixture::with(5 * RATE as u64, 1, move |f, _, _| {
+        let t = f as f32 / RATE as f32 - 0.5;
+        let slot = (t / 0.6).floor();
+        let into = t - slot * 0.6;
+        if t < 0.0 || slot as usize >= said.len() || into >= 0.35 {
+            return 0.0;
+        }
+        // A few milliseconds to rise and fall, as a voice does.
+        let edge = (into.min(0.35 - into) / 0.005).min(1.0);
+        (TAU * pitch(said[slot as usize]) * into).sin() * 0.4 * edge
+    })
+}
+
+/// A stand-in for the speech model: it hears each burst as the word of its pitch. `late` is
+/// added to every time it reports, as a real model's times are sometimes out.
+struct Tones {
+    late: f64,
+}
+
+impl transcribe::Engine for Tones {
+    fn name(&self) -> String {
+        "tones".into()
+    }
+
+    fn transcribe(&mut self, audio: &[f32]) -> scrubr_core::Result<Vec<Heard>> {
+        let rate = transcribe::ENGINE_RATE as f64;
+        let hop = 160;
+        let loud: Vec<bool> = audio.chunks(hop).map(|c| (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt() > 0.02).collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < loud.len() {
+            if !loud[i] {
+                i += 1;
+                continue;
+            }
+            let from = i;
+            while i < loud.len() && loud[i] {
+                i += 1;
+            }
+            if i - from < 8 {
+                continue;
+            }
+            let burst = &audio[from * hop..(i * hop).min(audio.len())];
+            let crossings = burst.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count() as f32;
+            let hz = crossings / 2.0 / (burst.len() as f32 / rate as f32);
+            let word = (((hz - 400.0) / 300.0).round().max(0.0) as usize).min(SPOKEN.len() - 1);
+            let (start, end) = ((from * hop) as f64 / rate, (i * hop) as f64 / rate);
+            out.push(Heard { text: SPOKEN[word].to_string(), start: start + self.late, end: end + self.late, probability: 1.0 });
+        }
+        Ok(out)
+    }
+}
+
+fn said(fx: &Fixture) -> String {
+    let words = transcribe::transcribe(&fx.project(), &fx.paths, None, &mut Tones { late: 0.0 }, &mut |_, _| {}).unwrap();
+    transcribe::text(&words)
+}
+
+fn cut_phrase(fx: &Fixture, phrase: &str, pick: Pick, late: f64, opts: &WriteOpts) -> scrubr_core::Result<project::Written<phrase::CutPhrase>> {
+    phrase::cut(&fx.paths, opts, &me(), None, None, phrase, pick, 240, true, &mut Tones { late }, &mut |_, _| {})
+}
+
+#[test]
+fn a_phrase_is_cut_in_the_pauses_either_side_and_checked() {
+    let fx = spoken();
+    assert_eq!(said(&fx), "alpha bravo charlie delta echo bravo foxtrot");
+    let secs = |frames: u64| frames as f64 / RATE as f64;
+
+    // Finding changes nothing. The cut sits in the silence before "charlie" and after "delta",
+    // not on the times the words were heard at, and the same when those times are a little out.
+    for late in [0.0, 0.08, -0.08] {
+        let found = phrase::find(&fx.project(), &fx.paths, None, None, "Charlie, delta!", &mut Tones { late }, &mut |_, _| {}).unwrap();
+        assert_eq!(found.len(), 1);
+        let one = &found[0];
+        let texts = |words: &[transcribe::Word]| words.iter().map(|w| w.text.clone()).collect::<Vec<_>>().join(" ");
+        assert_eq!((texts(&one.before), texts(&one.words), texts(&one.after)), ("alpha bravo".into(), "charlie delta".into(), "echo bravo".into()));
+        assert!((1.46..1.69).contains(&secs(one.cut.0)) && (2.66..2.89).contains(&secs(one.cut.1)), "cut {:.3}..{:.3} with times {late} out", secs(one.cut.0), secs(one.cut.1));
+        assert!(one.quiet.0.rms_db < -100.0 && one.quiet.1.rms_db < -100.0);
+    }
+    assert_eq!(fx.project().edits.len(), 1);
+
+    // A dry run listens and checks, and writes nothing.
+    let dry = cut_phrase(&fx, "charlie delta", Pick::Only, 0.0, &WriteOpts { dry_run: true, ..Default::default() }).unwrap();
+    assert!(!dry.wrote && dry.value.cuts[0].1.as_ref().unwrap().clean);
+    assert_eq!(said(&fx), "alpha bravo charlie delta echo bravo foxtrot");
+
+    let done = cut_phrase(&fx, "charlie delta", Pick::Only, 0.08, &WriteOpts::default()).unwrap();
+    assert!(done.wrote);
+    let (found, check) = &done.value.cuts[0];
+    let check = check.as_ref().unwrap();
+    assert!(check.clean && check.heard.contains("bravo echo") && check.join == found.cut.0);
+    assert_eq!(said(&fx), "alpha bravo echo bravo foxtrot");
+    let project = fx.project();
+    assert_eq!(project.edits.len(), 2, "one edit");
+    assert_eq!(Timeline::build(&project).unwrap().total(), 5 * RATE as u64 - (found.cut.1 - found.cut.0));
+    assert!(project.edits[1].desc.as_deref().unwrap().starts_with("cut \"charlie delta\" "));
+}
+
+#[test]
+fn a_phrase_said_more_than_once_has_to_be_picked() {
+    let fx = spoken();
+    let e = cut_phrase(&fx, "bravo", Pick::Only, 0.0, &WriteOpts::default()).unwrap_err();
+    assert_eq!((e.kind(), e.code()), (Kind::Usage, "phrase_ambiguous"));
+    assert!(e.to_string().contains("heard 2 times") && e.hint_text().unwrap().contains("--occurrence"));
+    assert_eq!(cut_phrase(&fx, "bravo", Pick::Nth(3), 0.0, &WriteOpts::default()).unwrap_err().code(), "no_such_occurrence");
+    assert_eq!(cut_phrase(&fx, "zulu", Pick::Only, 0.0, &WriteOpts::default()).unwrap_err().code(), "phrase_not_found");
+    assert_eq!(cut_phrase(&fx, " ,. ", Pick::Only, 0.0, &WriteOpts::default()).unwrap_err().code(), "empty_phrase");
+    assert_eq!(fx.project().edits.len(), 1, "nothing was written by any of those");
+
+    // The second one alone.
+    cut_phrase(&fx, "bravo", Pick::Nth(2), 0.0, &WriteOpts::default()).unwrap();
+    assert_eq!(said(&fx), "alpha bravo charlie delta echo foxtrot");
+    edit::undo(&fx.paths, &WriteOpts::default(), 1).unwrap();
+
+    // Both, as one edit, each join checked where it lands after the cuts before it.
+    let all = cut_phrase(&fx, "bravo", Pick::All, 0.0, &WriteOpts::default()).unwrap();
+    assert_eq!(all.value.cuts.len(), 2);
+    assert!(all.value.cuts.iter().all(|(_, check)| check.as_ref().unwrap().clean));
+    assert_eq!(said(&fx), "alpha charlie delta echo foxtrot");
+    assert_eq!(fx.project().edits.iter().filter(|e| matches!(e.op, Op::Batch { .. })).count(), 1);
+
+    // A search kept to a range hears only what is in it.
+    let found = phrase::find(&fx.project(), &fx.paths, None, Some((0, RATE as u64)), "charlie", &mut Tones { late: 0.0 }, &mut |_, _| {}).unwrap();
+    assert!(found.is_empty());
+}
+
+#[test]
+fn a_cut_that_would_take_the_wrong_word_is_not_made() {
+    let fx = spoken();
+    let version = fx.project().version;
+    // A model whose times are a whole word late: "charlie" is reported where "delta" is. The cut
+    // worked out from that would take "delta" and leave "charlie". Listening across the join
+    // before writing catches it.
+    let e = cut_phrase(&fx, "charlie", Pick::Only, 0.6, &WriteOpts::default()).unwrap_err();
+    assert_eq!((e.kind(), e.code()), (Kind::Usage, "cut_not_clean"));
+    assert!(e.to_string().contains("Nothing was cut") && e.hint_text().unwrap().contains("label"));
+    let project = fx.project();
+    assert_eq!((project.version, project.edits.len()), (version, 1));
+    assert_eq!(said(&fx), "alpha bravo charlie delta echo bravo foxtrot");
+
+    // A version the caller no longer holds is refused before anything is listened to.
+    let e = cut_phrase(&fx, "charlie", Pick::Only, 0.0, &WriteOpts { if_version: Some(version + 5), ..Default::default() }).unwrap_err();
+    assert_eq!(e.kind(), Kind::Conflict);
 }

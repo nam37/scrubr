@@ -382,6 +382,12 @@ fn features_not_in_this_build_say_so() {
     assert!(error["message"].as_str().unwrap().contains("optional feature"));
     assert!(error["hint"].as_str().unwrap().contains("--features transcribe"));
     bench.run(&["transcribe", "nope.scrubr"]).fails(2, "project_not_found");
+    // Cutting by words rests on the transcript.
+    let error = bench.run(&["cut", "ep.scrubr", "--phrase", "you know"]).fails(1, "feature_not_built");
+    assert!(error["hint"].as_str().unwrap().contains("cut by time"));
+    bench.run(&["find", "ep.scrubr", "you know"]).fails(1, "feature_not_built");
+    bench.run(&["find", "nope.scrubr", "you know"]).fails(2, "project_not_found");
+    bench.run(&["cut", "ep.scrubr"]).fails(1, "bad_usage");
     // The window is a program of its own; without it `open` says where it looked.
     let error = bench.run(&["open", "ep.scrubr"]).fails(2, "gui_not_found");
     assert!(error["hint"].as_str().unwrap().contains("SCRUBR_GUI"));

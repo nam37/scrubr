@@ -463,6 +463,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <div class="cmd"><code>scrubr normalize ep42.scrubr --lufs -16</code><span>Normalize to integrated loudness, or to a peak with <code>--peak -1dB</code>. Gain stops at a true-peak ceiling, −1 dBTP by default.</span></div>
       <div class="cmd"><code>scrubr mute ep42.scrubr 30:12..30:13.4</code><span>Replace a range with silence and keep its length.</span></div>
       <div class="cmd"><code>scrubr insert ep42.scrubr sting.wav --at 0</code><span>Insert another file, resampled if its rate differs.</span></div>
+      <div class="cmd"><code>scrubr cut ep42.scrubr --phrase "you know" --within 12:00..13:00</code><span>Remove a phrase by its words (M4): found in the transcript, cut in the pauses either side, and listened to across the join before anything is written. <code>scrubr find</code> lists the places without cutting. Both need the transcription feature.</span></div>
       <div class="cmd"><code>scrubr track ep42.scrubr add guest.wav --name guest</code><span>Add a file as a new track, list tracks, or remove one (M3). <code>--track guest</code> on level, analysis and transcript commands then names it.</span></div>
       <div class="cmd"><code>scrubr apply ep42.scrubr --ops cuts.json</code><span>Several operations in one write and one undo step.</span></div>
       <div class="cmd"><code>scrubr undo | redo | history ep42.scrubr</code><span>Move head, or list edits with author and session.</span></div>
@@ -648,7 +649,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
         </tbody>
       </table>
     </div>
-    <p class="key"><span class="tag">Cutting by phrase</span>Word times are not exact enough to cut on. The agent finds the phrase in the transcript, asks <code>analyze --quietest</code> for the quietest moment between the word inside and the word outside each end, cuts there, and transcribes again across each join to check that the phrase is gone and its neighbours are intact. On the podcast this removed a sentence in mid-conversation and a whole sponsor break cleanly. On the meeting it lands in the right pause for about five ends in six, and the check catches the rest.</p>
+    <p class="key"><span class="tag">Cutting by phrase</span>Word times are not exact enough to cut on. <code>scrubr cut --phrase</code> finds the phrase in the transcript, takes the quietest moment between the word inside and the word outside each end, and then listens across the join as it would sound, before writing. If the phrase is not gone, or the words either side no longer follow each other, nothing is written and the reply says so. An agent can do the same by hand with <code>analyze --quietest</code> and <code>transcribe --range</code>.</p>
+    <p>Tried on the recordings above: a whole sponsor sentence came out of the synthetic voice in one command, in ten seconds. On the podcast a short sentence between two pauses was cut cleanly from a 160-second window in about half a minute. Two attempts at a few words in the middle of running speech were refused by the check, which is what it is for: there was no pause to cut in, and the cut would have taken a neighbouring word. On the meeting, cutting by hand with the same rule landed in the right pause for about five ends in six.</p>
     <p>A fixed silence threshold does not carry across recordings: at −45 dB the podcast has almost no pauses, and the quiet meeting's soft speech counts as silence. The agent guide says to check loudness first.</p>
   </section>
 
@@ -839,6 +841,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
         <div class="body">
           <h3>Extras</h3>
           <p>MP3 export, spectrograms, and cut-by-words commands on top of the transcript.</p>
+          <p>Cutting by words is built: <code>scrubr find</code> and <code>scrubr cut --phrase</code>. MP3 export and spectrograms are not started.</p>
         </div>
       </li>
       <li>

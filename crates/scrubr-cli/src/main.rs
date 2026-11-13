@@ -140,12 +140,51 @@ enum Command {
     /// Remove a range. The join gets a short crossfade.
     Cut {
         project: PathBuf,
-        range: String,
+        /// The range to remove. Leave it out when cutting by --phrase.
+        range: Option<String>,
+        /// Cut these words out instead of a range: found in the transcript, cut in the pauses
+        /// either side, and checked by listening across the join before anything is written.
+        /// Needs the optional transcription feature.
+        #[arg(long, value_name = "WORDS", conflicts_with = "range")]
+        phrase: Option<String>,
+        /// Which one, counting from 1, when the phrase is said more than once.
+        #[arg(long, value_name = "N", requires = "phrase")]
+        occurrence: Option<usize>,
+        /// Cut every place the phrase is said, as one edit.
+        #[arg(long, requires = "phrase", conflicts_with = "occurrence")]
+        all: bool,
+        /// Look for the phrase only in this part of the timeline. Much faster on a long recording.
+        #[arg(long, value_name = "RANGE", requires = "phrase")]
+        within: Option<String>,
+        /// Listen for the phrase on this track alone, by name or id. The cut is still made on every track.
+        #[arg(long, value_name = "TRACK", requires = "phrase")]
+        heard_on: Option<String>,
+        /// Cut without listening across the join first.
+        #[arg(long, requires = "phrase")]
+        no_verify: bool,
+        /// The Whisper model. [default: base.en]
+        #[arg(long, value_name = "MODEL", requires = "phrase")]
+        model: Option<String>,
         /// Crossfade length at the join. 0 gives a hard, sample-exact join. [default: 5ms]
         #[arg(long, value_name = "LENGTH")]
         crossfade: Option<String>,
         #[command(flatten)]
         edit: EditOpts,
+    },
+    /// Find where a phrase is said and where to cut to take it out. Changes nothing. Needs the
+    /// optional transcription feature.
+    Find {
+        project: PathBuf,
+        phrase: String,
+        /// Look only in this part of the timeline. Much faster on a long recording.
+        #[arg(long, value_name = "RANGE")]
+        within: Option<String>,
+        /// Listen on this track alone, by name or id. [default: the mix]
+        #[arg(long, value_name = "TRACK")]
+        heard_on: Option<String>,
+        /// The Whisper model. [default: base.en]
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
     },
     /// Remove everything outside a range.
     Keep {
@@ -449,7 +488,13 @@ fn run(cli: Cli) -> Result<Reply, Error> {
         Command::Analyze { project, loudness, peaks, silence, envelope, quietest, range, track } => commands::analyze(&project, loudness, peaks, silence, envelope, quietest, range, track),
         Command::Render { project, png, range, width, height, track } => commands::render(&project, &png, range, width, height, track),
         Command::Transcribe { project, model, range, fetch_model, track } => commands::transcribe(project.as_deref(), model, range, fetch_model, track),
-        Command::Cut { project, range, crossfade, edit } => commands::cut(&project, &range, crossfade, &edit, false),
+        Command::Cut { project, range, phrase, occurrence, all, within, heard_on, no_verify, model, crossfade, edit } => match (range, phrase) {
+            (Some(range), None) => commands::cut(&project, &range, crossfade, &edit, false),
+            (None, Some(phrase)) => commands::cut_phrase(&project, &phrase, occurrence, all, within, heard_on, no_verify, model, crossfade, &edit),
+            _ => Err(Error::usage("bad_usage", "Cut needs a range or a phrase.")
+                .hint("For example `scrubr cut <project> 0:41..0:45`, or `scrubr cut <project> --phrase \"you know\"`.")),
+        },
+        Command::Find { project, phrase, within, heard_on, model } => commands::find(&project, &phrase, within, heard_on, model),
         Command::Keep { project, range, crossfade, edit } => commands::cut(&project, &range, crossfade, &edit, true),
         Command::Gain { project, db, range, track, edit } => commands::gain(&project, &db, range, track, &edit),
         Command::Fade { project, direction, length, range, track, edit } => commands::fade(&project, direction, length, range, track, &edit),

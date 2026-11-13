@@ -1092,6 +1092,145 @@ pub fn transcribe(project: Option<&Path>, model: Option<String>, range: Option<S
     Ok(Reply { version: Some(p.version), fields, text: shown })
 }
 
+// ---- cutting by words ------------------------------------------------------------------------
+
+#[cfg(not(feature = "transcribe"))]
+fn no_words(project: &Path) -> Error {
+    // Make sure the project is real before talking about features, so a wrong path reads as one.
+    if let Err(e) = project::open(&Paths::new(project)) {
+        return e;
+    }
+    Error::usage("feature_not_built", "This build of scrubr cannot find words: that needs transcription, an optional feature that is off by default.")
+        .hint("Build scrubr with `--features transcribe`, or cut by time: `scrubr cut <project> START..END`.")
+}
+
+#[cfg(not(feature = "transcribe"))]
+pub fn find(project: &Path, _phrase: &str, _within: Option<String>, _heard_on: Option<String>, _model: Option<String>) -> Result<Reply> {
+    Err(no_words(project))
+}
+
+#[cfg(not(feature = "transcribe"))]
+#[allow(clippy::too_many_arguments)]
+pub fn cut_phrase(
+    project: &Path,
+    _phrase: &str,
+    _occurrence: Option<usize>,
+    _all: bool,
+    _within: Option<String>,
+    _heard_on: Option<String>,
+    _no_verify: bool,
+    _model: Option<String>,
+    _xf: Option<String>,
+    _opts: &EditOpts,
+) -> Result<Reply> {
+    Err(no_words(project))
+}
+
+/// One place a phrase was heard, for a reply, and the line a person reads.
+#[cfg(feature = "transcribe")]
+fn found_json(found: &scrubr_core::phrase::Found, rate: u32) -> (Map<String, Value>, String) {
+    let say = |words: &[scrubr_core::transcribe::Word]| words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+    let (first, last) = (&found.words[0], &found.words[found.words.len() - 1]);
+    let mut fields = Map::new();
+    fields.insert("text".into(), json!(say(&found.words)));
+    fields.insert("start".into(), json!(seconds(first.start, rate)));
+    fields.insert("end".into(), json!(seconds(last.end, rate)));
+    fields.insert("cut".into(), json!({ "start": seconds(found.cut.0, rate), "end": seconds(found.cut.1, rate) }));
+    fields.insert("before".into(), json!(say(&found.before)));
+    fields.insert("after".into(), json!(say(&found.after)));
+    fields.insert("pause_dbfs".into(), json!([round2(found.quiet.0.rms_db), round2(found.quiet.1.rms_db)]));
+    let line = format!("{}  \"{}\"  after \"{}\", before \"{}\"", range_text(found.cut, rate), say(&found.words), say(&found.before), say(&found.after));
+    (fields, line)
+}
+
+#[cfg(feature = "transcribe")]
+pub fn find(project: &Path, phrase: &str, within: Option<String>, heard_on: Option<String>, model: Option<String>) -> Result<Reply> {
+    use scrubr_core::transcribe::{Engine, whisper};
+
+    let paths = Paths::new(project);
+    let p = project::open(&paths)?;
+    let rate = p.sample_rate;
+    let tl = Timeline::build(&p)?;
+    let within = within.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?;
+    let only = alone(&paths, &tl, &heard_on)?;
+    let mut engine = whisper::Whisper::load(&model.unwrap_or_else(|| whisper::DEFAULT_MODEL.to_string()))?;
+    // Progress goes to stderr, so stdout stays one JSON reply.
+    let found = scrubr_core::phrase::find(&p, &paths, only, within, phrase, &mut engine, &mut |done, total| {
+        eprintln!("find: {} of {}", timecode(done, rate), timecode(total, rate));
+    })?;
+    let (matches, lines): (Vec<Value>, Vec<String>) = found.iter().map(|f| found_json(f, rate)).map(|(fields, line)| (Value::Object(fields), line)).unzip();
+    let mut fields = Map::new();
+    fields.insert("phrase".into(), json!(phrase));
+    fields.insert("engine".into(), json!(engine.name()));
+    fields.insert("count".into(), json!(matches.len()));
+    fields.insert("matches".into(), Value::Array(matches));
+    let text = match lines.len() {
+        0 => format!("\"{phrase}\" was not heard."),
+        n => format!("\"{phrase}\" was heard {n} time{}. The range is the cut that would take it out:\n{}", if n == 1 { "" } else { "s" }, lines.join("\n")),
+    };
+    Ok(Reply { version: Some(p.version), fields, text })
+}
+
+#[cfg(feature = "transcribe")]
+#[allow(clippy::too_many_arguments)]
+pub fn cut_phrase(
+    project: &Path,
+    phrase: &str,
+    occurrence: Option<usize>,
+    all: bool,
+    within: Option<String>,
+    heard_on: Option<String>,
+    no_verify: bool,
+    model: Option<String>,
+    xf: Option<String>,
+    opts: &EditOpts,
+) -> Result<Reply> {
+    use scrubr_core::phrase::{self as words, Pick};
+    use scrubr_core::transcribe::whisper;
+
+    let paths = Paths::new(project);
+    let p = project::open(&paths)?;
+    let rate = p.sample_rate;
+    let tl = Timeline::build(&p)?;
+    let within = within.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?;
+    let xf_frames = crossfade(&xf, rate)?;
+    let pick = match (occurrence, all) {
+        (Some(n), _) => Pick::Nth(n),
+        (None, true) => Pick::All,
+        (None, false) => Pick::Only,
+    };
+    let mut engine = whisper::Whisper::load(&model.unwrap_or_else(|| whisper::DEFAULT_MODEL.to_string()))?;
+    let written = words::cut(&paths, &write_opts(opts), &who(&opts.author, &opts.session), heard_on.as_deref(), within, phrase, pick, xf_frames, !no_verify, &mut engine, &mut |done, total| {
+        eprintln!("cut: listening, {} of {}", timecode(done, rate), timecode(total, rate));
+    })?;
+    let done = written.value;
+    let applied = Written { value: done.applied, version: written.version, wrote: written.wrote };
+    let (mut fields, tail) = edit_reply(&applied, "cut");
+    let mut removed = 0;
+    let mut lines = Vec::new();
+    let cuts: Vec<Value> = done
+        .cuts
+        .iter()
+        .map(|(found, check)| {
+            let (mut one, line) = found_json(found, rate);
+            removed += found.cut.1 - found.cut.0;
+            one.insert("removed_seconds".into(), json!(seconds(found.cut.1 - found.cut.0, rate)));
+            one.insert("verified".into(), json!(check.as_ref().map(|c| c.clean)));
+            one.insert("heard_after".into(), json!(check.as_ref().map(|c| c.heard.clone())));
+            one.insert("join".into(), json!(check.as_ref().map(|c| seconds(c.join, rate))));
+            lines.push(line);
+            Value::Object(one)
+        })
+        .collect();
+    fields.insert("phrase".into(), json!(phrase));
+    fields.insert("cuts".into(), Value::Array(cuts));
+    fields.insert("removed_seconds".into(), json!(seconds(removed, rate)));
+    fields.insert("crossfade_ms".into(), json!(ms(xf_frames, rate)));
+    let checked = if no_verify { "not checked" } else { "each join listened to and clean" };
+    let text = format!("cut \"{phrase}\": removed {} in {} place{}, {checked}.\n{}\n{tail}", timecode(removed, rate), lines.len(), if lines.len() == 1 { "" } else { "s" }, lines.join("\n"));
+    Ok(finish(applied, fields, text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -173,7 +173,13 @@ pub fn transcribe_track(
     }
     let (start, end) = range.unwrap_or((0, total));
     crate::edit::check_range(project, paths, renderer.timeline(), (start, end))?;
-    let rate = project.sample_rate;
+    transcribe_renderer(renderer, project.sample_rate, (start, end), engine, progress)
+}
+
+/// [`transcribe`] over what a renderer plays, from `start` to `end` in its timeline's frames.
+/// The renderer need not be the project at head: it can play a change that is not written yet,
+/// so the result can be listened to before it is made.
+pub fn transcribe_renderer(renderer: Renderer, rate: u32, (start, end): (u64, u64), engine: &mut dyn Engine, progress: &mut dyn FnMut(u64, u64)) -> Result<Vec<Word>> {
     let mut mono = Mono { renderer, pos: start, end, rate, block: Vec::new() };
     let mut pieces = Pieces { engine, progress, pending: Vec::new(), done: 0, words: Vec::new(), start, end, rate };
     if rate == ENGINE_RATE {

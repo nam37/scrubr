@@ -8,6 +8,10 @@
 //! - `--bench SECONDS` plays while zooming from the whole file down to single samples and back,
 //!   prints frame and audio statistics, and exits.
 
+// A window program: Windows opens no console beside it. Started from a shell it still prints
+// there, through `join_console`.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod audio;
 mod studio;
 
@@ -622,7 +626,26 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     changed
 }
 
+/// Windows gives a window program no console, so one started from a shell would print nowhere.
+/// This joins the console of the shell that started it, if there is one. Output that was sent
+/// to a file or a pipe goes there as before, and a start from Explorer has no console to join.
+#[cfg(windows)]
+fn join_console() {
+    const PARENT: u32 = u32::MAX;
+    unsafe extern "system" {
+        fn AttachConsole(process: u32) -> i32;
+    }
+    // SAFETY: the call takes no pointers; it fails, harmlessly, when there is no console.
+    unsafe {
+        AttachConsole(PARENT);
+    }
+}
+
+#[cfg(not(windows))]
+fn join_console() {}
+
 fn main() {
+    join_console();
     // A project opens in the project view, and so does no file at all: the view starts empty.
     // A bare WAV still opens the M0 spike below.
     let args = rune::extra_args();

@@ -9,7 +9,8 @@
 //! changes on disk. Every command is in one list, which the main menu, the tool buttons and the
 //! keyboard all read. Playback renders the timeline with its edits applied. Open and Export use
 //! the system's file dialogs; an export runs on its own thread and reports how far it has got.
-//! With no project named, the window starts empty.
+//! With no project named, the window starts empty and offers to make a project from an audio
+//! file or to open one.
 
 use std::f32::consts::FRAC_PI_2;
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant
 use scrubr_core::edit::{self, DEFAULT_CROSSFADE_MS, Request, Revert};
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts};
 use scrubr_core::render::Renderer;
-use scrubr_core::timeline::SrcSpan;
+use scrubr_core::timeline::{SrcSpan, TrackState};
 use scrubr_core::{Kind, Peaks, Timeline, export, peaks, source};
 
 use crate::audio::Player;
@@ -222,9 +223,12 @@ fn load(paths: &Paths) -> Result<Doc, String> {
     let project = project::open(paths).map_err(|e| e.to_string())?;
     let tl = Timeline::build(&project).map_err(|e| e.to_string())?;
     let mut peaks: Vec<Option<Peaks>> = project.sources.iter().map(|_| None).collect();
+    // The main track's sources, and the files other tracks have laid over them.
     for seg in tl.segs() {
-        if peaks[seg.src].is_none() {
-            peaks[seg.src] = Some(source::peaks(paths, &project.sources[seg.src], project.sample_rate).map_err(|e| e.to_string())?);
+        for src in std::iter::once(seg.src).chain(tl.attached(seg.src).iter().map(|a| a.clip)) {
+            if peaks[src].is_none() {
+                peaks[src] = Some(source::peaks(paths, &project.sources[src], project.sample_rate).map_err(|e| e.to_string())?);
+            }
         }
     }
     let states = project.states();
@@ -255,7 +259,7 @@ fn load(paths: &Paths) -> Result<Doc, String> {
             Op::Cut { spans: s, .. } | Op::Keep { spans: s, .. } => spans(s, None),
             Op::Gain { spans: Some(s), .. } => spans(s, Some(LevelKind::Gain)),
             Op::Mute { spans: s, .. } => spans(s, Some(LevelKind::Mute)),
-            Op::Fade { dir, spans: s } => spans(s, Some(if *dir == FadeDir::In { LevelKind::FadeIn } else { LevelKind::FadeOut })),
+            Op::Fade { dir, spans: s, .. } => spans(s, Some(if *dir == FadeDir::In { LevelKind::FadeIn } else { LevelKind::FadeOut })),
             Op::Insert { source, .. } => {
                 if let Some(src) = src_of(source) {
                     inserted[src] = Some(i);
@@ -343,9 +347,82 @@ struct Column {
     any: bool,
 }
 
+/// What one lane of the timeline shows: a channel of the audio when the project has one track,
+/// or a whole track when it has several.
+#[derive(Clone, Copy, PartialEq)]
+enum Lane {
+    Channel(usize),
+    Track(usize),
+}
+
 impl Doc {
     fn rate(&self) -> u32 {
         self.project.sample_rate
+    }
+
+    /// The lanes, top to bottom.
+    fn lanes(&self) -> Vec<Lane> {
+        let live: Vec<usize> = self.tl.tracks().iter().enumerate().filter(|(_, t)| !t.removed).map(|(i, _)| i).collect();
+        if live.len() > 1 { live.into_iter().map(Lane::Track).collect() } else { (0..self.project.channels.clamp(1, 2) as usize).map(Lane::Channel).collect() }
+    }
+
+    /// `cols` columns of `fpc` timeline frames each, from `start`, for one track with its
+    /// channels folded together. A column the track has no audio in is left empty, so a lane
+    /// shows where its clips are.
+    fn track_columns(&self, track: usize, start: f64, fpc: f64, cols: usize) -> Vec<Column> {
+        let segs = self.tl.segs();
+        let total = self.tl.total();
+        let mut out = vec![Column::default(); cols];
+        let mut si = 0;
+        for (i, column) in out.iter_mut().enumerate() {
+            let t0 = (start + i as f64 * fpc).floor().max(0.0) as u64;
+            let t1 = ((start + (i + 1) as f64 * fpc).ceil().max(0.0) as u64).max(t0 + 1).min(total);
+            if t0 >= total {
+                break;
+            }
+            while si < segs.len() && self.tl.seg_start(si + 1) <= t0 {
+                si += 1;
+            }
+            let (mut min, mut max, mut squares, mut frames) = (f32::INFINITY, f32::NEG_INFINITY, 0f64, 0u64);
+            let mut j = si;
+            while j < segs.len() && self.tl.seg_start(j) < t1 {
+                let seg = segs[j];
+                let seg_t = self.tl.seg_start(j);
+                let from = seg.start + t0.saturating_sub(seg_t);
+                let to = seg.start + (t1 - seg_t).min(seg.frames());
+                j += 1;
+                if from >= to {
+                    continue;
+                }
+                // The audio this track has at main frames `from..to`: the file it is in, where
+                // it starts there, how long it is, and the main frame the level is read at.
+                let mut pieces: Vec<(usize, u64, u64, u64)> = Vec::new();
+                if track == 0 {
+                    pieces.push((seg.src, from, to - from, from + (to - from) / 2));
+                } else {
+                    for a in self.tl.attached(seg.src).iter().filter(|a| a.track == track && a.start < to && a.end > from) {
+                        let (lo, hi) = (a.start.max(from), a.end.min(to));
+                        pieces.push((a.clip, a.clip_start + (lo - a.start), hi - lo, lo + (hi - lo) / 2));
+                    }
+                }
+                for (audio, first, len, at) in pieces {
+                    let Some(p) = &self.peaks[audio] else { continue };
+                    let gain = self.tl.gain_for(track, seg.src, at);
+                    for ch in 0..p.channels() {
+                        let m = p.range(ch, first, first + len);
+                        let rms = p.rms(ch, first, first + len) * gain.abs();
+                        min = min.min(m.min * gain);
+                        max = max.max(m.max * gain);
+                        squares += (rms as f64).powi(2) * len as f64 / p.channels() as f64;
+                    }
+                    frames += len;
+                }
+            }
+            if frames > 0 {
+                *column = Column { min, max, rms: (squares / frames as f64).sqrt() as f32, any: true };
+            }
+        }
+        out
     }
 
     /// How much taller than true scale the lanes draw, so a quiet recording fills them. The
@@ -402,7 +479,17 @@ impl Doc {
 #[derive(Clone, Copy)]
 enum Ask {
     Open,
+    New,
     Export,
+}
+
+/// A project being made from an audio file, on its own thread: the file is hashed, converted if
+/// it has to be, and its waveform is drawn up.
+struct Creating {
+    /// The audio file's name, for telling the person what is going on.
+    name: String,
+    /// The new project's path, or why it could not be made.
+    result: mpsc::Receiver<Result<PathBuf, String>>,
 }
 
 /// One row of the Files tab: a folder, or an audio file scrubr can read.
@@ -473,6 +560,7 @@ pub struct Studio {
     blank: bool,
     ask: Option<Ask>,
     exporting: Option<Exporting>,
+    creating: Option<Creating>,
     doc: Option<Doc>,
     error: Option<String>,
     looks: [Look; 2],
@@ -705,6 +793,22 @@ fn add_file(s: &mut Studio, file: PathBuf) {
     }
 }
 
+/// Lays a file from the Files tab on a new track, starting at the playhead. Nothing moves.
+fn add_file_as_track(s: &mut Studio, file: PathBuf) {
+    let Some(doc) = &s.doc else { return };
+    s.files.playing = None;
+    let at = (head(s).round().max(0.0) as u64).min(doc.tl.total());
+    // The track is named after the file; a second one of the same name gets a number.
+    let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "track".into());
+    let taken = |name: &str| doc.tl.tracks().iter().any(|t| !t.removed && (t.name == name || t.id == name));
+    let name = std::iter::once(stem.clone()).chain((2..).map(|n| format!("{stem} {n}"))).find(|name| !taken(name)).unwrap_or(stem);
+    let made = act_at(s, (at, at), "new track", move |paths, opts, range| edit::track_add(paths, opts, &you(), &file, Some(&name), None, range.0).map(|_| ()));
+    if made.is_some() {
+        let dir = s.files.dir.clone();
+        browse(s, dir);
+    }
+}
+
 fn toggle_play(s: &mut Studio) {
     s.files.playing = None;
     let Some(p) = &s.player else {
@@ -767,6 +871,7 @@ fn init_with(path: Option<PathBuf>) -> Studio {
         paths: Paths::new(path.unwrap_or_default()),
         ask: None,
         exporting: None,
+        creating: None,
         doc: None,
         error: None,
         looks: [look(false), look(true)],
@@ -982,7 +1087,12 @@ fn kind(op: &Op) -> (&'static str, &'static Icon) {
         Op::Normalize { .. } => ("Normalize", &LEVEL),
         Op::Mute { .. } => ("Mute", &MUTE),
         Op::Insert { .. } => ("Insert", &INSERT),
+        Op::Track { .. } | Op::Clip { .. } => ("Track", &LAYERS),
+        Op::TrackSet { .. } => ("Mix", &LEVEL),
+        Op::TrackRemove { .. } => ("Track", &CROSS),
         Op::Revert { .. } => ("Undo", &UNDO),
+        // Audio put on a track is a batch: the time it needs, the track and the clip.
+        Op::Batch { ops } if ops.iter().any(|op| matches!(op, Op::Track { .. } | Op::Clip { .. })) => ("Track", &LAYERS),
         Op::Batch { ops } => match ops.first() {
             Some(first) if ops.iter().all(|op| op.name() == first.name()) => kind(first),
             _ => ("Batch", &LAYERS),
@@ -1126,8 +1236,8 @@ fn ruler(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> El {
 
 /// The audio in view, rendered with its edits: the frame it starts at, its channel count and
 /// its interleaved samples. For views closer than the peak cache can show.
-fn rendered(s: &Studio, doc: &Doc, w: f32) -> Option<(u64, usize, Vec<f32>)> {
-    let mut renderer = Renderer::new(&doc.project, &s.paths).ok()?;
+fn rendered(s: &Studio, doc: &Doc, w: f32, track: Option<usize>) -> Option<(u64, usize, Vec<f32>)> {
+    let mut renderer = Renderer::of(&doc.project, &s.paths, track).ok()?;
     let total = renderer.total();
     let first = (s.start.floor().max(0.0) as u64).min(total);
     let last = ((s.start + w as f64 * s.fpp).ceil().max(0.0) as u64 + 2).min(total);
@@ -1166,17 +1276,31 @@ fn sample_columns(first: u64, channels: usize, samples: &[f32], channel: usize, 
 }
 
 fn wave_shape(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32, scale: f32) -> Shape {
-    let lanes = doc.project.channels.clamp(1, 2) as usize;
+    let lanes = doc.lanes();
     let cols = (w * scale).round().max(1.0) as usize;
     let col_w = w / cols as f32;
     let fpc = s.fpp * col_w as f64;
-    let lane_h = h / lanes as f32;
+    let lane_h = h / lanes.len() as f32;
+    let heard = doc.tl.mix_gains(2, None);
     let selected = s.selection.map(|(a, b)| (((a - s.start) / fpc) as isize, ((b - s.start) / fpc) as isize));
     // A column narrower than the peak cache's smallest bucket has nothing of its own to show
     // there, so from that zoom inwards the lanes are drawn from the audio itself.
-    let fine = if fpc < peaks::BASE as f64 { rendered(s, doc, w) } else { None };
+    let close = fpc < peaks::BASE as f64;
     let mut shape = Shape::new();
-    for c in 0..lanes {
+    for (c, &kind) in lanes.iter().enumerate() {
+        // What the lane is drawn from at a close zoom, and which channel of it: the mix's own
+        // channel, or one track heard alone with its channels averaged.
+        let (fine, pick) = match (kind, close) {
+            (_, false) => (None, 0),
+            (Lane::Channel(channel), true) => (rendered(s, doc, w, None), channel),
+            (Lane::Track(track), true) => (
+                rendered(s, doc, w, Some(track)).map(|(first, channels, samples)| (first, 1, samples.chunks_exact(channels).map(|f| f.iter().sum::<f32>() / channels as f32).collect())),
+                0,
+            ),
+        };
+        // A track that is muted, or left out by another's solo, is drawn faint.
+        let quiet = matches!(kind, Lane::Track(t) if heard[t] == [0.0, 0.0]);
+        let (ink, ink_soft) = if quiet { (lk.ink.alpha(0.32), lk.ink_soft.alpha(0.4)) } else { (lk.ink, lk.ink_soft) };
         let mid = lane_h * (c as f32 + 0.5);
         shape = shape.line([0.0, mid], [w, mid], 1.0, LineCap::Butt, lk.rule);
         if c > 0 {
@@ -1185,18 +1309,18 @@ fn wave_shape(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32, scale: f32) -> S
         let amp = (lane_h * 0.5 - 10.0) * doc.magnify();
         if let (Some((first, channels, samples)), true) = (&fine, s.fpp <= LINE_FPP) {
             // Closest of all: a line through the samples, and a dot on each once they are apart.
-            let ch = c.min(channels - 1);
+            let ch = pick.min(channels - 1);
             let points: Vec<[f32; 2]> = samples
                 .chunks_exact(*channels)
                 .enumerate()
                 .map(|(i, frame)| [(((first + i as u64) as f64 - s.start) / s.fpp) as f32, mid - frame[ch].clamp(-1.0, 1.0) * amp])
                 .collect();
             if points.len() > 1 {
-                shape = shape.stroke(points.clone(), 1.25, lk.ink);
+                shape = shape.stroke(points.clone(), 1.25, ink);
             }
             if s.fpp <= DOT_FPP {
                 for [x, y] in points.into_iter().filter(|p| p[0] >= -4.0 && p[0] <= w + 4.0) {
-                    shape = shape.line([x - 0.01, y], [x + 0.01, y], 4.5, LineCap::Round, lk.ink);
+                    shape = shape.line([x - 0.01, y], [x + 0.01, y], 4.5, LineCap::Round, ink);
                 }
             }
             continue;
@@ -1204,17 +1328,20 @@ fn wave_shape(s: &Studio, doc: &Doc, lk: &Look, w: f32, h: f32, scale: f32) -> S
         if let Some((first, channels, samples)) = &fine {
             // Closer than a cycle of most sounds, a loudness body means nothing: draw the span
             // the wave covers in each column, which is its true shape.
-            for (i, column) in sample_columns(*first, *channels, samples, c, s.start, fpc, cols).iter().enumerate().filter(|(_, column)| column.any) {
+            for (i, column) in sample_columns(*first, *channels, samples, pick, s.start, fpc, cols).iter().enumerate().filter(|(_, column)| column.any) {
                 let chosen = selected.is_some_and(|(a, b)| (i as isize) >= a && (i as isize) < b);
                 let x = (i as f32 + 0.5) * col_w;
                 let (top, bottom) = (mid - column.max.clamp(-1.0, 1.0) * amp, mid - column.min.clamp(-1.0, 1.0) * amp);
                 let thin = (1.0 - (bottom - top)).max(0.0) * 0.5;
-                shape = shape.line([x, top - thin], [x, bottom + thin], col_w, LineCap::Butt, if chosen { lk.you } else { lk.ink });
+                shape = shape.line([x, top - thin], [x, bottom + thin], col_w, LineCap::Butt, if chosen { lk.you } else { ink });
             }
             continue;
         }
-        let columns = doc.columns(c, s.start, fpc, cols);
-        shape = lane(shape, &columns, col_w, mid, amp, lk.ink, lk.ink_soft, |i| match selected {
+        let columns = match kind {
+            Lane::Channel(channel) => doc.columns(channel, s.start, fpc, cols),
+            Lane::Track(track) => doc.track_columns(track, s.start, fpc, cols),
+        };
+        shape = lane(shape, &columns, col_w, mid, amp, ink, ink_soft, |i| match selected {
             Some((a, b)) if (i as isize) >= a && (i as isize) < b => Some((lk.you, lk.you.alpha(0.38))),
             _ => None,
         });
@@ -1299,6 +1426,56 @@ fn callout(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
         card = card.box_shadow(*shadow);
     }
     Some(card)
+}
+
+/// Changes a track's place in the mix. It names the track by id, so it means the same whatever
+/// else has happened to the project.
+fn set_track(s: &mut Studio, id: String, change: edit::TrackChange) {
+    act(s, move |paths| edit::track_set(paths, &WriteOpts::default(), &you(), &id, &change).map(|_| ()));
+}
+
+/// A track's name and its place in the mix, at the head of its lane: mute, solo, level in 1 dB
+/// steps and pan in tenths.
+fn track_head(lk: &Look, t: &TrackState, y: f32) -> El {
+    let k = &lk.k;
+    let level = (t.gain_db * 10.0).round() / 10.0;
+    let pan = (t.pan * 10.0).round() / 10.0;
+    let button = |key: String, label: &'static str, on: bool, help: &'static str, change: edit::TrackChange| {
+        let id = t.id.clone();
+        row()
+            .key(key)
+            .size(18.0, 18.0)
+            .radius(5.0)
+            .center()
+            .fill(if on { lk.you } else { k.c.text_base.alpha(0.09) })
+            .help(help)
+            .on_press(move |s: &mut Studio| set_track(s, id.clone(), change.clone()))
+            .child(text(label).font(k.ty.small_medium).color(if on { lk.on_you } else { k.c.text_muted }))
+    };
+    let change = edit::TrackChange::default;
+    let pan_text = if pan == 0.0 { "C".to_string() } else { format!("{}{}", if pan < 0.0 { "L" } else { "R" }, (pan.abs() * 100.0).round() as i32) };
+    let figure = |value: String, width: f32| row().w(width).h(18.0).center().child(text(value).font(lk.num(k.ty.small)).color(k.c.text_muted));
+    row()
+        .key(format!("track-{}", t.id))
+        .absolute(8.0, y)
+        .h(24.0)
+        .px(3.0)
+        .gap(3.0)
+        .center_y()
+        .radius(7.0)
+        // Over the waveform, so it gets a plate of its own to stay readable.
+        .fill(lk.lane.alpha(0.9))
+        .child(row().h(18.0).px(6.0).center_y().child(text(t.name.clone()).font(k.ty.small_medium).color(k.c.text_base)))
+        .child(button(format!("track-mute-{}", t.id), "M", t.mute, "Mute this track", edit::TrackChange { mute: Some(!t.mute), ..change() }))
+        .child(button(format!("track-solo-{}", t.id), "S", t.solo, "Solo: only soloed tracks are heard", edit::TrackChange { solo: Some(!t.solo), ..change() }))
+        .child(el().w(5.0))
+        .child(button(format!("track-down-{}", t.id), "\u{2212}", false, "1 dB quieter", edit::TrackChange { gain_db: Some(level - 1.0), ..change() }))
+        .child(figure(format!("{level:+} dB"), 46.0))
+        .child(button(format!("track-up-{}", t.id), "+", false, "1 dB louder", edit::TrackChange { gain_db: Some(level + 1.0), ..change() }))
+        .child(el().w(5.0))
+        .child(button(format!("track-left-{}", t.id), "L", false, "Pan a step to the left", edit::TrackChange { pan: Some(((pan - 0.1) * 10.0).round().max(-10.0) / 10.0), ..change() }))
+        .child(figure(pan_text, 26.0))
+        .child(button(format!("track-right-{}", t.id), "R", false, "Pan a step to the right", edit::TrackChange { pan: Some(((pan + 0.1) * 10.0).round().min(10.0) / 10.0), ..change() }))
 }
 
 /// The card for the label under the pointer: who left it, what it marks and what it says.
@@ -1489,19 +1666,25 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
             area = area.child(el().key("selection").absolute(x0, 0.0).size(x1 - x0, h).fill(lk.you.alpha(0.10)).border_sides([0.0, 1.0, 0.0, 1.0], lk.you.alpha(0.75)));
         }
     }
-    let lanes = doc.project.channels.clamp(1, 2) as usize;
-    if lanes == 2 {
-        for (c, name) in ["L", "R"].into_iter().enumerate() {
-            area = area.child(
-                row()
-                    .key(format!("lane-{name}"))
-                    .absolute(8.0, h / 2.0 * c as f32 + 18.0)
-                    .size(18.0, 18.0)
-                    .radius(5.0)
-                    .center()
-                    .fill(k.c.text_base.alpha(0.07))
-                    .child(text(name).font(k.ty.small_medium).color(k.c.text_muted)),
-            );
+    let lanes = doc.lanes();
+    for (i, lane) in lanes.iter().enumerate() {
+        let y = h / lanes.len() as f32 * i as f32 + 18.0;
+        match *lane {
+            Lane::Channel(c) if lanes.len() == 2 => {
+                let name = ["L", "R"][c];
+                area = area.child(
+                    row()
+                        .key(format!("lane-{name}"))
+                        .absolute(8.0, y)
+                        .size(18.0, 18.0)
+                        .radius(5.0)
+                        .center()
+                        .fill(k.c.text_base.alpha(0.07))
+                        .child(text(name).font(k.ty.small_medium).color(k.c.text_muted)),
+                );
+            }
+            Lane::Channel(_) => {}
+            Lane::Track(t) => area = area.child(track_head(lk, &doc.tl.tracks()[t], y)),
         }
     }
     if doc.magnify() > 1.05 {
@@ -1981,7 +2164,7 @@ fn files(s: &Studio, doc: &Doc, lk: &Look) -> El {
         }
         let playing = b.playing.as_ref().is_some_and(|(p, _)| *p == entry.path);
         let ending = entry.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
-        let (listen, add) = (path.clone(), path);
+        let (listen, add, lay) = (path.clone(), path.clone(), path);
         list = list.child(
             row()
                 .key(format!("file-{i}"))
@@ -2010,13 +2193,22 @@ fn files(s: &Studio, doc: &Doc, lk: &Look) -> El {
                         .child(text(format!("{ending} \u{b7} {}", file_size(entry.bytes))).font(lk.num(k.ty.small)).color(k.c.text_faint)),
                 )
                 .child(
-                    Button::new("Add".to_string())
+                    Button::new("Insert".to_string())
                         .variant(ButtonVariant::Neutral)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut Studio| add_file(s, add.clone()))
                         .build(k)
                         .key(format!("file-add-{i}"))
-                        .help(format!("Insert at the playhead, {at}")),
+                        .help(format!("Insert into the timeline at the playhead, {at}. What follows moves later.")),
+                )
+                .child(
+                    Button::new("Track".to_string())
+                        .variant(ButtonVariant::Neutral)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut Studio| add_file_as_track(s, lay.clone()))
+                        .build(k)
+                        .key(format!("file-track-{i}"))
+                        .help(format!("Lay on a new track from the playhead, {at}. Nothing moves.")),
                 ),
         );
     }
@@ -2264,11 +2456,64 @@ fn mark_selection(s: &mut Studio, start: bool) {
     });
 }
 
-/// Shows another project in this window.
+/// True for a file the window can start a project from.
+fn is_audio(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO_ENDINGS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Starts a project from an audio file: `ep42.wav` becomes `ep42.scrubr` beside it. The audio
+/// file is read and never changed. If that project is already there it is opened as it is.
+fn new_project(s: &mut Studio, file: PathBuf) {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !is_audio(&file) {
+        s.notice = Some(format!("{name} is not an audio file scrubr reads. It reads WAV, FLAC, MP3, OGG and AAC (.m4a)."));
+        return;
+    }
+    let project = file.with_extension("scrubr");
+    if project.exists() {
+        open_project(s, project.clone());
+        let made = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        s.notice = Some(format!("{made} was already beside {name}, so it was opened as it is."));
+        return;
+    }
+    let (answer, result) = mpsc::channel();
+    let started = std::thread::Builder::new().name("scrubr-new".into()).spawn(move || {
+        let made = edit::new_project(&Paths::new(&project), &[file], &you(), false).map(|_| project).map_err(|e| e.to_string());
+        let _ = answer.send(made);
+    });
+    match started {
+        Ok(_) => {
+            s.notice = None;
+            s.creating = Some(Creating { name, result });
+        }
+        Err(e) => s.notice = Some(format!("Could not start: {e}")),
+    }
+}
+
+/// Opens the project a `new_project` has finished making. True when the window has changed.
+fn watch_creating(s: &mut Studio) -> bool {
+    let Some(creating) = &s.creating else { return false };
+    let made = match creating.result.try_recv() {
+        Ok(made) => made,
+        Err(mpsc::TryRecvError::Empty) => return false,
+        Err(mpsc::TryRecvError::Disconnected) => Err("it stopped without a result.".to_string()),
+    };
+    let name = s.creating.take().map(|c| c.name).unwrap_or_default();
+    match made {
+        Ok(project) => open_project(s, project),
+        Err(e) => s.notice = Some(format!("A project could not be made from {name}: {e}")),
+    }
+    true
+}
+
+/// Shows another project in this window. An audio file is taken as a request for a new project.
 fn open_project(s: &mut Studio, path: PathBuf) {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if is_audio(&path) {
+        return new_project(s, path);
+    }
     if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("scrubr")) {
-        s.notice = Some(format!("{name} is not a scrubr project. A project's name ends in .scrubr; `scrubr new` makes one from audio files."));
+        s.notice = Some(format!("{name} is neither a scrubr project nor an audio file scrubr reads."));
         return;
     }
     if let Some(p) = &s.player {
@@ -2354,9 +2599,17 @@ fn flush_asks(s: &mut Studio, tx: &mut Tx) {
     let folder = (!s.blank).then(|| s.paths.dir.clone());
     match s.ask.take() {
         Some(Ask::Open) => {
-            let options = FileDialogOptions { title: "Open project".into(), directory: folder, ..Default::default() }.filter("scrubr project", &["scrubr"]);
+            let options = FileDialogOptions { title: "Open project".into(), directory: folder, ..Default::default() }.filter("scrubr project", &["scrubr"]).filter("Audio, as a new project", &AUDIO_ENDINGS);
             tx.open_file(options, |s: &mut Studio, result: FileDialogResult, _| match result {
                 Ok(Some(path)) => open_project(s, path),
+                Ok(None) => {}
+                Err(e) => s.notice = Some(format!("Could not show the file dialog: {e}")),
+            });
+        }
+        Some(Ask::New) => {
+            let options = FileDialogOptions { title: "New project from an audio file".into(), directory: folder, ..Default::default() }.filter("Audio", &AUDIO_ENDINGS);
+            tx.open_file(options, |s: &mut Studio, result: FileDialogResult, _| match result {
+                Ok(Some(path)) => new_project(s, path),
                 Ok(None) => {}
                 Err(e) => s.notice = Some(format!("Could not show the file dialog: {e}")),
             });
@@ -2459,11 +2712,12 @@ struct Command {
 }
 
 const OPEN: &str = "Open project\u{2026}";
+const NEW: &str = "New project from audio\u{2026}";
 
 impl Command {
-    /// Every command but Open needs a project to act on.
+    /// Every command but New and Open needs a project to act on.
     fn available(&self, s: &Studio) -> bool {
-        self.built && (s.doc.is_some() || self.label == OPEN) && (self.enabled)(s)
+        self.built && (s.doc.is_some() || self.label == OPEN || self.label == NEW) && (self.enabled)(s)
     }
 }
 
@@ -2482,7 +2736,8 @@ fn has_splices(s: &Studio) -> bool {
     s.doc.as_ref().is_some_and(|d| !d.splices.is_empty())
 }
 
-static COMMANDS: [Command; 21] = [
+static COMMANDS: [Command; 22] = [
+    Command { menu: 0, label: NEW, keys: Keys::Cmd('n'), divide: false, built: true, enabled: |s| s.creating.is_none(), run: |s| s.ask = Some(Ask::New) },
     Command { menu: 0, label: OPEN, keys: Keys::Cmd('o'), divide: false, built: true, enabled: always, run: |s| s.ask = Some(Ask::Open) },
     Command { menu: 0, label: "Export\u{2026}", keys: Keys::Cmd('e'), divide: false, built: true, enabled: |s| s.exporting.is_none(), run: |s| s.ask = Some(Ask::Export) },
     Command {
@@ -2652,11 +2907,36 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
                 .child(card)
                 .child(transport(s, doc, lk))
         }
-        // No project, or one that would not load: say so, and offer another.
+        // No project, or one that would not load: say how to start, and offer both ways in.
         (None, error) => {
-            let (title, body) = match error {
-                Some(e) => ("This project could not be opened", e.clone()),
-                None => ("No project open", "Open a .scrubr project to hear and review its edits. `scrubr new` makes a project from audio files.".to_string()),
+            let (title, body) = match (&s.creating, error) {
+                (Some(c), _) => ("Making a project", format!("Reading {}. A long or compressed file takes a little while.", c.name)),
+                (None, Some(e)) => ("This project could not be opened", e.clone()),
+                (None, None) => (
+                    "Start with an audio file",
+                    "Pick a recording and scrubr makes a project beside it, with the same name. The recording itself is never changed.".to_string(),
+                ),
+            };
+            let busy = s.creating.is_some();
+            // The way in a person most often wants is the filled button; the other is quieter.
+            let button = |key: &'static str, label: &'static str, filled: bool, ask: Ask| {
+                let plate = row()
+                    .key(key)
+                    .h(32.0)
+                    .px(14.0)
+                    .center_y()
+                    .radius(k.radius.md)
+                    .fill(if filled { lk.you.alpha(if busy { 0.45 } else { 1.0 }) } else { k.c.text_base.alpha(0.07) })
+                    .help(format!("{} ({})", label.trim_end_matches('\u{2026}'), command(label).keys.label()))
+                    .child(text(label).font(k.ty.ui_medium).color(if filled { lk.on_you } else { k.c.text_base }));
+                if busy {
+                    plate
+                } else {
+                    plate.on_press_tx(move |s: &mut Studio, tx: &mut Tx| {
+                        s.ask = Some(ask);
+                        flush_asks(s, tx);
+                    })
+                }
             };
             let mut plate = col()
                 .key("empty")
@@ -2673,21 +2953,12 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
                 .child(text(title).font(TextStyle { size: 19.0, weight: 620.0, line_height: 24.0, ..k.ty.ui }).color(k.c.text_base))
                 .child(text(body).font(k.ty.body).color(k.c.text_muted).wrap().align(Align::Center).max_w(460.0))
                 .child(el().h(4.0))
-                .child(
-                    row()
-                        .key("open-project")
-                        .h(32.0)
-                        .px(14.0)
-                        .center_y()
-                        .radius(k.radius.md)
-                        .fill(lk.you)
-                        .help(format!("Open project ({})", command(OPEN).keys.label()))
-                        .on_press_tx(|s: &mut Studio, tx: &mut Tx| {
-                            s.ask = Some(Ask::Open);
-                            flush_asks(s, tx);
-                        })
-                        .child(text(OPEN).font(k.ty.ui_medium).color(lk.on_you)),
+                .child(row().gap(10.0).center_y().child(button("new-project", NEW, true, Ask::New)).child(button("open-project", OPEN, false, Ask::Open)));
+            if !busy && error.is_none() {
+                plate = plate.child(el().h(2.0)).child(
+                    text("Already have a .scrubr project, from an agent or an earlier session? Open it.").font(k.ty.small).color(k.c.text_faint).wrap().align(Align::Center).max_w(460.0),
                 );
+            }
             if let Some(notice) = &s.notice {
                 plate = plate.child(text(notice.clone()).font(k.ty.small).color(k.c.text_muted).wrap().align(Align::Center).max_w(460.0));
             }
@@ -2855,12 +3126,13 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
     // The meters go on falling for a moment after the audio stops.
     let meters_lit = step_meters(s, t);
     changed |= watch_export(s);
+    changed |= watch_creating(s);
     // A file being listened to stops showing as playing when it ends.
     if s.files.playing.as_ref().is_some_and(|(_, p)| p.done()) {
         s.files.playing = None;
         changed = true;
     }
-    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
+    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.creating.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
 
     if s.pretend_edit_at.is_some_and(|at| t >= at) {
         s.pretend_edit_at = None;

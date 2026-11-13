@@ -9,8 +9,8 @@
 //! changes on disk. Every command is in one list, which the main menu, the tool buttons and the
 //! keyboard all read. Playback renders the timeline with its edits applied. Open and Export use
 //! the system's file dialogs; an export runs on its own thread and reports how far it has got.
-//! With no project named, the window starts empty and offers to make a project from an audio
-//! file or to open one.
+//! With no project named, the window starts empty and offers a new project or an existing one.
+//! A new project opens with the Files tab showing, and is made when its first file is added.
 
 use std::f32::consts::FRAC_PI_2;
 use std::path::PathBuf;
@@ -479,7 +479,6 @@ impl Doc {
 #[derive(Clone, Copy)]
 enum Ask {
     Open,
-    New,
     Export,
 }
 
@@ -578,6 +577,9 @@ pub struct Studio {
     paths: Paths,
     /// True while no project is open: the window started without one.
     blank: bool,
+    /// True for a new project that has no audio yet. Nothing is on disk until the first file is
+    /// added from the Files tab, because a project takes its rate and channels from that file.
+    fresh: bool,
     ask: Option<Ask>,
     exporting: Option<Exporting>,
     creating: Option<Creating>,
@@ -864,6 +866,9 @@ fn watch_adding(s: &mut Studio) -> bool {
 
 /// Inserts a file from the Files tab into the timeline at the playhead.
 fn add_file(s: &mut Studio, file: PathBuf) {
+    if s.fresh {
+        return first_file(s, file);
+    }
     if busy_adding(s) {
         return;
     }
@@ -956,6 +961,7 @@ fn init_with(path: Option<PathBuf>) -> Studio {
     let play_check = flag("--play-check").and_then(|t| t.parse::<f64>().ok());
     let mut s = Studio {
         blank: path.is_none(),
+        fresh: false,
         paths: Paths::new(path.unwrap_or_default()),
         ask: None,
         exporting: None,
@@ -1029,6 +1035,13 @@ fn init_with(path: Option<PathBuf>) -> Studio {
     let folder = flag("--files").map(PathBuf::from).unwrap_or_else(|| s.paths.dir.clone());
     if !s.blank {
         browse(&mut s, folder);
+    }
+    // `--new`: start as New does, with the Files tab on the folder `--files` names.
+    if has("--new") && s.blank {
+        start_fresh(&mut s);
+        if let Some(dir) = flag("--files") {
+            browse(&mut s, PathBuf::from(dir));
+        }
     }
     // `--outside-cut A..B` in seconds: another author cuts that range once the window has read
     // the project, and the window is not told.
@@ -2264,7 +2277,18 @@ fn file_size(bytes: u64) -> String {
 
 /// The Files tab: a folder to walk through, with a Play button and an Add button on each audio
 /// file, and under it the files the project already uses.
-fn files(s: &Studio, doc: &Doc, lk: &Look) -> El {
+/// The Files tab on its own, for a new project that has no audio yet and so no log.
+fn fresh_panel(s: &Studio, lk: &Look) -> El {
+    let k = &lk.k;
+    col()
+        .key("log")
+        .w_full()
+        .h_full()
+        .child(row().w_full().px(18.0).pt(16.0).pb(10.0).center_y().child(text("Files").font(k.ty.ui_medium).color(k.c.text_base)))
+        .child(col().w_full().grow(1.0).min_h(0.0).px(10.0).pb(16.0).scroll(ScrollSpec { stick_bottom: false }).child(files(s, None, lk)))
+}
+
+fn files(s: &Studio, doc: Option<&Doc>, lk: &Look) -> El {
     let k = &lk.k;
     let b = &s.files;
     let folder = b.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| b.dir.to_string_lossy().into_owned());
@@ -2282,7 +2306,7 @@ fn files(s: &Studio, doc: &Doc, lk: &Look) -> El {
         .child(icon(&FOLDER, 14.0).color(k.c.text_muted))
         .child(text(folder).font(k.ty.ui_medium).color(k.c.text_base).truncate().help(b.dir.to_string_lossy().into_owned()))
         .child(el().grow(1.0));
-    if b.dir != s.paths.dir {
+    if !s.blank && b.dir != s.paths.dir {
         head = head.child(small_button(k, "Project folder", "files-home".into(), |s: &mut Studio| {
             let dir = s.paths.dir.clone();
             browse(s, dir);
@@ -2294,7 +2318,7 @@ fn files(s: &Studio, doc: &Doc, lk: &Look) -> El {
     } else if b.entries.is_empty() {
         list = list.child(text("No folders or audio files here.").font(k.ty.small).color(k.c.text_faint).wrap());
     }
-    let at = timecode(self::head(s), doc.rate());
+    let at = doc.map(|doc| timecode(self::head(s), doc.rate()));
     for (i, entry) in b.entries.iter().enumerate() {
         let path = entry.path.clone();
         if entry.folder {
@@ -2342,26 +2366,36 @@ fn files(s: &Studio, doc: &Doc, lk: &Look) -> El {
                         .child(text(entry.name.clone()).font(k.ty.ui).color(k.c.text_base).truncate())
                         .child(text(format!("{ending} \u{b7} {}", file_size(entry.bytes))).font(lk.num(k.ty.small)).color(k.c.text_faint)),
                 )
-                .child(
-                    Button::new("Insert".to_string())
+                .child(match &at {
+                    Some(at) => Button::new("Insert".to_string())
                         .variant(ButtonVariant::Neutral)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut Studio| add_file(s, add.clone()))
                         .build(k)
                         .key(format!("file-add-{i}"))
                         .help(format!("Insert into the timeline at the playhead, {at}. What follows moves later.")),
-                )
-                .child(
-                    Button::new("Track".to_string())
+                    // A new project: its first file.
+                    None => Button::new("Add".to_string())
+                        .variant(ButtonVariant::Neutral)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut Studio| add_file(s, add.clone()))
+                        .build(k)
+                        .key(format!("file-add-{i}"))
+                        .help("Start the project with this file. The project is made beside it, with the same name."),
+                })
+                .child(match &at {
+                    Some(at) => Button::new("Track".to_string())
                         .variant(ButtonVariant::Neutral)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut Studio| add_file_as_track(s, lay.clone()))
                         .build(k)
                         .key(format!("file-track-{i}"))
                         .help(format!("Lay on a new track from the playhead, {at}. Nothing moves.")),
-                ),
+                    None => el(),
+                }),
         );
     }
+    let Some(doc) = doc else { return list };
     // What the project is already made of.
     list = list.child(el().h(10.0)).child(el().w_full().h(1.0).fill(lk.rule)).child(el().h(6.0)).child(text("In this project").font(k.ty.small_medium).color(k.c.text_muted).px(8.0));
     // Silence the project made for itself, where a track runs past the others, is not a file.
@@ -2422,7 +2456,7 @@ fn log(s: &Studio, doc: &Doc, lk: &Look) -> El {
                 .child(match s.tab {
                     0 => activity(s, doc, lk),
                     1 => labels(doc, lk),
-                    _ => files(s, doc, lk),
+                    _ => files(s, Some(doc), lk),
                 }),
         )
 }
@@ -2633,21 +2667,47 @@ fn is_audio(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO_ENDINGS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
-/// Starts a project from an audio file: `ep42.wav` becomes `ep42.scrubr` beside it. The audio
-/// file is read and never changed. If that project is already there it is opened as it is.
-fn new_project(s: &mut Studio, file: PathBuf) {
+/// Starts a new project with nothing in it, and shows the Files tab to add audio from. Nothing
+/// is written yet: the project is made when its first file is added.
+fn start_fresh(s: &mut Studio) {
+    if let Some(p) = &s.player {
+        p.pause();
+    }
+    // The Files tab starts where the person last was: the folder it showed, the open project's,
+    // or their home folder.
+    let dir = if !s.files.dir.as_os_str().is_empty() {
+        s.files.dir.clone()
+    } else if !s.blank {
+        s.paths.dir.clone()
+    } else {
+        std::env::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    };
+    s.paths = Paths::new(PathBuf::new());
+    s.blank = true;
+    s.fresh = true;
+    s.doc = None;
+    s.error = None;
+    s.player = None;
+    s.selection = None;
+    s.picked = None;
+    s.selected = None;
+    s.hover_note = None;
+    s.labeling = None;
+    s.notice = None;
+    s.view_request = None;
+    s.cursor = 0.0;
+    s.start = 0.0;
+    s.tab = 2;
+    if !s.inspector.is_open() {
+        s.inspector.toggle();
+    }
+    browse(s, dir);
+}
+
+/// Makes a project from an audio file on its own thread: the file is hashed, converted if it
+/// has to be, and its waveform is drawn up. `watch_creating` opens it.
+fn make_project(s: &mut Studio, file: PathBuf, project: PathBuf) {
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    if !is_audio(&file) {
-        s.notice = Some(format!("{name} is not an audio file scrubr reads. It reads WAV, FLAC, MP3, OGG and AAC (.m4a)."));
-        return;
-    }
-    let project = file.with_extension("scrubr");
-    if project.exists() {
-        open_project(s, project.clone());
-        let made = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        s.notice = Some(format!("{made} was already beside {name}, so it was opened as it is."));
-        return;
-    }
     let (answer, result) = mpsc::channel();
     let started = std::thread::Builder::new().name("scrubr-new".into()).spawn(move || {
         let made = edit::new_project(&Paths::new(&project), &[file], &you(), false).map(|_| project).map_err(|e| e.to_string());
@@ -2662,6 +2722,37 @@ fn new_project(s: &mut Studio, file: PathBuf) {
     }
 }
 
+/// Gives a new project its first file. `ep42.wav` becomes `ep42.scrubr` beside it, or
+/// `ep42 2.scrubr` if that name is taken: New never opens a project that is already there.
+fn first_file(s: &mut Studio, file: PathBuf) {
+    if s.creating.is_some() {
+        return;
+    }
+    s.files.playing = None;
+    let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+    let dir = file.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let project = std::iter::once(format!("{stem}.scrubr")).chain((2..).map(|n| format!("{stem} {n}.scrubr"))).map(|name| dir.join(name)).find(|p| !p.exists()).expect("the numbers do not run out");
+    make_project(s, file, project);
+}
+
+/// Starts a project from an audio file picked in the Open dialog: `ep42.wav` becomes
+/// `ep42.scrubr` beside it. If that project is already there it is opened as it is.
+fn new_project(s: &mut Studio, file: PathBuf) {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !is_audio(&file) {
+        s.notice = Some(format!("{name} is not an audio file scrubr reads. It reads WAV, FLAC, MP3, OGG and AAC (.m4a)."));
+        return;
+    }
+    let project = file.with_extension("scrubr");
+    if project.exists() {
+        open_project(s, project.clone());
+        let made = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        s.notice = Some(format!("{made} was already beside {name}, so it was opened as it is."));
+        return;
+    }
+    make_project(s, file, project);
+}
+
 /// Opens the project a `new_project` has finished making. True when the window has changed.
 fn watch_creating(s: &mut Studio) -> bool {
     let Some(creating) = &s.creating else { return false };
@@ -2671,7 +2762,15 @@ fn watch_creating(s: &mut Studio) -> bool {
         Err(mpsc::TryRecvError::Disconnected) => Err("it stopped without a result.".to_string()),
     };
     let name = s.creating.take().map(|c| c.name).unwrap_or_default();
+    let fresh = s.fresh;
     match made {
+        // A project started with New stays on the Files tab, where the next file comes from.
+        Ok(project) if fresh => {
+            let made = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            open_project(s, project);
+            s.tab = 2;
+            s.notice = Some(format!("Made {made} beside {name}."));
+        }
         Ok(project) => open_project(s, project),
         Err(e) => s.notice = Some(format!("A project could not be made from {name}: {e}")),
     }
@@ -2693,6 +2792,7 @@ fn open_project(s: &mut Studio, path: PathBuf) {
     }
     s.paths = Paths::new(path);
     s.blank = false;
+    s.fresh = false;
     s.selection = None;
     s.picked = None;
     s.selected = None;
@@ -2775,14 +2875,6 @@ fn flush_asks(s: &mut Studio, tx: &mut Tx) {
             let options = FileDialogOptions { title: "Open project".into(), directory: folder, ..Default::default() }.filter("scrubr project", &["scrubr"]).filter("Audio, as a new project", &AUDIO_ENDINGS);
             tx.open_file(options, |s: &mut Studio, result: FileDialogResult, _| match result {
                 Ok(Some(path)) => open_project(s, path),
-                Ok(None) => {}
-                Err(e) => s.notice = Some(format!("Could not show the file dialog: {e}")),
-            });
-        }
-        Some(Ask::New) => {
-            let options = FileDialogOptions { title: "New project from an audio file".into(), directory: folder, ..Default::default() }.filter("Audio", &AUDIO_ENDINGS);
-            tx.open_file(options, |s: &mut Studio, result: FileDialogResult, _| match result {
-                Ok(Some(path)) => new_project(s, path),
                 Ok(None) => {}
                 Err(e) => s.notice = Some(format!("Could not show the file dialog: {e}")),
             });
@@ -2890,7 +2982,7 @@ struct Command {
 }
 
 const OPEN: &str = "Open project\u{2026}";
-const NEW: &str = "New project from audio\u{2026}";
+const NEW: &str = "New project";
 
 impl Command {
     /// Every command but New and Open needs a project to act on.
@@ -2915,7 +3007,7 @@ fn has_splices(s: &Studio) -> bool {
 }
 
 static COMMANDS: [Command; 23] = [
-    Command { menu: 0, label: NEW, keys: Keys::Cmd('n'), divide: false, built: true, enabled: |s| s.creating.is_none(), run: |s| s.ask = Some(Ask::New) },
+    Command { menu: 0, label: NEW, keys: Keys::Cmd('n'), divide: false, built: true, enabled: |s| s.creating.is_none(), run: start_fresh },
     Command { menu: 0, label: OPEN, keys: Keys::Cmd('o'), divide: false, built: true, enabled: always, run: |s| s.ask = Some(Ask::Open) },
     Command { menu: 0, label: "Export\u{2026}", keys: Keys::Cmd('e'), divide: false, built: true, enabled: |s| s.exporting.is_none(), run: |s| s.ask = Some(Ask::Export) },
     Command {
@@ -3065,7 +3157,11 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
     let lk = &s.looks[cx.system_dark() as usize];
     let k = &lk.k;
     let scale = cx.env().scale;
-    let name = if s.blank { "No project".to_string() } else { s.paths.project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() };
+    let name = if s.fresh {
+        "New project".to_string()
+    } else if s.blank {
+        "No project".to_string()
+    } else { s.paths.project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() };
 
     let main = match (&s.doc, &s.error) {
         (Some(doc), _) => {
@@ -3096,17 +3192,19 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
         }
         // No project, or one that would not load: say how to start, and offer both ways in.
         (None, error) => {
-            let (title, body) = match (&s.creating, error) {
-                (Some(c), _) => ("Making a project", format!("Reading {}. A long or compressed file takes a little while.", c.name)),
-                (None, Some(e)) => ("This project could not be opened", e.clone()),
-                (None, None) => (
-                    "Start with an audio file",
-                    "Pick a recording and scrubr makes a project beside it, with the same name. The recording itself is never changed.".to_string(),
+            let (title, body) = match (&s.creating, error, s.fresh) {
+                (Some(c), _, _) => ("Making a project", format!("Reading {}. A long or compressed file takes a little while.", c.name)),
+                (None, Some(e), _) => ("This project could not be opened", e.clone()),
+                (None, None, true) => (
+                    "Add audio to begin",
+                    "Find a recording in the Files tab and press Add. scrubr makes the project beside that file, with the same name. The recording itself is never changed.".to_string(),
                 ),
+                (None, None, false) => ("Start a project", "A project holds your edits over one or more recordings. The recordings themselves are never changed.".to_string()),
             };
             let busy = s.creating.is_some();
             // The way in a person most often wants is the filled button; the other is quieter.
-            let button = |key: &'static str, label: &'static str, filled: bool, ask: Ask| {
+            // New needs no dialog; Open asks for a file.
+            let button = |key: &'static str, label: &'static str, filled: bool, ask: Option<Ask>| {
                 let plate = row()
                     .key(key)
                     .h(32.0)
@@ -3119,9 +3217,12 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
                 if busy {
                     plate
                 } else {
-                    plate.on_press_tx(move |s: &mut Studio, tx: &mut Tx| {
-                        s.ask = Some(ask);
-                        flush_asks(s, tx);
+                    plate.on_press_tx(move |s: &mut Studio, tx: &mut Tx| match ask {
+                        Some(ask) => {
+                            s.ask = Some(ask);
+                            flush_asks(s, tx);
+                        }
+                        None => start_fresh(s),
                     })
                 }
             };
@@ -3138,13 +3239,15 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
                 .child(icon(&LOGO, 44.0).color(lk.you))
                 .child(el().h(2.0))
                 .child(text(title).font(TextStyle { size: 19.0, weight: 620.0, line_height: 24.0, ..k.ty.ui }).color(k.c.text_base))
-                .child(text(body).font(k.ty.body).color(k.c.text_muted).wrap().align(Align::Center).max_w(460.0))
-                .child(el().h(4.0))
-                .child(row().gap(10.0).center_y().child(button("new-project", NEW, true, Ask::New)).child(button("open-project", OPEN, false, Ask::Open)));
-            if !busy && error.is_none() {
-                plate = plate.child(el().h(2.0)).child(
-                    text("Already have a .scrubr project, from an agent or an earlier session? Open it.").font(k.ty.small).color(k.c.text_faint).wrap().align(Align::Center).max_w(460.0),
-                );
+                .child(text(body).font(k.ty.body).color(k.c.text_muted).wrap().align(Align::Center).max_w(460.0));
+            // A new project has its way forward in the Files tab beside this.
+            if !s.fresh {
+                plate = plate.child(el().h(4.0)).child(row().gap(10.0).center_y().child(button("new-project", NEW, true, None)).child(button("open-project", OPEN, false, Some(Ask::Open))));
+                if !busy && error.is_none() {
+                    plate = plate.child(el().h(2.0)).child(
+                        text("Already have a .scrubr project, from an agent or an earlier session? Open it.").font(k.ty.small).color(k.c.text_faint).wrap().align(Align::Center).max_w(460.0),
+                    );
+                }
             }
             if let Some(notice) = &s.notice {
                 plate = plate.child(text(notice.clone()).font(k.ty.small).color(k.c.text_muted).wrap().align(Align::Center).max_w(460.0));
@@ -3204,7 +3307,7 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
                 })
                 .child(el().w(2.0))
                 // The log's switch, while there is a log.
-                .child(if s.doc.is_none() {
+                .child(if s.doc.is_none() && !s.fresh {
                     el()
                 } else {
                     IconButton::new(&shell::INSPECTOR)
@@ -3221,6 +3324,8 @@ fn view(s: &Studio, cx: &mut Cx<Studio>) -> El {
     // middle of the window, not of what the pane left.
     if let Some(doc) = &s.doc {
         split = split.inspector(&s.inspector, |s: &mut Studio| &mut s.inspector, log(s, doc, lk));
+    } else if s.fresh {
+        split = split.inspector(&s.inspector, |s: &mut Studio| &mut s.inspector, fresh_panel(s, lk));
     }
     let window = split
         .toolbar(toolbar)

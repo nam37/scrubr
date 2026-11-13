@@ -492,6 +492,26 @@ struct Creating {
     result: mpsc::Receiver<Result<PathBuf, String>>,
 }
 
+/// What a file being added does to the project, at a place on the timeline.
+type AddChange = Arc<dyn Fn(&Paths, &WriteOpts, (u64, u64)) -> scrubr_core::Result<()> + Send + Sync>;
+
+/// A file being added to the project on its own thread. A long or compressed file is hashed and
+/// converted first, and that would stall the window.
+struct Adding {
+    /// The file's name, for telling the person what is going on.
+    name: String,
+    /// What the change is called when the person is told how it went: "insert", "new track".
+    what: &'static str,
+    /// The place it was asked for, in terms of the audio, to find again if the project changes.
+    kept: Place,
+    range: (u64, u64),
+    change: AddChange,
+    /// On a second try: who wrote the project first.
+    after: Option<String>,
+    /// How it went. An error says whether the project had been written in the meantime.
+    result: mpsc::Receiver<Result<(), (bool, String)>>,
+}
+
 /// One row of the Files tab: a folder, or an audio file scrubr can read.
 struct Entry {
     name: String,
@@ -561,6 +581,7 @@ pub struct Studio {
     ask: Option<Ask>,
     exporting: Option<Exporting>,
     creating: Option<Creating>,
+    adding: Option<Adding>,
     doc: Option<Doc>,
     error: Option<String>,
     looks: [Look; 2],
@@ -579,6 +600,8 @@ pub struct Studio {
     /// A range to show instead of the whole timeline once the layout is known.
     view_request: Option<(f64, f64)>,
     selection: Option<(f64, f64)>,
+    /// The track the last press on the timeline was in, by id. "Mute on picked track" acts on it.
+    picked: Option<String>,
     cursor: f64,
     selected: Option<usize>,
     /// The label the pointer is over, by its place in the document's notes: its card is shown.
@@ -774,39 +797,104 @@ fn toggle_listen(s: &mut Studio, file: PathBuf) {
     }
 }
 
+/// True, with a word to the person, while a file is still being added: the project is being
+/// written, so nothing else can change it yet.
+fn busy_adding(s: &mut Studio) -> bool {
+    let Some(adding) = &s.adding else { return false };
+    s.notice = Some(format!("Still adding {}. Wait for it, then try again.", adding.name));
+    true
+}
+
+/// Starts a change that adds a file, on its own thread. `watch_adding` finishes it.
+fn start_adding(s: &mut Studio, name: String, what: &'static str, range: (u64, u64), change: AddChange, after: Option<String>) {
+    let kept = place(s, range);
+    let paths = s.paths.clone();
+    let opts = WriteOpts { if_version: s.doc.as_ref().map(|d| d.project.version), ..Default::default() };
+    let (answer, result) = mpsc::channel();
+    let run = change.clone();
+    let started = std::thread::Builder::new().name("scrubr-add".into()).spawn(move || {
+        let made = run(&paths, &opts, range).map_err(|e| (e.kind() == Kind::Conflict, e.to_string()));
+        let _ = answer.send(made);
+    });
+    match started {
+        Ok(_) => {
+            s.hold_reloads = false;
+            s.notice = Some(format!("Adding {name}\u{2026}"));
+            s.adding = Some(Adding { name, what, kept, range, change, after, result });
+        }
+        Err(e) => s.notice = Some(format!("Could not start: {e}")),
+    }
+}
+
+/// Shows the project once a file has been added. If another program wrote the project first,
+/// the place is looked for again and the file is added there, once, when the same audio is
+/// still in one piece. True when the window has changed.
+fn watch_adding(s: &mut Studio) -> bool {
+    let Some(adding) = &s.adding else { return false };
+    let made = match adding.result.try_recv() {
+        Ok(made) => made,
+        Err(mpsc::TryRecvError::Empty) => return false,
+        Err(mpsc::TryRecvError::Disconnected) => Err((false, "it stopped without a result.".to_string())),
+    };
+    let Some(Adding { name, what, kept, range, change, after, .. }) = s.adding.take() else { return false };
+    match made {
+        Ok(()) => {
+            reload(s);
+            let rate = s.doc.as_ref().map_or(48_000, |d| d.rate());
+            s.notice = after.map(|who| format!("{who} edited the project first. Your {what} was made on the same audio, now at {}.", timecode(range.0 as f64, rate)));
+            if what == "insert" {
+                set_cursor(s, range.0 as f64);
+                reveal(s, range.0 as f64);
+            }
+            let dir = s.files.dir.clone();
+            browse(s, dir);
+        }
+        Err((true, _)) => {
+            reload(s);
+            let who = last_author(s);
+            match find(s, &kept).filter(|_| after.is_none()) {
+                Some(moved) => start_adding(s, name, what, moved, change, Some(who)),
+                None => s.notice = Some(format!("{who} edited the project first, and the audio your {what} was for has changed. {name} was not added: look again and repeat it.")),
+            }
+        }
+        Err((false, e)) => s.notice = Some(format!("{name} could not be added: {e}")),
+    }
+    true
+}
+
 /// Inserts a file from the Files tab into the timeline at the playhead.
 fn add_file(s: &mut Studio, file: PathBuf) {
+    if busy_adding(s) {
+        return;
+    }
     let Some(doc) = &s.doc else { return };
-    s.files.playing = None;
     let at = (head(s).round().max(0.0) as u64).min(doc.tl.total());
     let (rate, crossfade) = (doc.rate(), (DEFAULT_CROSSFADE_MS / 1000.0 * doc.rate() as f64).round() as u32);
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let made = act_at(s, (at, at), "insert", move |paths, opts, range| {
+    s.files.playing = None;
+    let shown = name.clone();
+    let change: AddChange = Arc::new(move |paths: &Paths, opts: &WriteOpts, range: (u64, u64)| {
         let desc = format!("insert {name} at {}", timecode(range.0 as f64, rate));
         edit::apply(paths, opts, &you(), false, |_, _| Ok((vec![Request::Insert { file: file.clone(), at: range.0, crossfade }], Some(desc)))).map(|_| ())
     });
-    if let Some((at, _)) = made {
-        set_cursor(s, at as f64);
-        reveal(s, at as f64);
-        let dir = s.files.dir.clone();
-        browse(s, dir);
-    }
+    start_adding(s, shown, "insert", (at, at), change, None);
 }
 
 /// Lays a file from the Files tab on a new track, starting at the playhead. Nothing moves.
 fn add_file_as_track(s: &mut Studio, file: PathBuf) {
+    if busy_adding(s) {
+        return;
+    }
     let Some(doc) = &s.doc else { return };
-    s.files.playing = None;
     let at = (head(s).round().max(0.0) as u64).min(doc.tl.total());
     // The track is named after the file; a second one of the same name gets a number.
     let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "track".into());
     let taken = |name: &str| doc.tl.tracks().iter().any(|t| !t.removed && (t.name == name || t.id == name));
     let name = std::iter::once(stem.clone()).chain((2..).map(|n| format!("{stem} {n}"))).find(|name| !taken(name)).unwrap_or(stem);
-    let made = act_at(s, (at, at), "new track", move |paths, opts, range| edit::track_add(paths, opts, &you(), &file, Some(&name), None, range.0).map(|_| ()));
-    if made.is_some() {
-        let dir = s.files.dir.clone();
-        browse(s, dir);
-    }
+    let shown = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    s.files.playing = None;
+    let change: AddChange = Arc::new(move |paths: &Paths, opts: &WriteOpts, range: (u64, u64)| edit::track_add(paths, opts, &you(), &file, Some(&name), None, range.0).map(|_| ()));
+    start_adding(s, shown, "new track", (at, at), change, None);
 }
 
 fn toggle_play(s: &mut Studio) {
@@ -872,6 +960,8 @@ fn init_with(path: Option<PathBuf>) -> Studio {
         ask: None,
         exporting: None,
         creating: None,
+        adding: None,
+        picked: None,
         doc: None,
         error: None,
         looks: [look(false), look(true)],
@@ -1428,6 +1518,21 @@ fn callout(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
     Some(card)
 }
 
+/// The track the last press on the timeline was in, when the project shows a lane for each track.
+fn picked_track(s: &Studio) -> Option<(usize, &TrackState)> {
+    let doc = s.doc.as_ref()?;
+    let id = s.picked.as_ref()?;
+    doc.lanes().into_iter().find_map(|lane| match lane {
+        Lane::Track(t) if doc.tl.tracks()[t].id == *id => Some((t, &doc.tl.tracks()[t])),
+        _ => None,
+    })
+}
+
+/// Takes a track out of the project. Undo brings it back.
+fn remove_track(s: &mut Studio, id: String) {
+    act(s, move |paths| edit::track_remove(paths, &WriteOpts::default(), &you(), &id).map(|_| ()));
+}
+
 /// Changes a track's place in the mix. It names the track by id, so it means the same whatever
 /// else has happened to the project.
 fn set_track(s: &mut Studio, id: String, change: edit::TrackChange) {
@@ -1435,8 +1540,9 @@ fn set_track(s: &mut Studio, id: String, change: edit::TrackChange) {
 }
 
 /// A track's name and its place in the mix, at the head of its lane: mute, solo, level in 1 dB
-/// steps and pan in tenths.
-fn track_head(lk: &Look, t: &TrackState, y: f32) -> El {
+/// steps and pan in tenths. A press on the name picks the track, and every track but the main
+/// one can be removed.
+fn track_head(lk: &Look, t: &TrackState, y: f32, main: bool, picked: bool) -> El {
     let k = &lk.k;
     let level = (t.gain_db * 10.0).round() / 10.0;
     let pan = (t.pan * 10.0).round() / 10.0;
@@ -1455,7 +1561,18 @@ fn track_head(lk: &Look, t: &TrackState, y: f32) -> El {
     let change = edit::TrackChange::default;
     let pan_text = if pan == 0.0 { "C".to_string() } else { format!("{}{}", if pan < 0.0 { "L" } else { "R" }, (pan.abs() * 100.0).round() as i32) };
     let figure = |value: String, width: f32| row().w(width).h(18.0).center().child(text(value).font(lk.num(k.ty.small)).color(k.c.text_muted));
-    row()
+    let pick = t.id.clone();
+    let name = row()
+        .key(format!("track-name-{}", t.id))
+        .h(18.0)
+        .px(6.0)
+        .center_y()
+        .radius(5.0)
+        .fill(if picked { lk.you } else { k.c.text_base.alpha(0.0) })
+        .help(if picked { "Picked: Shift+M mutes the selection on this track alone" } else { "Pick this track, to mute a selection on it alone" })
+        .on_press(move |s: &mut Studio| s.picked = Some(pick.clone()))
+        .child(text(t.name.clone()).font(k.ty.small_medium).color(if picked { lk.on_you } else { k.c.text_base }));
+    let mut head = row()
         .key(format!("track-{}", t.id))
         .absolute(8.0, y)
         .h(24.0)
@@ -1465,7 +1582,7 @@ fn track_head(lk: &Look, t: &TrackState, y: f32) -> El {
         .radius(7.0)
         // Over the waveform, so it gets a plate of its own to stay readable.
         .fill(lk.lane.alpha(0.9))
-        .child(row().h(18.0).px(6.0).center_y().child(text(t.name.clone()).font(k.ty.small_medium).color(k.c.text_base)))
+        .child(name)
         .child(button(format!("track-mute-{}", t.id), "M", t.mute, "Mute this track", edit::TrackChange { mute: Some(!t.mute), ..change() }))
         .child(button(format!("track-solo-{}", t.id), "S", t.solo, "Solo: only soloed tracks are heard", edit::TrackChange { solo: Some(!t.solo), ..change() }))
         .child(el().w(5.0))
@@ -1475,7 +1592,22 @@ fn track_head(lk: &Look, t: &TrackState, y: f32) -> El {
         .child(el().w(5.0))
         .child(button(format!("track-left-{}", t.id), "L", false, "Pan a step to the left", edit::TrackChange { pan: Some(((pan - 0.1) * 10.0).round().max(-10.0) / 10.0), ..change() }))
         .child(figure(pan_text, 26.0))
-        .child(button(format!("track-right-{}", t.id), "R", false, "Pan a step to the right", edit::TrackChange { pan: Some(((pan + 0.1) * 10.0).round().min(10.0) / 10.0), ..change() }))
+        .child(button(format!("track-right-{}", t.id), "R", false, "Pan a step to the right", edit::TrackChange { pan: Some(((pan + 0.1) * 10.0).round().min(10.0) / 10.0), ..change() }));
+    if !main {
+        let id = t.id.clone();
+        head = head.child(el().w(5.0)).child(
+            row()
+                .key(format!("track-rm-{}", t.id))
+                .size(18.0, 18.0)
+                .radius(5.0)
+                .center()
+                .fill(k.c.text_base.alpha(0.09))
+                .help("Remove this track. Undo brings it back.")
+                .on_press(move |s: &mut Studio| remove_track(s, id.clone()))
+                .child(icon(&CROSS, 10.0).color(k.c.text_muted)),
+        );
+    }
+    head
 }
 
 /// The card for the label under the pointer: who left it, what it marks and what it says.
@@ -1644,6 +1776,13 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
             true
         })
         .on_drag(|s: &mut Studio, d, _| {
+            // The press picks the track whose lane it is in.
+            let lanes = s.doc.as_ref().map(|doc| doc.lanes()).unwrap_or_default();
+            let lane = ((d.start_y / s.wave[1].max(1.0) * lanes.len() as f32).floor().max(0.0) as usize).min(lanes.len().saturating_sub(1));
+            s.picked = match lanes.get(lane) {
+                Some(Lane::Track(t)) => s.doc.as_ref().map(|doc| doc.tl.tracks()[*t].id.clone()),
+                _ => None,
+            };
             // A drag selects a range; a press without one moves the cursor.
             let frame = |x: f32| (s.start + x as f64 * s.fpp).clamp(0.0, total(s));
             if (d.x - d.start_x).abs() > 2.0 {
@@ -1667,6 +1806,17 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
         }
     }
     let lanes = doc.lanes();
+    let picked = picked_track(s).map(|(t, _)| t);
+    // The selection is stronger in the picked track's lane: a mute can be made there alone.
+    if let (Some((a, b)), Some(t)) = (s.selection, picked)
+        && let Some(i) = lanes.iter().position(|lane| *lane == Lane::Track(t))
+    {
+        let (x0, x1) = ((((a - s.start) / s.fpp) as f32).max(0.0), (((b - s.start) / s.fpp) as f32).min(w));
+        let lane_h = h / lanes.len() as f32;
+        if x1 > x0 {
+            area = area.child(el().key("selection-track").absolute(x0, lane_h * i as f32).size(x1 - x0, lane_h).fill(lk.you.alpha(0.14)));
+        }
+    }
     for (i, lane) in lanes.iter().enumerate() {
         let y = h / lanes.len() as f32 * i as f32 + 18.0;
         match *lane {
@@ -1684,7 +1834,7 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
                 );
             }
             Lane::Channel(_) => {}
-            Lane::Track(t) => area = area.child(track_head(lk, &doc.tl.tracks()[t], y)),
+            Lane::Track(t) => area = area.child(track_head(lk, &doc.tl.tracks()[t], y, t == 0, picked == Some(t))),
         }
     }
     if doc.magnify() > 1.05 {
@@ -2214,7 +2364,8 @@ fn files(s: &Studio, doc: &Doc, lk: &Look) -> El {
     }
     // What the project is already made of.
     list = list.child(el().h(10.0)).child(el().w_full().h(1.0).fill(lk.rule)).child(el().h(6.0)).child(text("In this project").font(k.ty.small_medium).color(k.c.text_muted).px(8.0));
-    for source in &doc.project.sources {
+    // Silence the project made for itself, where a track runs past the others, is not a file.
+    for source in doc.project.sources.iter().filter(|source| !source.silence) {
         let missing = !s.paths.source_file(source).is_file();
         let name = std::path::Path::new(&source.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| source.path.clone());
         let length = duration(source.frames as f64, doc.rate());
@@ -2285,6 +2436,9 @@ fn you() -> Who {
 /// Runs a change to the project and reloads, or says why it could not be made. For changes that
 /// name what they act on by id, which mean the same whatever else has happened to the project.
 fn act(s: &mut Studio, change: impl FnOnce(&Paths) -> scrubr_core::Result<()>) {
+    if busy_adding(s) {
+        return;
+    }
     s.hold_reloads = false;
     match change(&s.paths) {
         Ok(()) => {
@@ -2309,6 +2463,9 @@ enum Wrote {
 /// which edit is at head. It is refused if the project has been written since, and the window
 /// reloads; the caller decides whether the change still makes sense.
 fn act_checked(s: &mut Studio, change: impl FnOnce(&Paths, &WriteOpts) -> scrubr_core::Result<()>) -> Wrote {
+    if busy_adding(s) {
+        return Wrote::Failed;
+    }
     s.hold_reloads = false;
     let opts = WriteOpts { if_version: s.doc.as_ref().map(|d| d.project.version), ..Default::default() };
     match change(&s.paths, &opts) {
@@ -2445,6 +2602,21 @@ fn mute_selection(s: &mut Studio) {
     }
 }
 
+/// Silences the selection on the picked track alone. The other tracks play on, and nothing moves.
+fn mute_on_track(s: &mut Studio) {
+    let Some((range, crossfade, _)) = selected_range(s, "mute") else { return };
+    let Some((id, track)) = picked_track(s).map(|(_, t)| (t.id.clone(), t.name.clone())) else { return };
+    let rate = s.doc.as_ref().map_or(48_000, |d| d.rate());
+    let made = act_at(s, range, "mute", move |paths, opts, range| {
+        let desc = format!("mute {track} {}..{}", timecode(range.0 as f64, rate), timecode(range.1 as f64, rate));
+        let request = Request::OnTrack { track: id.clone(), request: Box::new(Request::Mute { range, crossfade }) };
+        edit::apply(paths, opts, &you(), false, |_, _| Ok((vec![request], Some(desc)))).map(|_| ())
+    });
+    if let Some(range) = made {
+        s.selection = Some((range.0 as f64, range.1 as f64));
+    }
+}
+
 /// Puts the start or the end of the selection at the playhead. The other end stays where it is,
 /// or joins it when it would fall on the wrong side.
 fn mark_selection(s: &mut Studio, start: bool) {
@@ -2522,6 +2694,7 @@ fn open_project(s: &mut Studio, path: PathBuf) {
     s.paths = Paths::new(path);
     s.blank = false;
     s.selection = None;
+    s.picked = None;
     s.selected = None;
     s.notice = None;
     s.view_request = None;
@@ -2649,6 +2822,7 @@ fn step_splice(s: &mut Studio, forward: bool) {
 #[derive(Clone, Copy, PartialEq)]
 enum Keys {
     Char(char),
+    Shift(char),
     Cmd(char),
     CmdShift(char),
     Delete,
@@ -2665,7 +2839,9 @@ impl Keys {
         match self {
             Keys::Cmd(c) => e.is_command(c) && !e.mods.shift,
             Keys::CmdShift(c) => e.is_command(c) && e.mods.shift,
-            Keys::Char(c) => matches!(&e.key, Key::Text(t) if !e.mods.cmd && t.chars().map(|x| x.to_ascii_lowercase()).eq([c])),
+            // A letter with Shift held is another command's key.
+            Keys::Char(c) => matches!(&e.key, Key::Text(t) if !e.mods.cmd && !(c.is_ascii_alphabetic() && e.mods.shift) && t.chars().map(|x| x.to_ascii_lowercase()).eq([c])),
+            Keys::Shift(c) => matches!(&e.key, Key::Text(t) if !e.mods.cmd && e.mods.shift && t.chars().map(|x| x.to_ascii_lowercase()).eq([c])),
             Keys::Delete => matches!(e.key, Key::Delete | Key::Backspace),
             Keys::Escape => matches!(e.key, Key::Escape),
             Keys::Home => matches!(e.key, Key::Home),
@@ -2684,6 +2860,8 @@ impl Keys {
             Keys::Cmd(c) => format!("Ctrl+{}", c.to_ascii_uppercase()),
             Keys::CmdShift(c) if mac => format!("\u{21e7}\u{2318}{}", c.to_ascii_uppercase()),
             Keys::CmdShift(c) => format!("Ctrl+Shift+{}", c.to_ascii_uppercase()),
+            Keys::Shift(c) if mac => format!("\u{21e7}{}", c.to_ascii_uppercase()),
+            Keys::Shift(c) => format!("Shift+{}", c.to_ascii_uppercase()),
             Keys::Char(' ') => "Space".into(),
             Keys::Char(c) => c.to_ascii_uppercase().to_string(),
             Keys::Delete => "Del".into(),
@@ -2736,7 +2914,7 @@ fn has_splices(s: &Studio) -> bool {
     s.doc.as_ref().is_some_and(|d| !d.splices.is_empty())
 }
 
-static COMMANDS: [Command; 22] = [
+static COMMANDS: [Command; 23] = [
     Command { menu: 0, label: NEW, keys: Keys::Cmd('n'), divide: false, built: true, enabled: |s| s.creating.is_none(), run: |s| s.ask = Some(Ask::New) },
     Command { menu: 0, label: OPEN, keys: Keys::Cmd('o'), divide: false, built: true, enabled: always, run: |s| s.ask = Some(Ask::Open) },
     Command { menu: 0, label: "Export\u{2026}", keys: Keys::Cmd('e'), divide: false, built: true, enabled: |s| s.exporting.is_none(), run: |s| s.ask = Some(Ask::Export) },
@@ -2760,6 +2938,15 @@ static COMMANDS: [Command; 22] = [
     },
     Command { menu: 1, label: "Cut selection", keys: Keys::Delete, divide: true, built: true, enabled: has_selection, run: cut_selection },
     Command { menu: 1, label: "Mute selection", keys: Keys::Char('m'), divide: false, built: true, enabled: has_selection, run: mute_selection },
+    Command {
+        menu: 1,
+        label: "Mute on picked track",
+        keys: Keys::Shift('m'),
+        divide: false,
+        built: true,
+        enabled: |s| has_selection(s) && picked_track(s).is_some(),
+        run: mute_on_track,
+    },
     Command { menu: 1, label: "Add label\u{2026}", keys: Keys::Char('l'), divide: true, built: true, enabled: always, run: begin_label },
     Command { menu: 1, label: "Set selection start", keys: Keys::Char('i'), divide: true, built: true, enabled: always, run: |s| mark_selection(s, true) },
     Command { menu: 1, label: "Set selection end", keys: Keys::Char('o'), divide: false, built: true, enabled: always, run: |s| mark_selection(s, false) },
@@ -3127,18 +3314,19 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
     let meters_lit = step_meters(s, t);
     changed |= watch_export(s);
     changed |= watch_creating(s);
+    changed |= watch_adding(s);
     // A file being listened to stops showing as playing when it ends.
     if s.files.playing.as_ref().is_some_and(|(_, p)| p.done()) {
         s.files.playing = None;
         changed = true;
     }
-    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.creating.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
+    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.creating.is_some() || s.adding.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
 
     if s.pretend_edit_at.is_some_and(|at| t >= at) {
         s.pretend_edit_at = None;
         s.stamp = None;
     }
-    if t - s.checked_at >= 0.45 && !s.blank && !s.hold_reloads {
+    if t - s.checked_at >= 0.45 && !s.blank && !s.hold_reloads && s.adding.is_none() {
         s.checked_at = t;
         if stamp(&s.paths) != s.stamp {
             reload(s);

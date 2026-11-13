@@ -115,7 +115,8 @@ a track by its name or its id (`t2`).
   then work on that track heard alone, at its own level and pan, whatever is muted or soloed.
   With a microphone on each track, `transcribe --track T` gives one speaker's words.
 - **The window** shows a lane for each track, with its mute, solo, level and pan. The person
-  can change those there, and each change is an edit in `history` under their name.
+  can change those there, mute a selection on one track, and remove a track. Each change is an
+  edit in `history` under their name.
 
 ## What edits do
 

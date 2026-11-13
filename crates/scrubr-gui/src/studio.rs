@@ -1785,7 +1785,13 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
             true
         })
         .on_magnify(|s: &mut Studio, e, _| {
-            zoom_about(s, e.x as f64, 1.0 + e.delta as f64);
+            // A pinch on macOS, and Ctrl + wheel everywhere else, which Rune hands over as a
+            // pinch. There a wheel turned away from the hand arrives as a pinch inwards, the
+            // reverse of what a wheel does in every other program, so it is turned round here.
+            let delta = if cfg!(target_os = "macos") { e.delta as f64 } else { -(e.delta as f64) };
+            // The same step in and out, so a notch one way undoes a notch the other.
+            let factor = if delta >= 0.0 { 1.0 + delta } else { 1.0 / (1.0 - delta) };
+            zoom_about(s, e.x as f64, factor);
             true
         })
         .on_drag(|s: &mut Studio, d, _| {

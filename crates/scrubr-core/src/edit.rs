@@ -5,14 +5,14 @@
 //! that is the timeline at head. For a batch it is the timeline before the batch, for every
 //! operation in it, so positions worked out from one analysis stay valid through the whole batch.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::analysis::{self, FLOOR_DB};
 use crate::error::{Error, Result};
-use crate::project::{self, FadeDir, Label, Op, Paths, Project, Span, Who, WriteOpts, Written};
+use crate::project::{self, FadeDir, Label, Op, Paths, Project, Source, Span, Who, WriteOpts, Written};
 use crate::render::Renderer;
 use crate::source;
-use crate::timeline::{SrcSpan, Timeline};
+use crate::timeline::{SrcSpan, Timeline, TrackState};
 
 /// The default crossfade at joins, in milliseconds.
 pub const DEFAULT_CROSSFADE_MS: f64 = 5.0;
@@ -38,6 +38,10 @@ pub enum Request {
     Mute { range: (u64, u64), crossfade: u32 },
     Insert { file: PathBuf, at: u64, crossfade: u32 },
     Normalize { target: Target, ceiling_dbtp: f64 },
+    /// Another request aimed at one track, named by id or name. A level change then touches
+    /// that track alone, and an insert puts the file on that track with silence on the others.
+    /// Cut and keep remove time from every track and cannot be aimed at one.
+    OnTrack { track: String, request: Box<Request> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -102,6 +106,10 @@ pub fn check_range(project: &Project, paths: &Paths, base: &Timeline, (start, en
     Ok(())
 }
 
+fn unknown_track(paths: &Paths, key: &str) -> Error {
+    Error::usage("unknown_track", format!("There is no track {key}.")).hint(format!("Run `scrubr track {} list` to see the tracks.", paths.shown.display()))
+}
+
 fn stored(base: &Timeline, spans: &[SrcSpan]) -> (Vec<Span>, u64) {
     (base.stored(spans), spans.iter().map(SrcSpan::frames).sum())
 }
@@ -126,23 +134,23 @@ pub fn resolve(project: &mut Project, paths: &Paths, base: &Timeline, pending: &
                 return Err(Error::usage("bad_gain", "The gain must be a finite number of dB."));
             }
             match range {
-                None => plain(Op::Gain { gain_db: *db, spans: None }, base.total()),
+                None => plain(Op::Gain { gain_db: *db, spans: None, track: None }, base.total()),
                 Some(range) => {
                     check_range(project, paths, base, *range)?;
                     let (spans, frames) = stored(base, &base.resolve(range.0, range.1));
-                    plain(Op::Gain { gain_db: *db, spans: Some(spans) }, frames)
+                    plain(Op::Gain { gain_db: *db, spans: Some(spans), track: None }, frames)
                 }
             }
         }
         Request::Fade { dir, range } => {
             check_range(project, paths, base, *range)?;
             let (spans, frames) = stored(base, &base.resolve(range.0, range.1));
-            plain(Op::Fade { dir: *dir, spans }, frames)
+            plain(Op::Fade { dir: *dir, spans, track: None }, frames)
         }
         Request::Mute { range, crossfade } => {
             check_range(project, paths, base, *range)?;
             let (spans, frames) = stored(base, &base.resolve(range.0, range.1));
-            plain(Op::Mute { spans, crossfade: *crossfade }, frames)
+            plain(Op::Mute { spans, crossfade: *crossfade, track: None }, frames)
         }
         Request::Insert { file, at, crossfade } => {
             if *at > base.total() {
@@ -159,15 +167,68 @@ pub fn resolve(project: &mut Project, paths: &Paths, base: &Timeline, pending: &
             let at = base.anchor(*at).map(|(src, frame)| (base.source_id(src).to_string(), frame));
             Resolved { op: Op::Insert { source: id.clone(), at, crossfade: *crossfade }, frames, normalize: None, new_source: Some(id) }
         }
+        Request::OnTrack { track, request } => {
+            let t = base.find_track(track).ok_or_else(|| unknown_track(paths, track))?;
+            let id = base.tracks()[t].id.clone();
+            match &**request {
+                Request::Gain { .. } | Request::Fade { .. } | Request::Mute { .. } => {
+                    let mut one = resolve(project, paths, base, pending, request)?;
+                    if let Op::Gain { track, .. } | Op::Fade { track, .. } | Op::Mute { track, .. } = &mut one.op {
+                        *track = Some(id);
+                    }
+                    one
+                }
+                Request::Normalize { target, ceiling_dbtp } => {
+                    let report = measure_for_normalize(project, paths, pending, Some(t), *target, *ceiling_dbtp)?;
+                    let (lufs, peak_db) = match target {
+                        Target::Lufs(l) => (Some(*l), None),
+                        Target::Peak(p) => (None, Some(*p)),
+                    };
+                    Resolved {
+                        op: Op::Normalize { lufs, peak_db, gain_db: report.gain_db, ceiling_dbtp: *ceiling_dbtp, track: Some(id) },
+                        frames: base.total(),
+                        normalize: Some(report),
+                        new_source: None,
+                    }
+                }
+                // On the main track an insert is the plain one: the file's audio is the new time.
+                Request::Insert { .. } if t == 0 => resolve(project, paths, base, pending, request)?,
+                Request::Insert { file, at, crossfade } => {
+                    if *at > base.total() {
+                        return Err(Error::usage(
+                            "range_out_of_bounds",
+                            format!("Position {} is past the end of the timeline ({}).", seconds(project, *at), seconds(project, base.total())),
+                        )
+                        .hint(format!("Run `scrubr info {}` to get the timeline length. Use `--at end` to append.", paths.shown.display())));
+                    }
+                    // New time for every track: silence on the main one, with the file's audio
+                    // attached to it on this track.
+                    let clip = project.next_source_id();
+                    let source = source::import(paths, &clip, file, Some(project.sample_rate))?;
+                    let frames = source.frames;
+                    project.sources.push(source);
+                    let quiet = project.next_source_id();
+                    project.sources.push(Source::silence(quiet.clone(), frames, project.sample_rate, project.channels));
+                    let at = base.anchor(*at).map(|(src, frame)| (base.source_id(src).to_string(), frame));
+                    let ops = vec![Op::Insert { source: quiet.clone(), at, crossfade: *crossfade }, Op::Clip { track: id, source: clip.clone(), at: vec![Span(quiet, 0, frames)] }];
+                    Resolved { op: Op::Batch { ops }, frames, normalize: None, new_source: Some(clip) }
+                }
+                Request::Cut { .. } | Request::Keep { .. } => {
+                    return Err(Error::usage("track_not_allowed", "Cut and keep remove time from every track, so they cannot be aimed at one.")
+                        .hint("Drop the track. To silence one track over a range and keep its length, use mute with the track."));
+                }
+                Request::OnTrack { .. } => return Err(Error::usage("track_not_allowed", "An operation names its track once.")),
+            }
+        }
         Request::Normalize { target, ceiling_dbtp } => {
-            let report = measure_for_normalize(project, paths, pending, *target, *ceiling_dbtp)?;
+            let report = measure_for_normalize(project, paths, pending, None, *target, *ceiling_dbtp)?;
             let (lufs, peak_db) = match target {
                 Target::Lufs(l) => (Some(*l), None),
                 Target::Peak(p) => (None, Some(*p)),
             };
             let total = base.total();
             Resolved {
-                op: Op::Normalize { lufs, peak_db, gain_db: report.gain_db, ceiling_dbtp: *ceiling_dbtp },
+                op: Op::Normalize { lufs, peak_db, gain_db: report.gain_db, ceiling_dbtp: *ceiling_dbtp, track: None },
                 frames: total,
                 normalize: Some(report),
                 new_source: None,
@@ -176,16 +237,19 @@ pub fn resolve(project: &mut Project, paths: &Paths, base: &Timeline, pending: &
     })
 }
 
-/// Measures the timeline at head plus `pending`, and works out the gain that reaches `target`
-/// without taking the true peak past `ceiling_dbtp`.
-fn measure_for_normalize(project: &Project, paths: &Paths, pending: &[Op], target: Target, ceiling_dbtp: f64) -> Result<NormalizeReport> {
+/// Measures the timeline at head plus `pending`, or one track of it heard alone, and works out
+/// the gain that reaches `target` without taking the true peak past `ceiling_dbtp`.
+fn measure_for_normalize(project: &Project, paths: &Paths, pending: &[Op], only: Option<usize>, target: Target, ceiling_dbtp: f64) -> Result<NormalizeReport> {
     let nothing = || {
         Error::usage("nothing_to_normalize", "The timeline is silent or too short to measure, so there is no level to normalize.")
             .hint("Check the audio with `scrubr analyze <project> --loudness --peaks`.")
     };
     let tl = Timeline::build_with(project, pending)?;
     let total = tl.total();
-    let mut renderer = Renderer::with_timeline(project, paths, tl)?;
+    let mut renderer = match only {
+        Some(track) => Renderer::for_track(project, paths, tl, track)?,
+        None => Renderer::with_timeline(project, paths, tl)?,
+    };
     let options = analysis::Options { loudness: true, peaks: true, ..Default::default() };
     let report = analysis::analyze(&mut renderer, 0, total, &options, project.sample_rate)?;
     let loudness = report.loudness.expect("loudness was asked for");
@@ -283,6 +347,181 @@ pub fn apply(
         _ => brought_in.iter().for_each(|id| source::forget(paths, id)),
     }
     result
+}
+
+// ---- tracks ----------------------------------------------------------------------------------
+
+/// What [`track_add`] did.
+#[derive(Clone, Debug)]
+pub struct TrackAdded {
+    pub edit: String,
+    /// The track the file is now on.
+    pub track: TrackState,
+    /// False when the file joined a track that was already there.
+    pub created: bool,
+    /// The id of the source the file became.
+    pub source: String,
+    /// Where the file starts on the timeline, and how long it is, in frames.
+    pub at: u64,
+    pub frames: u64,
+    /// Frames of silence added to the end of the timeline to make room for the file.
+    pub extended: u64,
+    pub frames_before: u64,
+    pub frames_after: u64,
+    pub sample_rate: u32,
+}
+
+fn check_track_name(tl: &Timeline, name: &str, except: Option<usize>) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(Error::usage("bad_track_name", "A track's name cannot be empty."));
+    }
+    if tl.tracks().iter().enumerate().any(|(i, t)| Some(i) != except && !t.removed && (t.name == name || t.id == name)) {
+        return Err(Error::usage("track_exists", format!("There is already a track called {name}.")).hint("Pick another name with --name, or add the file to that track with --track."));
+    }
+    Ok(())
+}
+
+/// Puts a file on a track of its own, or on a track that is already there with `onto`, starting
+/// at timeline position `at`. Nothing on the timeline moves. If the file runs past the end, the
+/// timeline grows with silence on the other tracks.
+pub fn track_add(paths: &Paths, opts: &WriteOpts, who: &Who, file: &Path, name: Option<&str>, onto: Option<&str>, at: u64) -> Result<Written<TrackAdded>> {
+    let mut brought_in: Option<String> = None;
+    let mut discarded: Vec<String> = Vec::new();
+    let result = project::update(paths, opts, |project| {
+        let base = Timeline::build(project)?;
+        let total = base.total();
+        if at > total {
+            return Err(Error::usage(
+                "range_out_of_bounds",
+                format!("Position {} is past the end of the timeline ({}).", seconds(project, at), seconds(project, total)),
+            )
+            .hint(format!("Run `scrubr info {}` to get the timeline length. Use `--at end` to start where the timeline ends.", paths.shown.display())));
+        }
+        let (track, track_name, created) = match onto {
+            Some(key) => {
+                let t = base.find_track(key).ok_or_else(|| unknown_track(paths, key))?;
+                if t == 0 {
+                    return Err(Error::usage("main_track", "The main track's audio is the timeline itself, so a file cannot be laid over it.")
+                        .hint("Use `scrubr insert` to add the file to the timeline, or leave out the track to give the file a track of its own."));
+                }
+                (base.tracks()[t].id.clone(), base.tracks()[t].name.clone(), false)
+            }
+            None => {
+                let name = match name {
+                    Some(name) => name.to_string(),
+                    None => file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                };
+                check_track_name(&base, &name, None)?;
+                (project.next_track_id(), name, true)
+            }
+        };
+        let id = project.next_source_id();
+        let source = source::import(paths, &id, file, Some(project.sample_rate))?;
+        brought_in = Some(id.clone());
+        let frames = source.frames;
+        project.sources.push(source);
+        if frames == 0 {
+            return Err(Error::usage("empty_file", format!("{} holds no audio.", file.display())));
+        }
+        let mut ops = Vec::new();
+        let extended = (at + frames).saturating_sub(total);
+        if extended > 0 {
+            // Room past the end: silence on the main track. It joins with the fade the end had.
+            let quiet = project.next_source_id();
+            project.sources.push(Source::silence(quiet.clone(), extended, project.sample_rate, project.channels));
+            ops.push(Op::Insert { source: quiet, at: None, crossfade: base.segs().last().map_or(0, |s| s.xf_out) });
+        }
+        let room = Timeline::build_with(project, &ops)?;
+        let spans = room.stored(&room.resolve(at, at + frames));
+        if created {
+            ops.push(Op::Track { track: track.clone(), name: track_name.clone() });
+        }
+        ops.push(Op::Clip { track: track.clone(), source: id.clone(), at: spans });
+        let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let desc = match created {
+            true => format!("add track {track_name}: {file_name} at {}", seconds(project, at)),
+            false => format!("add {file_name} to track {track_name} at {}", seconds(project, at)),
+        };
+        let (edit, gone) = project.push_edit(Op::Batch { ops }, Some(desc), who);
+        discarded = gone;
+        let after = Timeline::build(project)?;
+        let state = after.tracks().iter().find(|t| t.id == track).cloned().expect("the track was just added");
+        Ok(TrackAdded { edit, track: state, created, source: id, at, frames, extended, frames_before: total, frames_after: after.total(), sample_rate: project.sample_rate })
+    });
+    match &result {
+        Ok(written) if written.wrote => discarded.iter().for_each(|id| source::forget(paths, id)),
+        _ => brought_in.iter().for_each(|id| source::forget(paths, id)),
+    }
+    result
+}
+
+/// A change to a track's name or its place in the mix. What is `None` stays as it is.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackChange {
+    pub name: Option<String>,
+    pub gain_db: Option<f64>,
+    /// From -1.0, full left, to 1.0, full right.
+    pub pan: Option<f64>,
+    pub mute: Option<bool>,
+    pub solo: Option<bool>,
+}
+
+/// Changes a track's name, level, pan, mute or solo. Returns the edit's id and the track as it
+/// now is.
+pub fn track_set(paths: &Paths, opts: &WriteOpts, who: &Who, track: &str, change: &TrackChange) -> Result<Written<(String, TrackState)>> {
+    project::update(paths, opts, |project| {
+        let tl = Timeline::build(project)?;
+        let t = tl.find_track(track).ok_or_else(|| unknown_track(paths, track))?;
+        let before = &tl.tracks()[t];
+        if *change == TrackChange::default() {
+            return Err(Error::usage("no_operations", "There is nothing to change.").hint("Give a level, a pan, a mute or solo setting, or a new name."));
+        }
+        if let Some(name) = &change.name {
+            check_track_name(&tl, name, Some(t))?;
+        }
+        if change.gain_db.is_some_and(|db| !db.is_finite()) {
+            return Err(Error::usage("bad_gain", "The level must be a finite number of dB."));
+        }
+        if change.pan.is_some_and(|pan| !(-1.0..=1.0).contains(&pan)) {
+            return Err(Error::usage("bad_pan", "Pan runs from -1, full left, to 1, full right.").hint("Use a number such as -0.3, 0 or 0.5."));
+        }
+        let mut said = Vec::new();
+        if let Some(name) = &change.name {
+            said.push(format!("renamed {name}"));
+        }
+        if let Some(db) = change.gain_db {
+            said.push(format!("level {db:+} dB"));
+        }
+        if let Some(pan) = change.pan {
+            said.push(if pan == 0.0 { "pan centre".to_string() } else { format!("pan {} {}", pan.abs(), if pan < 0.0 { "left" } else { "right" }) });
+        }
+        if let Some(mute) = change.mute {
+            said.push(if mute { "muted" } else { "unmuted" }.to_string());
+        }
+        if let Some(solo) = change.solo {
+            said.push(if solo { "solo" } else { "solo off" }.to_string());
+        }
+        let desc = format!("track {}: {}", before.name, said.join(", "));
+        let op = Op::TrackSet { track: before.id.clone(), name: change.name.clone(), gain_db: change.gain_db, pan: change.pan, mute: change.mute, solo: change.solo };
+        let (edit, _) = project.push_edit(op, Some(desc), who);
+        let after = Timeline::build(project)?;
+        Ok((edit, after.tracks()[t].clone()))
+    })
+}
+
+/// Takes a track and its audio out of the project. Time does not change. Returns the edit's id
+/// and the track that was removed.
+pub fn track_remove(paths: &Paths, opts: &WriteOpts, who: &Who, track: &str) -> Result<Written<(String, TrackState)>> {
+    project::update(paths, opts, |project| {
+        let tl = Timeline::build(project)?;
+        let t = tl.find_track(track).ok_or_else(|| unknown_track(paths, track))?;
+        if t == 0 {
+            return Err(Error::usage("main_track", "The main track's audio is the timeline itself, so it cannot be removed.").hint("Mute it with `scrubr track <project> set main --mute` to hear the other tracks without it."));
+        }
+        let state = tl.tracks()[t].clone();
+        let (edit, _) = project.push_edit(Op::TrackRemove { track: state.id.clone() }, Some(format!("remove track {}", state.name)), who);
+        Ok((edit, state))
+    })
 }
 
 /// How head moved.

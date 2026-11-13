@@ -434,6 +434,7 @@ pub fn import(paths: &Paths, id: &str, file: &Path, rate: Option<u32>) -> Result
         bits: probe.bits,
         float: probe.float,
         conformed: !probe.wav || probe.sample_rate != rate,
+        silence: false,
     };
     let audio = paths.audio_file(&source);
     let peaks = paths.peaks_file(&source);
@@ -471,13 +472,14 @@ pub fn import_preview(paths: &Paths, id: &str, file: &Path, rate: Option<u32>) -
         bits: probe.bits,
         float: probe.float,
         conformed: !probe.wav || probe.sample_rate != rate,
+        silence: false,
     })
 }
 
 /// Makes sure the file a source's audio is read from exists, rebuilding a missing converted copy
 /// from the original.
 pub fn ensure_audio(paths: &Paths, source: &Source, rate: u32) -> Result<()> {
-    if !source.conformed {
+    if !source.conformed || source.silence {
         return Ok(());
     }
     let audio = paths.audio_file(source);
@@ -500,6 +502,19 @@ pub fn ensure_audio(paths: &Paths, source: &Source, rate: u32) -> Result<()> {
 
 /// A source's peak pyramid, from the cache folder, rebuilt when missing or stale.
 pub fn peaks(paths: &Paths, source: &Source, rate: u32) -> Result<Peaks> {
+    if source.silence {
+        // Nothing to read and nothing worth caching: a flat line of the right length.
+        let channels = source.channels.max(1) as usize;
+        let mut builder = PeakBuilder::new(channels, source.frames);
+        let block = vec![0f32; CHUNK_FRAMES * channels];
+        let mut left = source.frames;
+        while left > 0 {
+            let frames = left.min(CHUNK_FRAMES as u64) as usize;
+            builder.push(&block[..frames * channels]);
+            left -= frames as u64;
+        }
+        return Ok(builder.finish());
+    }
     let cached = paths.peaks_file(source);
     if let Ok(peaks) = Peaks::load(&cached)
         && peaks.frames() == source.frames

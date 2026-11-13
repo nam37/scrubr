@@ -153,7 +153,20 @@ impl Pieces<'_> {
 /// Transcribes the timeline at head, or `range` of it in frames. `progress` hears frames done
 /// and frames in all after each piece.
 pub fn transcribe(project: &Project, paths: &Paths, range: Option<(u64, u64)>, engine: &mut dyn Engine, progress: &mut dyn FnMut(u64, u64)) -> Result<Vec<Word>> {
-    let renderer = Renderer::new(project, paths)?;
+    transcribe_track(project, paths, None, range, engine, progress)
+}
+
+/// [`transcribe`] for one track heard alone, by its index in the timeline's tracks, or the mix
+/// when `track` is `None`. A track for each speaker gives a transcript for each speaker.
+pub fn transcribe_track(
+    project: &Project,
+    paths: &Paths,
+    track: Option<usize>,
+    range: Option<(u64, u64)>,
+    engine: &mut dyn Engine,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Vec<Word>> {
+    let renderer = Renderer::of(project, paths, track)?;
     let total = renderer.total();
     if total == 0 {
         return Err(Error::usage("empty_timeline", "The timeline is empty, so there is nothing to transcribe."));

@@ -406,3 +406,75 @@ fn exports_of_one_version_are_identical_and_wav_matches_the_request() {
     bench.run(&["export", "ep.scrubr", "x.flac", "--bits", "32f"]).fails(1, "bad_depth");
     bench.run(&["export", "ep.scrubr", "ep.wav"]).fails(1, "would_overwrite_source");
 }
+
+#[test]
+fn tracks_are_added_mixed_measured_and_exported_from_the_command_line() {
+    let bench = Bench::with_project();
+    // A four-second bed at half the level of the main tone, laid from 3 s: over the first gap
+    // (3.0-4.5 s) it is all there is to hear.
+    write_wav(&bench.root.join("bed.wav"), 4.0, |t| (TAU * 440.0 * t).cos() * 0.05);
+    let peak = |reply: &Value, c: usize| reply["peaks"]["peak_dbfs"][c].as_f64().unwrap();
+    let near = |a: f64, b: f64| (a - b).abs() < 0.05;
+
+    let added = bench.run_as("codex", "s7", &["track", "ep.scrubr", "add", "bed.wav", "--at", "3", "--name", "bed"]).ok();
+    assert_eq!(added["track"], json!({ "id": "t2", "name": "bed", "created": true }));
+    assert_eq!((added["at"].clone(), added["seconds"].clone(), added["extended_seconds"].clone(), added["timeline_seconds"].clone()), (json!(3.0), json!(4.0), json!(0.0), json!(12.0)));
+    let list = bench.run(&["track", "ep.scrubr", "list"]).ok();
+    assert_eq!(list["tracks"].as_array().unwrap().len(), 2);
+    assert_eq!((list["tracks"][0]["name"].clone(), list["tracks"][0]["main"].clone()), (json!("main"), json!(true)));
+    assert_eq!(list["tracks"][1]["clips"][0]["ranges"], json!([{ "start": 3.0, "end": 7.0 }]));
+    assert_eq!(bench.run(&["info", "ep.scrubr"]).ok()["tracks"], json!([{ "id": "t1", "name": "main" }, { "id": "t2", "name": "bed" }]));
+
+    // The mix in the gap is the bed; each track can be measured alone.
+    let gap = ["analyze", "ep.scrubr", "--peaks", "--range", "3.1..4.4"];
+    assert!(near(peak(&bench.run(&gap).ok(), 0), -26.02));
+    assert!(near(peak(&bench.run(&[&gap[..], &["--track", "bed"]].concat()).ok(), 0), -26.02));
+    assert_eq!(peak(&bench.run(&[&gap[..], &["--track", "main"]].concat()).ok(), 0), -120.0);
+
+    // A level edit and the mixer both reach the bed alone. Full left leaves the right silent.
+    let reply = bench.run(&["gain", "ep.scrubr", "-6dB", "--track", "bed"]).ok();
+    assert_eq!(reply["track"], json!("bed"));
+    assert!(near(peak(&bench.run(&gap).ok(), 0), -32.04));
+    let set = bench.run(&["track", "ep.scrubr", "set", "bed", "--gain", "-6", "--pan", "-1"]).ok();
+    assert_eq!((set["track"]["gain_db"].clone(), set["track"]["pan"].clone(), set["op"].clone()), (json!(-6.0), json!(-1.0), json!("track_set")));
+    let mixed = bench.run(&gap).ok();
+    assert!(near(peak(&mixed, 0), -38.06) && peak(&mixed, 1) == -120.0, "{mixed}");
+    bench.run(&["track", "ep.scrubr", "set", "bed", "--pan", "0", "--gain", "0"]).ok();
+
+    // A cut takes the same half second out of both tracks; undo puts both back.
+    let cut = bench.run(&["cut", "ep.scrubr", "3.5..4", "--crossfade", "0"]).ok();
+    assert_eq!(cut["timeline_seconds"], json!(11.5));
+    assert_eq!(bench.run(&["track", "ep.scrubr", "list"]).ok()["tracks"][1]["clips"][0]["ranges"], json!([{ "start": 3.0, "end": 6.5 }]));
+    bench.run(&["undo", "ep.scrubr"]).ok();
+
+    // A batch can aim an operation at a track; a cut cannot be aimed.
+    let ops = bench.root.join("ops.json");
+    fs::write(&ops, r#"[{ "op": "mute", "range": "3..3.5", "track": "main" }, { "op": "gain", "db": -3, "track": "bed" }]"#).unwrap();
+    assert_eq!(bench.run(&["apply", "ep.scrubr", "--ops", "ops.json"]).ok()["ops"], json!(2));
+    fs::write(&ops, r#"[{ "op": "cut", "range": "3..3.5", "track": "bed" }]"#).unwrap();
+    bench.run(&["apply", "ep.scrubr", "--ops", "ops.json"]).fails(1, "bad_ops");
+    bench.run(&["cut", "ep.scrubr", "1..2", "--if-version", "1"]).fails(3, "version_conflict");
+
+    // Each track exports alone, and the mix exports whole.
+    let alone = bench.run(&["export", "ep.scrubr", "bed.out.wav", "--track", "bed"]).ok();
+    assert_eq!(alone["seconds"], json!(12.0));
+    let bed = bench.run(&["new", "bedcheck.scrubr", "--from", "bed.out.wav"]).ok();
+    assert_eq!(bed["timeline_seconds"], json!(12.0));
+    assert!(near(peak(&bench.run(&["analyze", "bedcheck.scrubr", "--peaks"]).ok(), 0), -35.04));
+    assert_eq!(peak(&bench.run(&["analyze", "bedcheck.scrubr", "--peaks", "--range", "0..2.9"]).ok(), 0), -120.0);
+
+    // Mistakes say what is wrong.
+    bench.run(&["gain", "ep.scrubr", "-1dB", "--track", "nope"]).fails(1, "unknown_track");
+    bench.run(&["analyze", "ep.scrubr", "--track", "nope"]).fails(1, "unknown_track");
+    bench.run(&["track", "ep.scrubr", "set", "bed", "--pan", "3"]).fails(1, "bad_pan");
+    bench.run(&["track", "ep.scrubr", "rm", "main"]).fails(1, "main_track");
+    bench.run(&["track", "ep.scrubr", "add", "bed.wav", "--name", "bed"]).fails(1, "track_exists");
+
+    // Removing the track takes the bed out of the mix and leaves the length alone. The agent's
+    // session, which added it, can still be undone as a whole.
+    let removed = bench.run(&["track", "ep.scrubr", "rm", "bed"]).ok();
+    assert_eq!(removed["track"], json!({ "id": "t2", "name": "bed" }));
+    assert_eq!(bench.run(&["track", "ep.scrubr", "list"]).ok()["tracks"].as_array().unwrap().len(), 1);
+    assert_eq!(peak(&bench.run(&["analyze", "ep.scrubr", "--peaks", "--range", "3.6..4.4"]).ok(), 0), -120.0);
+    assert_eq!(bench.run(&["info", "ep.scrubr"]).ok()["timeline_seconds"], json!(12.0));
+}

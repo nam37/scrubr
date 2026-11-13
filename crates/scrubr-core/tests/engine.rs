@@ -718,10 +718,10 @@ fn waveform_images_are_written_from_peaks_and_from_audio() {
     fx.apply(vec![cut(40_000, 50_000, 240)]);
     let project = fx.project();
     let wide = fx.root.join("wide.png");
-    let report = image::render_png(&project, &fx.paths, &wide, &image::Options { width: 400, height: 200, range: None }).unwrap();
+    let report = image::render_png(&project, &fx.paths, &wide, &image::Options { width: 400, height: 200, ..Default::default() }).unwrap();
     assert!(report.from_peaks && report.end == 182_000);
     let near = fx.root.join("near.png");
-    let report = image::render_png(&project, &fx.paths, &near, &image::Options { width: 400, height: 200, range: Some((39_000, 41_000)) }).unwrap();
+    let report = image::render_png(&project, &fx.paths, &near, &image::Options { width: 400, height: 200, range: Some((39_000, 41_000)), track: None }).unwrap();
     assert!(!report.from_peaks && (report.frames_per_pixel - 5.0).abs() < 1e-9);
     for path in [&wide, &near] {
         let bytes = fs::read(path).unwrap();
@@ -732,7 +732,7 @@ fn waveform_images_are_written_from_peaks_and_from_audio() {
     let pixmap = tiny_skia::Pixmap::load_png(&wide).unwrap();
     let dark = |x: u32| (30..110).filter(|&y| pixmap.pixel(x, y).unwrap().red() < 0x40).count();
     assert!(dark(100) > 40 && dark(350) <= 1, "{} and {}", dark(100), dark(350));
-    let err = image::render_png(&project, &fx.paths, &wide, &image::Options { width: 400, height: 200, range: Some((0, 999_999)) }).unwrap_err();
+    let err = image::render_png(&project, &fx.paths, &wide, &image::Options { width: 400, height: 200, range: Some((0, 999_999)), track: None }).unwrap_err();
     assert_eq!(err.code(), "range_out_of_bounds");
 }
 
@@ -862,4 +862,176 @@ fn silence_is_not_sent_to_the_engine() {
     let mut engine = OneWordPerPiece::default();
     let words = transcribe(&fx.project(), &fx.paths, None, &mut engine, &mut |_, _| {}).unwrap();
     assert!(engine.pieces.is_empty() && words.is_empty());
+}
+
+// ---- tracks ----------------------------------------------------------------------------------
+
+fn on(track: &str, request: Request) -> Request {
+    Request::OnTrack { track: track.into(), request: Box::new(request) }
+}
+
+fn add_track(fx: &Fixture, file: &str, name: &str, at: u64) -> edit::TrackAdded {
+    edit::track_add(&fx.paths, &WriteOpts::default(), &me(), &fx.root.join(file), Some(name), None, at).unwrap().value
+}
+
+fn set_track(fx: &Fixture, track: &str, change: edit::TrackChange) {
+    edit::track_set(&fx.paths, &WriteOpts::default(), &me(), track, &change).unwrap();
+}
+
+/// True when every sample of `audio` is within a 24-bit step or two of `value`.
+fn all_near(audio: &[f32], value: f32) -> bool {
+    audio.iter().all(|s| (s - value).abs() < 3e-5)
+}
+
+#[test]
+fn a_second_track_is_summed_with_the_first_and_moves_nothing() {
+    // The main track is a steady 0.25 on both sides; the guest is 0.125 for 10,000 frames.
+    let fx = Fixture::with(48_000, 2, |_, _, _| 0.25);
+    write_wav(&fx.root.join("guest.wav"), RATE, 2, 24, 10_000, |_, _| 0.125);
+    assert_eq!(fx.project().format, project::FORMAT);
+    let added = add_track(&fx, "guest.wav", "guest", 5_000);
+    assert_eq!((added.track.id.as_str(), added.track.name.as_str(), added.created), ("t2", "guest", true));
+    assert_eq!((added.at, added.frames, added.extended, added.frames_before, added.frames_after), (5_000, 10_000, 0, 48_000, 48_000));
+    // A project that uses tracks says so in its format, and reads back the same.
+    let project = fx.project();
+    assert_eq!(project.format, project::FORMAT_TRACKS);
+    assert_eq!(Project::parse(&project.to_json(), Path::new("p.scrubr")).unwrap(), project);
+
+    let audio = fx.render(4096);
+    assert_eq!(audio.len(), 96_000);
+    assert!(all_near(&audio[..10_000], 0.25) && all_near(&audio[10_000..30_000], 0.375) && all_near(&audio[30_000..], 0.25));
+    // The same samples however the reads are cut up.
+    assert_eq!(fx.render(977), audio);
+
+    // Level: half as loud. Pan: full left leaves nothing of the guest on the right.
+    set_track(&fx, "guest", edit::TrackChange { gain_db: Some(-6.0206), ..Default::default() });
+    assert!(all_near(&fx.render(4096)[10_000..30_000], 0.3125));
+    set_track(&fx, "t2", edit::TrackChange { pan: Some(-1.0), ..Default::default() });
+    let audio = fx.render(4096);
+    assert!(audio[10_000..30_000].as_chunks::<2>().0.iter().all(|f| (f[0] - 0.3125).abs() < 3e-5 && (f[1] - 0.25).abs() < 3e-5));
+    // Solo leaves the guest alone; mute takes it out.
+    set_track(&fx, "guest", edit::TrackChange { solo: Some(true), ..Default::default() });
+    let audio = fx.render(4096);
+    assert!(all_near(&audio[..10_000], 0.0) && audio[10_000..30_000].as_chunks::<2>().0.iter().all(|f| (f[0] - 0.0625).abs() < 3e-5 && f[1] == 0.0));
+    set_track(&fx, "guest", edit::TrackChange { solo: Some(false), mute: Some(true), ..Default::default() });
+    assert!(all_near(&fx.render(4096), 0.25));
+    set_track(&fx, "guest", edit::TrackChange { mute: Some(false), pan: Some(0.0), gain_db: Some(0.0), ..Default::default() });
+
+    // A level edit aimed at the guest changes the guest alone; one aimed at nothing changes both.
+    fx.apply(vec![on("guest", Request::Gain { db: -6.0206, range: Some((5_000, 10_000)) })]);
+    let audio = fx.render(4096);
+    assert!(all_near(&audio[10_000..20_000], 0.3125) && all_near(&audio[20_000..30_000], 0.375) && all_near(&audio[..10_000], 0.25));
+    fx.apply(vec![Request::Gain { db: -6.0206, range: Some((10_000, 12_000)) }]);
+    let audio = fx.render(4096);
+    assert!(all_near(&audio[20_000..24_000], 0.1875) && all_near(&audio[24_000..30_000], 0.375));
+}
+
+#[test]
+fn tracks_stay_in_step_through_cuts_and_reverts() {
+    // The main track counts up and the guest counts down, so wherever both are heard and in step
+    // their sum is one fixed number. Any drift between them would change it.
+    let fx = Fixture::with(48_000, 1, |f, _, _| f as f32 / 100_000.0);
+    write_wav(&fx.root.join("guest.wav"), RATE, 1, 24, 20_000, |g, _| -(g as f32) / 100_000.0);
+    // A cut made before the guest exists, then the guest laid at 10,000: source frame 12,000.
+    let early = fx.apply(vec![cut(2_000, 4_000, 0)]).edit;
+    add_track(&fx, "guest.wav", "guest", 10_000);
+    let audio = fx.render(4096);
+    assert_eq!(audio.len(), 46_000);
+    assert!(all_near(&audio[10_000..30_000], 0.12), "the guest sits on main frames 12,000 to 32,000");
+    assert!((audio[9_999] - 0.11999).abs() < 3e-5 && (audio[30_000] - 0.32).abs() < 3e-5);
+
+    // Taking the early cut back gives the main track 2,000 frames more before the guest. The
+    // guest moves with the audio it was laid on.
+    edit::revert(&fx.paths, &WriteOpts::default(), &me(), &Revert::Edits(vec![early])).unwrap();
+    let audio = fx.render(4096);
+    assert_eq!(audio.len(), 48_000);
+    assert!(all_near(&audio[12_000..32_000], 0.12) && (audio[11_999] - 0.11999).abs() < 3e-5);
+
+    // A cut across the guest's start removes the same moment from both.
+    fx.apply(vec![cut(11_000, 13_000, 0)]);
+    let audio = fx.render(4096);
+    assert_eq!(audio.len(), 46_000);
+    assert!(all_near(&audio[11_000..30_000], 0.12) && (audio[10_999] - 0.10999).abs() < 3e-5 && (audio[30_000] - 0.32).abs() < 3e-5);
+    // A cut with a crossfade fades every track across the join together, so the sum holds.
+    fx.apply(vec![cut(20_000, 21_000, 240)]);
+    assert!(all_near(&fx.render(4096)[11_000..29_000], 0.12));
+    // Where the guest is now, as the timeline reports it.
+    let tl = Timeline::build(&fx.project()).unwrap();
+    let guest = tl.find_track("guest").unwrap();
+    assert_eq!(tl.clips(guest).into_iter().map(|(_, ranges)| ranges).collect::<Vec<_>>(), vec![vec![(11_000, 29_000)]]);
+    // Undo, twice, brings the audio back as it was.
+    edit::undo(&fx.paths, &WriteOpts::default(), 2).unwrap();
+    assert!(all_near(&fx.render(4096)[12_000..32_000], 0.12));
+}
+
+#[test]
+fn a_file_past_the_end_and_an_insert_on_a_track_make_time_for_every_track() {
+    let fx = Fixture::with(10_000, 1, |_, _, _| 0.25);
+    write_wav(&fx.root.join("a.wav"), RATE, 1, 24, 2_000, |_, _| 0.125);
+    write_wav(&fx.root.join("b.wav"), RATE, 1, 24, 3_000, |_, _| 0.0625);
+    // A file laid over the last 1,000 frames runs 1,000 past the end: the timeline grows.
+    let added = add_track(&fx, "a.wav", "bed", 9_000);
+    assert_eq!((added.extended, added.frames_after), (1_000, 11_000));
+    let audio = fx.render(4096);
+    assert!(all_near(&audio[..9_000], 0.25) && all_near(&audio[9_000..10_000], 0.375) && all_near(&audio[10_000..], 0.125));
+
+    // An insert on the bed track is new time: silence on the main track, the file on the bed.
+    let applied = fx.apply(vec![on("bed", Request::Insert { file: fx.root.join("b.wav"), at: 5_000, crossfade: 0 })]);
+    assert_eq!((applied.frames_before, applied.frames_after), (11_000, 14_000));
+    let audio = fx.render(4096);
+    assert!(all_near(&audio[..5_000], 0.25) && all_near(&audio[5_000..8_000], 0.0625) && all_near(&audio[8_000..12_000], 0.25));
+    assert!(all_near(&audio[12_000..13_000], 0.375) && all_near(&audio[13_000..], 0.125));
+    // The bed alone, and the main track alone.
+    let project = fx.project();
+    let tl = Timeline::build(&project).unwrap();
+    let bed = tl.find_track("bed").unwrap();
+    let mut alone = Vec::new();
+    Renderer::for_track(&project, &fx.paths, tl.clone(), bed).unwrap().read(0, 14_000, &mut alone).unwrap();
+    assert!(all_near(&alone[..5_000], 0.0) && all_near(&alone[5_000..8_000], 0.0625) && all_near(&alone[8_000..12_000], 0.0) && all_near(&alone[12_000..], 0.125));
+    Renderer::for_track(&project, &fx.paths, tl, 0).unwrap().read(0, 14_000, &mut alone).unwrap();
+    assert!(all_near(&alone[..5_000], 0.25) && all_near(&alone[5_000..8_000], 0.0) && all_near(&alone[13_000..], 0.0));
+
+    // Normalize aimed at the bed measures the bed alone and changes the bed alone.
+    let applied = fx.apply(vec![on("bed", Request::Normalize { target: Target::Peak(-12.0412), ceiling_dbtp: 0.0 })]);
+    let report = applied.resolved[0].normalize.unwrap();
+    assert!((report.measured_peak_db + 18.0618).abs() < 0.01 && (report.gain_db - 6.02).abs() < 0.011, "{report:?}");
+    let audio = fx.render(4096);
+    assert!(all_near(&audio[..5_000], 0.25) && audio[13_000..].iter().all(|s| (s - 0.25).abs() < 1e-3));
+
+    // Removing the track takes its audio out and leaves time alone; undo puts it back.
+    edit::track_remove(&fx.paths, &WriteOpts::default(), &me(), "bed").unwrap();
+    let audio = fx.render(4096);
+    assert_eq!(audio.len(), 14_000);
+    assert!(all_near(&audio[5_000..8_000], 0.0) && all_near(&audio[8_000..13_000], 0.25) && all_near(&audio[13_000..], 0.0));
+    assert!(Timeline::build(&fx.project()).unwrap().find_track("bed").is_none());
+    edit::undo(&fx.paths, &WriteOpts::default(), 1).unwrap();
+    assert!(Timeline::build(&fx.project()).unwrap().find_track("bed").is_some());
+}
+
+#[test]
+fn track_mistakes_are_refused_with_a_reason() {
+    let fx = Fixture::with(10_000, 1, |_, _, _| 0.25);
+    write_wav(&fx.root.join("a.wav"), RATE, 1, 24, 2_000, |_, _| 0.125);
+    add_track(&fx, "a.wav", "bed", 0);
+    let opts = WriteOpts::default();
+    let code = |e: scrubr_core::Error| (e.exit_code(), e.code().to_string());
+    let request = |r: Request| edit::apply(&fx.paths, &opts, &me(), false, |_, _| Ok((vec![r], None))).map(|_| ());
+    assert_eq!(code(request(on("nope", Request::Gain { db: 1.0, range: None })).unwrap_err()), (1, "unknown_track".into()));
+    assert_eq!(code(request(on("bed", cut(0, 100, 0))).unwrap_err()), (1, "track_not_allowed".into()));
+    assert_eq!(code(edit::track_add(&fx.paths, &opts, &me(), &fx.root.join("a.wav"), Some("bed"), None, 0).unwrap_err()), (1, "track_exists".into()));
+    assert_eq!(code(edit::track_add(&fx.paths, &opts, &me(), &fx.root.join("a.wav"), None, Some("main"), 0).unwrap_err()), (1, "main_track".into()));
+    assert_eq!(code(edit::track_add(&fx.paths, &opts, &me(), &fx.root.join("a.wav"), Some("late"), None, 10_001).unwrap_err()), (1, "range_out_of_bounds".into()));
+    assert_eq!(code(edit::track_remove(&fx.paths, &opts, &me(), "t1").unwrap_err()), (1, "main_track".into()));
+    assert_eq!(code(edit::track_set(&fx.paths, &opts, &me(), "bed", &edit::TrackChange { pan: Some(2.0), ..Default::default() }).unwrap_err()), (1, "bad_pan".into()));
+    assert_eq!(code(edit::track_set(&fx.paths, &opts, &me(), "bed", &edit::TrackChange::default()).unwrap_err()), (1, "no_operations".into()));
+    assert_eq!(code(edit::track_set(&fx.paths, &opts, &me(), "bed", &edit::TrackChange { name: Some("main".into()), ..Default::default() }).unwrap_err()), (1, "track_exists".into()));
+    // None of those wrote anything, and a second file can join the track that is there.
+    assert_eq!(fx.project().version, 2);
+    let added = edit::track_add(&fx.paths, &opts, &me(), &fx.root.join("a.wav"), None, Some("bed"), 4_000).unwrap().value;
+    assert!(!added.created && added.track.id == "t2");
+    let audio = fx.render(4096);
+    assert!(all_near(&audio[..2_000], 0.375) && all_near(&audio[2_000..4_000], 0.25) && all_near(&audio[4_000..6_000], 0.375));
+    // A file from a newer scrubr is refused, not misread.
+    let newer = fx.project().to_json().replacen("\"format\": 2", "\"format\": 3", 1);
+    assert!(Project::parse(&newer, Path::new("p.scrubr")).unwrap_err().to_string().contains("format 3"));
 }

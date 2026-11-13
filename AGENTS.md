@@ -54,6 +54,9 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr fade P in 0.5s` / `fade P out 2s` / `fade P in --range R` | Fade in from the start, out to the end, or across a range |
 | `scrubr normalize P --lufs -16 [--ceiling -1]` / `--peak -1dB` | Set loudness or peak |
 | `scrubr insert P sting.wav --at 0` | Insert a file at a position (`--at end` appends) |
+| `scrubr track P add guest.wav [--name N] [--at T]` | Lay a file on a new track. Nothing on the timeline moves. `--track T` adds it to a track that is there |
+| `scrubr track P set T [--gain -3dB] [--pan -0.3] [--mute\|--unmute] [--solo\|--unsolo] [--name N]` | A track's level, pan, mute and solo in the mix |
+| `scrubr track P list` / `track P rm T` | Tracks and where their audio sits now; take a track out |
 | `scrubr apply P --ops ops.json` | Several operations as one edit. `--ops -` reads stdin |
 | `scrubr undo P` / `redo P` | Move head back or forward one edit (`--steps N`) |
 | `scrubr undo P --edit e3` / `--of-session s7` | Take out specific edits, or a whole session, from anywhere in the log |
@@ -63,8 +66,9 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr open P` | Open the project in the window, for the person to review. Returns at once |
 
 Edit commands (`cut` to `redo`, and `label add`/`rm`) accept `--dry-run`, `--if-version N`,
-`--author` and `--session`. `scrubr open` needs the window's program, `scrubr-gui`, beside
-`scrubr`; without it the reply is `gui_not_found`. Not in this build: MP3 export.
+`--author` and `--session`, and so do `track add`, `set` and `rm`. `scrubr open` needs the
+window's program, `scrubr-gui`, beside `scrubr`; without it the reply is `gui_not_found`. Not in
+this build: MP3 export.
 
 ## Batches
 
@@ -88,6 +92,30 @@ all the ranges from one `analyze` reply and cut them in one `apply`; do not shif
 allow for earlier cuts. Outside a batch each command sees the timeline the previous one left, so
 positions after a cut move earlier by its length. A batch is one edit and one undo step.
 `normalize` in a batch measures the audio as the operations before it leave it.
+
+## Tracks
+
+A project has a main track, `main`, whose audio is the timeline, and any number of other tracks
+laid over it: a second microphone, a music bed. Export and playback are the mix of them all. Name
+a track by its name or its id (`t2`).
+
+- **Time is shared.** `cut`, `keep` and `insert` act on every track, so tracks stay in step.
+  Nothing cuts one track alone. To silence one track over a range and keep its length, use
+  `mute R --track T`.
+- **Level is per track.** `gain`, `fade`, `mute` and `normalize` take `--track T` and then change
+  that track alone; without it they change every track. `normalize --track T` measures that track
+  alone. In a batch, add `"track": "guest"` to the operation.
+- **Adding audio.** `track add` lays a file over the timeline and moves nothing. A file that runs
+  past the end makes the timeline longer, with silence on the other tracks.
+  `insert --track T` is new time: the file on that track and silence on the others.
+- **The mix.** `track set` gives a track a level, a pan from -1 (left) to 1 (right), mute and
+  solo. At pan 0 a track is untouched; moving to one side turns the other side down. These are
+  edits like any other: they are in `history` and can be undone.
+- **Measuring one track.** `analyze`, `render`, `transcribe` and `export` take `--track T` and
+  then work on that track heard alone, at its own level and pan, whatever is muted or soloed.
+  With a microphone on each track, `transcribe --track T` gives one speaker's words.
+- **The window** shows a lane for each track, with its mute, solo, level and pan. The person
+  can change those there, and each change is an edit in `history` under their name.
 
 ## What edits do
 

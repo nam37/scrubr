@@ -12,10 +12,11 @@ use scrubr_core::export::{self, Depth};
 use scrubr_core::image;
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts, Written};
 use scrubr_core::render::Renderer;
+use scrubr_core::timeline::TrackState;
 use scrubr_core::{Error, Result, Timeline};
 
 use crate::time::{self, Scale, range_text, seconds, timecode};
-use crate::{Direction, EditOpts, LabelAction, Reply, ops};
+use crate::{Direction, EditOpts, LabelAction, Reply, TrackAction, ops};
 
 fn non_empty(value: &Option<String>) -> Option<String> {
     value.as_ref().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
@@ -39,6 +40,30 @@ fn crossfade(text: &Option<String>, rate: u32) -> Result<u32> {
     match text {
         Some(text) => Ok(time::parse_duration(text, rate)?.min(u32::MAX as u64) as u32),
         None => Ok((DEFAULT_CROSSFADE_MS / 1000.0 * rate as f64).round() as u32),
+    }
+}
+
+/// The request, aimed at one track when one is named.
+fn aimed(track: &Option<String>, request: Request) -> Request {
+    match track {
+        Some(track) => Request::OnTrack { track: track.clone(), request: Box::new(request) },
+        None => request,
+    }
+}
+
+/// " on track guest" for a description, or nothing.
+fn on_track(track: &Option<String>) -> String {
+    track.as_ref().map_or(String::new(), |t| format!(" on track {t}"))
+}
+
+/// The index of the track a command named, for hearing it alone.
+fn alone(paths: &Paths, tl: &Timeline, track: &Option<String>) -> Result<Option<usize>> {
+    match track {
+        None => Ok(None),
+        Some(key) => tl
+            .find_track(key)
+            .map(Some)
+            .ok_or_else(|| Error::usage("unknown_track", format!("There is no track {key}.")).hint(format!("Run `scrubr track {} list` to see the tracks.", paths.shown.display()))),
     }
 }
 
@@ -96,6 +121,9 @@ fn sources_json(project: &Project) -> Value {
         .sources
         .iter()
         .map(|s| {
+            if s.silence {
+                return json!({ "id": s.id, "silence": true, "seconds": seconds(s.frames, project.sample_rate), "frames": s.frames });
+            }
             json!({
                 "id": s.id,
                 "path": s.path,
@@ -161,7 +189,14 @@ pub fn info(project: &Path) -> Result<Reply> {
         tl.segs().len(),
         if tl.segs().len() == 1 { "" } else { "s" },
     );
-    for s in &p.sources {
+    for s in p.sources.iter().filter(|s| s.silence) {
+        text.push_str(&format!("  {}  (silence)  {}\n", s.id, timecode(s.frames, rate)));
+    }
+    let live: Vec<&TrackState> = tl.tracks().iter().filter(|t| !t.removed).collect();
+    if live.len() > 1 {
+        text.push_str(&format!("tracks: {}\n", live.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    for s in p.sources.iter().filter(|s| !s.silence) {
         text.push_str(&format!(
             "  {}  {}  {}  {} Hz {} ch {}-bit{}\n",
             s.id,
@@ -185,6 +220,7 @@ pub fn info(project: &Path) -> Result<Reply> {
         "labels": p.labels.len(),
         "segments": tl.segs().len(),
         "gain_db": round2(tl.global_gain_db()),
+        "tracks": live.iter().map(|t| json!({ "id": t.id, "name": t.name })).collect::<Vec<_>>(),
         "sources": sources_json(&p),
     });
     Ok(Reply::new(Some(p.version), fields, text))
@@ -247,11 +283,22 @@ pub fn history(project: &Path) -> Result<Reply> {
 
 // ---- analyze, render, export -----------------------------------------------------------------
 
-pub fn analyze(project: &Path, loudness: bool, peaks: bool, silence: Option<String>, envelope: Option<String>, quietest: Vec<String>, range: Option<String>) -> Result<Reply> {
+#[allow(clippy::too_many_arguments)]
+pub fn analyze(
+    project: &Path,
+    loudness: bool,
+    peaks: bool,
+    silence: Option<String>,
+    envelope: Option<String>,
+    quietest: Vec<String>,
+    range: Option<String>,
+    track: Option<String>,
+) -> Result<Reply> {
     let paths = Paths::new(project);
     let p = project::open(&paths)?;
     let rate = p.sample_rate;
-    let mut renderer = Renderer::new(&p, &paths)?;
+    let only = alone(&paths, &Timeline::build(&p)?, &track)?;
+    let mut renderer = Renderer::of(&p, &paths, only)?;
     let total = renderer.total();
     let scale = Scale { rate, total };
     let (t0, t1) = match &range {
@@ -292,6 +339,10 @@ pub fn analyze(project: &Path, loudness: bool, peaks: bool, silence: Option<Stri
     let mut fields = Map::new();
     let mut text = format!("timeline {}", timecode(total, rate));
     fields.insert("timeline_seconds".into(), json!(seconds(total, rate)));
+    if let Some(track) = &track {
+        fields.insert("track".into(), json!(track));
+        text.push_str(&format!(", track {track} alone"));
+    }
     if range.is_some() {
         fields.insert("range".into(), json!({ "start": seconds(t0, rate), "end": seconds(t1, rate) }));
         text.push_str(&format!(", measured {}", range_text((t0, t1), rate)));
@@ -355,13 +406,14 @@ pub fn analyze(project: &Path, loudness: bool, peaks: bool, silence: Option<Stri
     Ok(Reply { version: Some(p.version), fields, text })
 }
 
-pub fn render(project: &Path, png: &Path, range: Option<String>, width: u32, height: u32) -> Result<Reply> {
+pub fn render(project: &Path, png: &Path, range: Option<String>, width: u32, height: u32, track: Option<String>) -> Result<Reply> {
     let paths = Paths::new(project);
     let p = project::open(&paths)?;
     let rate = p.sample_rate;
     let tl = Timeline::build(&p)?;
     let range = range.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?;
-    let report = image::render_png(&p, &paths, png, &image::Options { width, height, range })?;
+    let only = alone(&paths, &tl, &track)?;
+    let report = image::render_png(&p, &paths, png, &image::Options { width, height, range, track: only })?;
     let seconds_per_pixel = report.frames_per_pixel / rate as f64;
     let text = format!(
         "Wrote {} ({}x{}): {}, {:.6} s per pixel.",
@@ -384,7 +436,7 @@ pub fn render(project: &Path, png: &Path, range: Option<String>, width: u32, hei
     Ok(Reply::new(Some(p.version), fields, text))
 }
 
-pub fn export(project: &Path, out: &Path, bits: Option<String>, range: Option<String>) -> Result<Reply> {
+pub fn export(project: &Path, out: &Path, bits: Option<String>, range: Option<String>, track: Option<String>) -> Result<Reply> {
     let paths = Paths::new(project);
     let p = project::open(&paths)?;
     let rate = p.sample_rate;
@@ -398,7 +450,8 @@ pub fn export(project: &Path, out: &Path, bits: Option<String>, range: Option<St
     };
     let tl = Timeline::build(&p)?;
     let range = range.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?;
-    let report = export::export(&p, &paths, out, &export::Options { depth, range, progress: None })?;
+    let only = alone(&paths, &tl, &track)?;
+    let report = export::export(&p, &paths, out, &export::Options { depth, range, progress: None, track: only })?;
     let (bits, float) = match report.depth {
         Depth::Int(bits) => (bits, false),
         Depth::Float => (32, true),
@@ -457,47 +510,49 @@ pub fn cut(project: &Path, range: &str, xf: Option<String>, opts: &EditOpts, kee
     Ok(finish(written, fields, text))
 }
 
-pub fn mute(project: &Path, range: &str, xf: Option<String>, opts: &EditOpts) -> Result<Reply> {
+pub fn mute(project: &Path, range: &str, xf: Option<String>, track: Option<String>, opts: &EditOpts) -> Result<Reply> {
     let paths = Paths::new(project);
     let mut asked = (0, 0);
     let mut xf_frames = 0;
     let written = edit::apply(&paths, &write_opts(opts), &who(&opts.author, &opts.session), false, |p, tl| {
         asked = time::parse_range(range, scale(p, tl))?;
         xf_frames = crossfade(&xf, p.sample_rate)?;
-        Ok((vec![Request::Mute { range: asked, crossfade: xf_frames }], Some(format!("mute {}", range_text(asked, p.sample_rate)))))
+        Ok((vec![aimed(&track, Request::Mute { range: asked, crossfade: xf_frames })], Some(format!("mute {}{}", range_text(asked, p.sample_rate), on_track(&track)))))
     })?;
     let rate = written.value.sample_rate;
     let (mut fields, tail) = edit_reply(&written, "mute");
+    fields.insert("track".into(), json!(track));
     fields.insert("range".into(), json!({ "start": seconds(asked.0, rate), "end": seconds(asked.1, rate) }));
     fields.insert("muted_seconds".into(), json!(seconds(written.value.resolved[0].frames, rate)));
     fields.insert("crossfade_ms".into(), json!(ms(xf_frames, rate)));
     fields.insert("source_spans".into(), spans_of(&written.value.resolved[0].op).unwrap_or(Value::Null));
-    let text = format!("mute {}. {tail}", range_text(asked, rate));
+    let text = format!("mute {}{}. {tail}", range_text(asked, rate), on_track(&track));
     Ok(finish(written, fields, text))
 }
 
-pub fn gain(project: &Path, db: &str, range: Option<String>, opts: &EditOpts) -> Result<Reply> {
+pub fn gain(project: &Path, db: &str, range: Option<String>, track: Option<String>, opts: &EditOpts) -> Result<Reply> {
     let paths = Paths::new(project);
     let db = time::parse_db(db)?;
     let mut asked = None;
     let written = edit::apply(&paths, &write_opts(opts), &who(&opts.author, &opts.session), false, |p, tl| {
         asked = range.as_deref().map(|text| time::parse_range(text, scale(p, tl))).transpose()?;
         let over = asked.map_or("whole timeline".to_string(), |r| range_text(r, p.sample_rate));
-        Ok((vec![Request::Gain { db, range: asked }], Some(format!("gain {db:+} dB {over}"))))
+        Ok((vec![aimed(&track, Request::Gain { db, range: asked })], Some(format!("gain {db:+} dB {over}{}", on_track(&track)))))
     })?;
     let rate = written.value.sample_rate;
     let (mut fields, tail) = edit_reply(&written, "gain");
+    fields.insert("track".into(), json!(track));
     fields.insert("gain_db".into(), json!(db));
     fields.insert("range".into(), asked.map_or(Value::Null, |r| json!({ "start": seconds(r.0, rate), "end": seconds(r.1, rate) })));
     if let Some(spans) = spans_of(&written.value.resolved[0].op) {
         fields.insert("source_spans".into(), spans);
     }
     let over = asked.map_or("the whole timeline".to_string(), |r| range_text(r, rate));
-    let text = format!("gain {db:+} dB over {over}. {tail}");
+    let text = format!("gain {db:+} dB over {over}{}. {tail}", on_track(&track));
     Ok(finish(written, fields, text))
 }
 
-pub fn fade(project: &Path, direction: Direction, length: Option<String>, range: Option<String>, opts: &EditOpts) -> Result<Reply> {
+pub fn fade(project: &Path, direction: Direction, length: Option<String>, range: Option<String>, track: Option<String>, opts: &EditOpts) -> Result<Reply> {
     let paths = Paths::new(project);
     let dir = if direction == Direction::In { FadeDir::In } else { FadeDir::Out };
     let name = if dir == FadeDir::In { "in" } else { "out" };
@@ -512,15 +567,16 @@ pub fn fade(project: &Path, direction: Direction, length: Option<String>, range:
                     .hint("For example `scrubr fade <project> in 0.5s`, or `scrubr fade <project> out --range 58:00..58:10`."));
             }
         };
-        Ok((vec![Request::Fade { dir, range: asked }], Some(format!("fade {name} {}", range_text(asked, p.sample_rate)))))
+        Ok((vec![aimed(&track, Request::Fade { dir, range: asked })], Some(format!("fade {name} {}{}", range_text(asked, p.sample_rate), on_track(&track)))))
     })?;
     let rate = written.value.sample_rate;
     let (mut fields, tail) = edit_reply(&written, "fade");
+    fields.insert("track".into(), json!(track));
     fields.insert("direction".into(), json!(name));
     fields.insert("range".into(), json!({ "start": seconds(asked.0, rate), "end": seconds(asked.1, rate) }));
     fields.insert("fade_seconds".into(), json!(seconds(asked.1 - asked.0, rate)));
     fields.insert("source_spans".into(), spans_of(&written.value.resolved[0].op).unwrap_or(Value::Null));
-    let text = format!("fade {name} over {}. {tail}", range_text(asked, rate));
+    let text = format!("fade {name} over {}{}. {tail}", range_text(asked, rate), on_track(&track));
     Ok(finish(written, fields, text))
 }
 
@@ -557,7 +613,7 @@ fn normalize_text(report: &NormalizeReport) -> String {
     format!("normalize: {:+.2} dB, {reached}, true peak {:.2} dBTP.{limit}", report.gain_db, report.achieved_true_peak_dbtp())
 }
 
-pub fn normalize(project: &Path, lufs: Option<String>, peak: Option<String>, ceiling: Option<String>, opts: &EditOpts) -> Result<Reply> {
+pub fn normalize(project: &Path, lufs: Option<String>, peak: Option<String>, ceiling: Option<String>, track: Option<String>, opts: &EditOpts) -> Result<Reply> {
     let paths = Paths::new(project);
     let target = match (&lufs, &peak) {
         (Some(lufs), None) => Target::Lufs(time::parse_db(lufs)?),
@@ -569,20 +625,21 @@ pub fn normalize(project: &Path, lufs: Option<String>, peak: Option<String>, cei
     };
     let ceiling_dbtp = ceiling.as_deref().map(time::parse_db).transpose()?.unwrap_or(DEFAULT_CEILING_DBTP);
     let desc = match target {
-        Target::Lufs(lufs) => format!("normalize {lufs} LUFS"),
-        Target::Peak(peak) => format!("normalize peak {peak} dBFS"),
+        Target::Lufs(lufs) => format!("normalize {lufs} LUFS{}", on_track(&track)),
+        Target::Peak(peak) => format!("normalize peak {peak} dBFS{}", on_track(&track)),
     };
     let written = edit::apply(&paths, &write_opts(opts), &who(&opts.author, &opts.session), false, |_, _| {
-        Ok((vec![Request::Normalize { target, ceiling_dbtp }], Some(desc)))
+        Ok((vec![aimed(&track, Request::Normalize { target, ceiling_dbtp })], Some(desc)))
     })?;
     let report = written.value.resolved[0].normalize.expect("normalize reports what it measured");
     let (mut fields, tail) = edit_reply(&written, "normalize");
+    fields.insert("track".into(), json!(track));
     fields.extend(normalize_fields(&report));
-    let text = format!("{} {tail}", normalize_text(&report));
+    let text = format!("{}{} {tail}", normalize_text(&report), track.as_ref().map_or(String::new(), |t| format!(" Track {t} alone was measured and changed.")));
     Ok(finish(written, fields, text))
 }
 
-pub fn insert(project: &Path, file: &Path, at: &str, xf: Option<String>, opts: &EditOpts) -> Result<Reply> {
+pub fn insert(project: &Path, file: &Path, at: &str, xf: Option<String>, track: Option<String>, opts: &EditOpts) -> Result<Reply> {
     let paths = Paths::new(project);
     let mut position = 0;
     let mut xf_frames = 0;
@@ -590,17 +647,18 @@ pub fn insert(project: &Path, file: &Path, at: &str, xf: Option<String>, opts: &
     let written = edit::apply(&paths, &write_opts(opts), &who(&opts.author, &opts.session), false, |p, tl| {
         position = time::parse_position(at, scale(p, tl))?;
         xf_frames = crossfade(&xf, p.sample_rate)?;
-        let request = Request::Insert { file: file.to_path_buf(), at: position, crossfade: xf_frames };
-        Ok((vec![request], Some(format!("insert {name} at {}", timecode(position, p.sample_rate)))))
+        let request = aimed(&track, Request::Insert { file: file.to_path_buf(), at: position, crossfade: xf_frames });
+        Ok((vec![request], Some(format!("insert {name} at {}{}", timecode(position, p.sample_rate), on_track(&track)))))
     })?;
     let rate = written.value.sample_rate;
     let resolved = &written.value.resolved[0];
     let (mut fields, tail) = edit_reply(&written, "insert");
+    fields.insert("track".into(), json!(track));
     fields.insert("source".into(), json!(resolved.new_source));
     fields.insert("at".into(), json!(seconds(position, rate)));
     fields.insert("inserted_seconds".into(), json!(seconds(resolved.frames, rate)));
     fields.insert("crossfade_ms".into(), json!(ms(xf_frames, rate)));
-    let text = format!("insert {name} at {}: added {}. {tail}", timecode(position, rate), timecode(resolved.frames, rate));
+    let text = format!("insert {name} at {}{}: added {}. {tail}", timecode(position, rate), on_track(&track), timecode(resolved.frames, rate));
     Ok(finish(written, fields, text))
 }
 
@@ -768,6 +826,147 @@ pub fn label(project: &Path, action: LabelAction) -> Result<Reply> {
     }
 }
 
+// ---- tracks ----------------------------------------------------------------------------------
+
+/// A track for a reply, and the line that lists it. `clips` gives where its audio sits now.
+fn track_json(t: &TrackState, p: &Project, tl: &Timeline, clips: bool) -> (Value, String) {
+    let rate = p.sample_rate;
+    let main = t.id == project::MAIN_TRACK;
+    let mut fields = Map::new();
+    fields.insert("id".into(), json!(t.id));
+    fields.insert("name".into(), json!(t.name));
+    fields.insert("main".into(), json!(main));
+    fields.insert("gain_db".into(), json!(t.gain_db));
+    fields.insert("pan".into(), json!(t.pan));
+    fields.insert("mute".into(), json!(t.mute));
+    fields.insert("solo".into(), json!(t.solo));
+    let mut mix = vec![format!("{:+} dB", t.gain_db)];
+    if t.pan != 0.0 {
+        mix.push(format!("pan {} {}", t.pan.abs(), if t.pan < 0.0 { "left" } else { "right" }));
+    }
+    if t.mute {
+        mix.push("muted".into());
+    }
+    if t.solo {
+        mix.push("solo".into());
+    }
+    let mut text = format!("{:<4}  {:<16}  {}", t.id, t.name, mix.join(", "));
+    if main {
+        text.push_str("  (the timeline's own audio)");
+    }
+    if clips && let Some(index) = tl.tracks().iter().position(|x| x.id == t.id) {
+        let mut list = Vec::new();
+        for (clip, ranges) in tl.clips(index) {
+            let source = &p.sources[clip];
+            let heard: u64 = ranges.iter().map(|r| r.1 - r.0).sum();
+            list.push(json!({ "source": source.id, "file": source.path, "seconds": seconds(heard, rate), "ranges": ranges_json(&ranges, rate) }));
+            let at = ranges.iter().map(|&r| range_text(r, rate)).collect::<Vec<_>>().join(", ");
+            text.push_str(&format!("\n      {}  {}  {}", source.id, source.path, if at.is_empty() { "not on the timeline now".to_string() } else { at }));
+        }
+        fields.insert("clips".into(), Value::Array(list));
+    }
+    (Value::Object(fields), text)
+}
+
+/// The end of an edit command's text: the edit and version, or that nothing was written.
+fn wrote_tail(wrote: bool, edit: &str, version: u64) -> String {
+    if wrote { format!("Edit {edit}, version {version}.") } else { format!("Dry run: nothing was written (version {version}).") }
+}
+
+/// A pan from the command line: a number from -1 to 1.
+fn parse_pan(text: &str) -> Result<f64> {
+    text.trim().replace('\u{2212}', "-").parse::<f64>().map_err(|_| {
+        Error::usage("bad_pan", format!("Cannot read \"{text}\" as a pan.")).hint("Pan runs from -1, full left, to 1, full right. Use a number such as -0.3, 0 or 0.5.")
+    })
+}
+
+pub fn track(project: &Path, action: TrackAction) -> Result<Reply> {
+    let paths = Paths::new(project);
+    match action {
+        TrackAction::List => {
+            let p = project::open(&paths)?;
+            let tl = Timeline::build(&p)?;
+            let (list, lines): (Vec<Value>, Vec<String>) = tl.tracks().iter().filter(|t| !t.removed).map(|t| track_json(t, &p, &tl, true)).unzip();
+            Ok(Reply::new(Some(p.version), json!({ "timeline_seconds": seconds(tl.total(), p.sample_rate), "tracks": list }), lines.join("\n")))
+        }
+        TrackAction::Add { file, name, track, at, edit } => {
+            // The position is read against the timeline the write sees, under its lock.
+            let p = project::open(&paths)?;
+            let tl = Timeline::build(&p)?;
+            let position = match &at {
+                Some(at) => time::parse_position(at, scale(&p, &tl))?,
+                None => 0,
+            };
+            let opts = WriteOpts { if_version: write_opts(&edit).if_version.or(Some(p.version)), ..write_opts(&edit) };
+            let written = edit::track_add(&paths, &opts, &who(&edit.author, &edit.session), &file, name.as_deref(), track.as_deref(), position)?;
+            let a = &written.value;
+            let p = project::open(&paths)?;
+            let rate = a.sample_rate;
+            let mut fields = Map::new();
+            if !written.wrote {
+                fields.insert("dry_run".into(), json!(true));
+            }
+            fields.insert("edit".into(), json!(a.edit));
+            fields.insert("op".into(), json!("track_add"));
+            fields.insert("track".into(), json!({ "id": a.track.id, "name": a.track.name, "created": a.created }));
+            fields.insert("source".into(), json!(a.source));
+            fields.insert("at".into(), json!(seconds(a.at, rate)));
+            fields.insert("seconds".into(), json!(seconds(a.frames, rate)));
+            fields.insert("extended_seconds".into(), json!(seconds(a.extended, rate)));
+            fields.insert("timeline_seconds".into(), json!(seconds(a.frames_after, rate)));
+            fields.insert("timeline_seconds_before".into(), json!(seconds(a.frames_before, rate)));
+            let name = file.file_name().unwrap_or_default().to_string_lossy();
+            let grew = if a.extended > 0 { format!(" The timeline grew by {} to {}.", timecode(a.extended, rate), timecode(a.frames_after, rate)) } else { String::new() };
+            let text = format!(
+                "{} track {} ({}): {name} at {}, {} long.{grew} {}",
+                if a.created { "Added" } else { "Added to" },
+                a.track.name,
+                a.track.id,
+                timecode(a.at, rate),
+                timecode(a.frames, rate),
+                wrote_tail(written.wrote, &a.edit, written.version)
+            );
+            let _ = p;
+            Ok(Reply { version: Some(written.version), fields, text })
+        }
+        TrackAction::Set { track, gain, pan, mute, unmute, solo, unsolo, name, edit } => {
+            let change = edit::TrackChange {
+                name,
+                gain_db: gain.as_deref().map(time::parse_db).transpose()?,
+                pan: pan.as_deref().map(parse_pan).transpose()?,
+                mute: if mute { Some(true) } else if unmute { Some(false) } else { None },
+                solo: if solo { Some(true) } else if unsolo { Some(false) } else { None },
+            };
+            let written = edit::track_set(&paths, &write_opts(&edit), &who(&edit.author, &edit.session), &track, &change)?;
+            let p = project::open(&paths)?;
+            let tl = Timeline::build(&p)?;
+            let (id, state) = &written.value;
+            let (json_track, line) = track_json(state, &p, &tl, false);
+            let mut fields = Map::new();
+            if !written.wrote {
+                fields.insert("dry_run".into(), json!(true));
+            }
+            fields.insert("edit".into(), json!(id));
+            fields.insert("op".into(), json!("track_set"));
+            fields.insert("track".into(), json_track);
+            Ok(Reply { version: Some(written.version), fields, text: format!("{line}\n{}", wrote_tail(written.wrote, id, written.version)) })
+        }
+        TrackAction::Rm { track, edit } => {
+            let written = edit::track_remove(&paths, &write_opts(&edit), &who(&edit.author, &edit.session), &track)?;
+            let (id, state) = &written.value;
+            let mut fields = Map::new();
+            if !written.wrote {
+                fields.insert("dry_run".into(), json!(true));
+            }
+            fields.insert("edit".into(), json!(id));
+            fields.insert("op".into(), json!("track_rm"));
+            fields.insert("track".into(), json!({ "id": state.id, "name": state.name }));
+            let text = format!("Removed track {} ({}). Its audio is out of the mix; the timeline's length is unchanged. {}", state.name, state.id, wrote_tail(written.wrote, id, written.version));
+            Ok(Reply { version: Some(written.version), fields, text })
+        }
+    }
+}
+
 // ---- the window ------------------------------------------------------------------------------
 
 /// The window is its own program, `scrubr-gui`, kept beside this one. `SCRUBR_GUI` names another.
@@ -839,7 +1038,7 @@ fn open_with(project: Option<&Path>, gui: &Path) -> Result<Reply> {
 }
 
 #[cfg(not(feature = "transcribe"))]
-pub fn transcribe(project: Option<&Path>, _model: Option<String>, _range: Option<String>, _fetch_model: Option<String>) -> Result<Reply> {
+pub fn transcribe(project: Option<&Path>, _model: Option<String>, _range: Option<String>, _fetch_model: Option<String>, _track: Option<String>) -> Result<Reply> {
     // Make sure the project is real before talking about features, so a wrong path reads as one.
     if let Some(project) = project {
         project::open(&Paths::new(project))?;
@@ -849,7 +1048,7 @@ pub fn transcribe(project: Option<&Path>, _model: Option<String>, _range: Option
 }
 
 #[cfg(feature = "transcribe")]
-pub fn transcribe(project: Option<&Path>, model: Option<String>, range: Option<String>, fetch_model: Option<String>) -> Result<Reply> {
+pub fn transcribe(project: Option<&Path>, model: Option<String>, range: Option<String>, fetch_model: Option<String>, track: Option<String>) -> Result<Reply> {
     use scrubr_core::transcribe::{self as speech, Engine, whisper};
 
     if let Some(name) = fetch_model {
@@ -870,7 +1069,8 @@ pub fn transcribe(project: Option<&Path>, model: Option<String>, range: Option<S
     let mut engine = whisper::Whisper::load(&name)?;
     let began = std::time::Instant::now();
     // Progress goes to stderr, so stdout stays one JSON reply.
-    let words = speech::transcribe(&p, &paths, range, &mut engine, &mut |done, total| {
+    let only = alone(&paths, &tl, &track)?;
+    let words = speech::transcribe_track(&p, &paths, only, range, &mut engine, &mut |done, total| {
         eprintln!("transcribe: {} of {}", timecode(done, rate), timecode(total, rate));
     })?;
     let took = began.elapsed().as_secs_f64();
@@ -916,12 +1116,12 @@ mod tests {
         let text = new(&project, std::slice::from_ref(&wav), false, None, None).unwrap().text;
         assert!(text.starts_with("Created ") && text.contains("from 1 file: 0:04.000 at 48000 Hz, 2 channels.") && text.ends_with("Version 1."), "{text}");
         assert_eq!(cut(&project, "0.5..1", None, &opts(false), false).unwrap().text, "cut 0:00.500..0:01.000: removed 0:00.500. Timeline 0:04.000 -> 0:03.500. Edit e2, version 2.");
-        assert_eq!(gain(&project, "-3dB", None, &opts(false)).unwrap().text, "gain -3 dB over the whole timeline. Timeline 0:03.500. Edit e3, version 3.");
+        assert_eq!(gain(&project, "-3dB", None, None, &opts(false)).unwrap().text, "gain -3 dB over the whole timeline. Timeline 0:03.500. Edit e3, version 3.");
         assert_eq!(
-            fade(&project, Direction::Out, Some("0.5s".into()), None, &opts(true)).unwrap().text,
+            fade(&project, Direction::Out, Some("0.5s".into()), None, None, &opts(true)).unwrap().text,
             "fade out over 0:03.000..0:03.500. Timeline 0:03.500. Dry run: nothing was written (version 3)."
         );
-        let text = normalize(&project, Some("-12".into()), None, None, &opts(false)).unwrap().text;
+        let text = normalize(&project, Some("-12".into()), None, None, None, &opts(false)).unwrap().text;
         assert!(text.starts_with("normalize: +") && text.contains("target -12 LUFS, reached -12.00 LUFS") && text.ends_with("Edit e4, version 4."), "{text}");
         let text = label(&project, LabelAction::Add { range: "0:02..0:03".into(), text: "check".into(), edit: opts(false) }).unwrap().text;
         assert_eq!(text, "Added label l1   0:02.000..0:03.000       check  [you]. Version 5.");
@@ -933,16 +1133,16 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[1].starts_with("e2    cut 0:00.500..0:01.000") && lines[1].contains("you/s1"), "{text}");
         assert!(lines[3].starts_with("e4    normalize -12 LUFS") && lines[3].ends_with("<- head"), "{text}");
-        let text = analyze(&project, false, false, None, None, vec!["1..3".into()], None).unwrap().text;
+        let text = analyze(&project, false, false, None, None, vec!["1..3".into()], None, None).unwrap().text;
         assert_eq!(text, "timeline 0:03.500
 quietest in 0:01.000..0:03.000: 0:02.000 (0:01.500..0:02.500, -120.0 dBFS)");
-        let text = analyze(&project, true, true, Some("-50dB:0.5s".into()), Some("1s".into()), Vec::new(), None).unwrap().text;
+        let text = analyze(&project, true, true, Some("-50dB:0.5s".into()), Some("1s".into()), Vec::new(), None, None).unwrap().text;
         assert!(text.starts_with("timeline 0:03.500\nloudness: -12.0 LUFS, true peak "), "{text}");
         assert!(text.contains("\nsilence under -50 dBFS for 0:00.500 or more: 1 ranges\n  0:01.500..0:02.500\n"), "{text}");
         assert!(text.contains("clipped samples") && text.ends_with("envelope: 4 windows of 0:01.000 (use --json for the levels)"), "{text}");
         let text = undo(&project, 1, vec![], None, &opts(false)).unwrap().text;
         assert_eq!(text, "Undid e4. Head is e3. Timeline 0:03.500 -> 0:03.500. Version 6.");
-        let text = export(&project, &dir.path().join("out.wav"), None, Some("0..1".into())).unwrap().text;
+        let text = export(&project, &dir.path().join("out.wav"), None, Some("0..1".into()), None).unwrap().text;
         assert!(text.starts_with("Exported 0:01.000 to ") && text.contains("WAV 16-bit, 48000 Hz, 2 ch, 192044 bytes."), "{text}");
         let err = open_with(Some(&project), &dir.path().join("no-such-window")).unwrap_err();
         assert!(err.to_string().contains("was not found at") && err.hint_text().is_some_and(|h| h.contains("SCRUBR_GUI")), "{err}");

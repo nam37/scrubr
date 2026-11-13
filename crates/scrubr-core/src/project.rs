@@ -4,6 +4,11 @@
 //! source, so an edit keeps its meaning when an earlier edit is undone. The timeline is never
 //! stored; [`crate::timeline::Timeline`] computes it by replaying the log up to head.
 //!
+//! A project has one or more tracks that share one timeline. Time is what the main track's
+//! sources lay out: every cut, keep and insert acts on them. The audio of every other track is
+//! attached to frames of those sources, so it is cut, restored and moved with them and the
+//! tracks cannot drift apart. A stretch of time with no main audio is a silence source.
+//!
 //! Writes go through [`update`]: an OS file lock next to the project, a version check, a
 //! temporary file and a rename, so two writers cannot both pass and a killed writer leaves the
 //! previous version intact.
@@ -18,8 +23,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Kind, Result, io_at};
 
-/// The project file format this build reads and writes.
+/// The format of a project with one track, as written since the first version.
 pub const FORMAT: u32 = 1;
+
+/// The format of a project that uses tracks. A build from before tracks refuses to read it.
+pub const FORMAT_TRACKS: u32 = 2;
+
+/// The id of the main track, which every project has: the audio that lays out time.
+pub const MAIN_TRACK: &str = "t1";
 
 /// A frame range `[start, end)` in one source: `["src1", 37932000, 38251200]`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +64,17 @@ pub struct Source {
     /// converted copy in the cache folder, which is rebuilt from the file when missing.
     #[serde(default, skip_serializing_if = "is_false")]
     pub conformed: bool,
+    /// True for a stretch of time with no audio of its own: there is no file, and `path`,
+    /// `bytes`, `mtime` and `hash` are empty. It gives another track's audio time to sit on.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub silence: bool,
+}
+
+impl Source {
+    /// A stretch of silence `frames` long.
+    pub fn silence(id: String, frames: u64, sample_rate: u32, channels: u16) -> Source {
+        Source { id, path: String::new(), frames, bytes: 0, mtime: String::new(), hash: String::new(), sample_rate, channels, bits: 0, float: false, conformed: false, silence: true }
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -85,15 +107,23 @@ pub enum Op {
         #[serde(default)]
         crossfade: u32,
     },
-    /// A level change, over `spans` or, without them, over the whole timeline.
+    /// A level change, over `spans` or, without them, over the whole timeline. With `track` it
+    /// changes that track alone; without, every track.
     Gain {
         gain_db: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spans: Option<Vec<Span>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track: Option<String>,
     },
     /// A linear ramp across `spans`, taken in order: up from silence for `in`, down to it for
     /// `out`.
-    Fade { dir: FadeDir, spans: Vec<Span> },
+    Fade {
+        dir: FadeDir,
+        spans: Vec<Span>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track: Option<String>,
+    },
     /// A whole-timeline level change. `gain_db` is the gain that was resolved when the edit was
     /// made, so replaying the log never measures the timeline again.
     Normalize {
@@ -103,12 +133,16 @@ pub enum Op {
         peak_db: Option<f64>,
         gain_db: f64,
         ceiling_dbtp: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track: Option<String>,
     },
     /// Silence over `spans`, with a ramp of `crossfade` frames inside each end.
     Mute {
         spans: Vec<Span>,
         #[serde(default)]
         crossfade: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track: Option<String>,
     },
     /// Places `source`, whole, just before frame `at.1` of source `at.0`. Without `at` it goes
     /// at the end of the timeline.
@@ -119,6 +153,28 @@ pub enum Op {
         #[serde(default)]
         crossfade: u32,
     },
+    /// Adds a track: a lane of audio beside the main one. Its audio arrives with `clip`.
+    Track { track: String, name: String },
+    /// Attaches `source`, from its first frame, to the main track's frames in `at`, taken in
+    /// order. The clip is heard wherever those frames are on the timeline.
+    Clip { track: String, source: String, at: Vec<Span> },
+    /// Changes a track's name or its place in the mix. What is left out keeps its value.
+    TrackSet {
+        track: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gain_db: Option<f64>,
+        /// From -1.0, full left, to 1.0, full right.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pan: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mute: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        solo: Option<bool>,
+    },
+    /// Takes a track and its audio out of the project. Time is not changed.
+    TrackRemove { track: String },
     /// Several operations written as one edit and undone as one step.
     Batch { ops: Vec<Op> },
     /// Takes earlier edits out of the timeline without moving the edits around them.
@@ -136,6 +192,10 @@ impl Op {
             Op::Normalize { .. } => "normalize",
             Op::Mute { .. } => "mute",
             Op::Insert { .. } => "insert",
+            Op::Track { .. } => "track",
+            Op::Clip { .. } => "clip",
+            Op::TrackSet { .. } => "track_set",
+            Op::TrackRemove { .. } => "track_remove",
             Op::Batch { .. } => "batch",
             Op::Revert { .. } => "revert",
         }
@@ -145,11 +205,21 @@ impl Op {
     fn collect_sources<'a>(&'a self, out: &mut HashSet<&'a str>) {
         match self {
             Op::Import { sources } => out.extend(sources.iter().map(String::as_str)),
-            Op::Insert { source, .. } => {
+            Op::Insert { source, .. } | Op::Clip { source, .. } => {
                 out.insert(source);
             }
             Op::Batch { ops } => ops.iter().for_each(|op| op.collect_sources(out)),
             _ => {}
+        }
+    }
+
+    /// True for an operation a build from before tracks would not understand.
+    fn uses_tracks(&self) -> bool {
+        match self {
+            Op::Track { .. } | Op::Clip { .. } | Op::TrackSet { .. } | Op::TrackRemove { .. } => true,
+            Op::Gain { track, .. } | Op::Fade { track, .. } | Op::Normalize { track, .. } | Op::Mute { track, .. } => track.is_some(),
+            Op::Batch { ops } => ops.iter().any(Op::uses_tracks),
+            _ => false,
         }
     }
 }
@@ -183,7 +253,7 @@ pub struct Label {
 
 /// The last number handed out for each kind of id, so an id is never used twice even after
 /// undone edits are discarded.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ids {
     #[serde(default)]
     pub edit: u64,
@@ -191,6 +261,23 @@ pub struct Ids {
     pub source: u64,
     #[serde(default)]
     pub label: u64,
+    /// The main track is `t1`, so the first track added is `t2`.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub track: u64,
+}
+
+fn one() -> u64 {
+    1
+}
+
+fn is_one(n: &u64) -> bool {
+    *n == 1
+}
+
+impl Default for Ids {
+    fn default() -> Ids {
+        Ids { edit: 0, source: 0, label: 0, track: 1 }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -262,8 +349,8 @@ impl Project {
             Error::codec("project_invalid", format!("{} is not a readable scrubr project: {what}", path.display()))
         };
         let mut project: Project = serde_json::from_str(text).map_err(|e| invalid(e.to_string()))?;
-        if project.format != FORMAT {
-            return Err(invalid(format!("it has format {}, and this build reads format {FORMAT}", project.format))
+        if project.format == 0 || project.format > FORMAT_TRACKS {
+            return Err(invalid(format!("it has format {}, and this build reads formats up to {FORMAT_TRACKS}", project.format))
                 .hint("Open it with the scrubr version that wrote it."));
         }
         if project.sample_rate == 0 || project.channels == 0 {
@@ -349,6 +436,11 @@ impl Project {
         format!("src{}", self.ids.source)
     }
 
+    pub fn next_track_id(&mut self) -> String {
+        self.ids.track = self.ids.track.max(1) + 1;
+        format!("t{}", self.ids.track)
+    }
+
     /// The state of every edit, in log order.
     pub fn states(&self) -> Vec<EditState> {
         let mut states = vec![EditState::Undone; self.edits.len()];
@@ -387,6 +479,10 @@ impl Project {
         let keep = self.head_index().map_or(0, |i| i + 1);
         let discarded = self.edits.len() > keep;
         self.edits.truncate(keep);
+        // From the first edit that uses tracks, older builds must not read the file.
+        if op.uses_tracks() {
+            self.format = self.format.max(FORMAT_TRACKS);
+        }
         self.ids.edit += 1;
         let id = format!("e{}", self.ids.edit);
         self.edits.push(Edit {
@@ -734,7 +830,7 @@ pub fn hash_file(path: &Path) -> Result<String> {
 /// export). A source whose content changed stops the command.
 pub fn verify_sources(project: &Project, paths: &Paths, full: bool) -> Result<Vec<Refresh>> {
     let mut refreshes = Vec::new();
-    for (index, source) in project.sources.iter().enumerate() {
+    for (index, source) in project.sources.iter().enumerate().filter(|(_, s)| !s.silence) {
         let file = paths.source_file(source);
         let meta = match fs::metadata(&file) {
             Ok(meta) => meta,
@@ -798,7 +894,7 @@ mod tests {
         }"#;
         let project = Project::parse(text, Path::new("ep42.scrubr")).unwrap();
         assert_eq!(project.edits[2].op, Op::Cut { spans: vec![Span("src1".into(), 37_932_000, 38_251_200)], crossfade: 0 });
-        assert_eq!(project.ids, Ids { edit: 5, source: 1, label: 1 });
+        assert_eq!(project.ids, Ids { edit: 5, source: 1, label: 1, track: 1 });
         let again = Project::parse(&project.to_json(), Path::new("ep42.scrubr")).unwrap();
         assert_eq!(again, project);
         assert!(project.to_json().contains(r#"{"id":"e5","op":"cut","spans":[["src1",37932000,38251200]],"crossfade":0,"author":"codex","session":"s7"}"#));

@@ -125,7 +125,7 @@ pub fn parse(doc: &Value, scale: Scale) -> Result<Vec<(Request, &'static str)>> 
             Some(key) => Err(bad(index, format!("{name} has no field \"{key}\""))),
             None => Ok(()),
         };
-        out.push(match name.as_str() {
+        let (request, kind) = match name.as_str() {
             "cut" => {
                 known(&["range", "start", "end", "crossfade"])?;
                 (Request::Cut { range: need_range()?, crossfade }, "cut")
@@ -135,16 +135,16 @@ pub fn parse(doc: &Value, scale: Scale) -> Result<Vec<(Request, &'static str)>> 
                 (Request::Keep { range: need_range()?, crossfade }, "keep")
             }
             "mute" => {
-                known(&["range", "start", "end", "crossfade"])?;
+                known(&["range", "start", "end", "crossfade", "track"])?;
                 (Request::Mute { range: need_range()?, crossfade }, "mute")
             }
             "gain" => {
-                known(&["db", "range", "start", "end"])?;
+                known(&["db", "range", "start", "end", "track"])?;
                 let db = level(index, op.get("db").ok_or_else(|| bad(index, "gain needs \"db\""))?)?;
                 (Request::Gain { db, range: range(index, op, scale)? }, "gain")
             }
             "fade" => {
-                known(&["dir", "length", "range", "start", "end"])?;
+                known(&["dir", "length", "range", "start", "end", "track"])?;
                 let dir = match op.get("dir").and_then(Value::as_str) {
                     Some("in") => FadeDir::In,
                     Some("out") => FadeDir::Out,
@@ -158,13 +158,13 @@ pub fn parse(doc: &Value, scale: Scale) -> Result<Vec<(Request, &'static str)>> 
                 (Request::Fade { dir, range }, "fade")
             }
             "insert" => {
-                known(&["file", "at", "crossfade"])?;
+                known(&["file", "at", "crossfade", "track"])?;
                 let Some(Value::String(file)) = op.get("file") else { return Err(bad(index, "insert needs \"file\"")) };
                 let at = position(index, op.get("at").ok_or_else(|| bad(index, "insert needs \"at\""))?, scale)?;
                 (Request::Insert { file: PathBuf::from(file), at, crossfade }, "insert")
             }
             "normalize" => {
-                known(&["lufs", "peak", "ceiling"])?;
+                known(&["lufs", "peak", "ceiling", "track"])?;
                 let target = match (op.get("lufs"), op.get("peak")) {
                     (Some(lufs), None) => Target::Lufs(level(index, lufs)?),
                     (None, Some(peak)) => Target::Peak(level(index, peak)?),
@@ -177,6 +177,12 @@ pub fn parse(doc: &Value, scale: Scale) -> Result<Vec<(Request, &'static str)>> 
                 (Request::Normalize { target, ceiling_dbtp }, "normalize")
             }
             other => return Err(bad(index, format!("there is no operation \"{other}\"; the operations are cut, keep, gain, fade, mute, insert and normalize"))),
+        };
+        // "track" aims the operation at one track. Cut and keep act on every track and take none.
+        out.push(match op.get("track") {
+            None => (request, kind),
+            Some(Value::String(track)) => (Request::OnTrack { track: track.clone(), request: Box::new(request) }, kind),
+            Some(_) => return Err(bad(index, "\"track\" must be a track's name or id")),
         });
     }
     Ok(out)

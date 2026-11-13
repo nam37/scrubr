@@ -21,11 +21,13 @@ pub struct Options {
     pub height: u32,
     /// Timeline range in frames. The default is the whole timeline.
     pub range: Option<(u64, u64)>,
+    /// Draw this track alone, by its index in the timeline's tracks. The default is the mix.
+    pub track: Option<usize>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { width: 1600, height: 480, range: None }
+        Options { width: 1600, height: 480, range: None, track: None }
     }
 }
 
@@ -199,7 +201,7 @@ pub fn render_png(project: &Project, paths: &Paths, out: &Path, options: &Option
         return Err(Error::usage("bad_size", format!("A {width}x{height} image is out of range."))
             .hint("Use a width of 64 to 16384 and a height of at least 24 plus 16 per channel."));
     }
-    let mut renderer = Renderer::new(project, paths)?;
+    let mut renderer = Renderer::of(project, paths, options.track)?;
     let total = renderer.total();
     let (start, end) = options.range.unwrap_or((0, total));
     if total == 0 {
@@ -208,7 +210,9 @@ pub fn render_png(project: &Project, paths: &Paths, out: &Path, options: &Option
     crate::edit::check_range(project, paths, renderer.timeline(), (start, end))?;
 
     let frames_per_px = (end - start) as f64 / width as f64;
-    let from_peaks = frames_per_px >= PEAKS_FROM;
+    // The peak cache holds each file on its own. A mix, or one track of several, has to be
+    // drawn from the audio.
+    let from_peaks = frames_per_px >= PEAKS_FROM && options.track.is_none() && !renderer.timeline().needs_mix();
     let columns = if from_peaks {
         columns_from_peaks(project, paths, &renderer, start, frames_per_px, width as usize)?
     } else {

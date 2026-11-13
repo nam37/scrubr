@@ -8,6 +8,12 @@
 //! fades against the audio that follows or precedes it in its own source, which for a cut is the
 //! first and last few milliseconds of what was removed. Where a source has no such audio (its
 //! own start or end), that side fades to or from silence instead.
+//!
+//! With more than one track, the audio at a frame of a main-track source is a mix: the main
+//! track's own audio and every clip attached to that frame, each with its level edits, its
+//! level and its pan, summed. Crossfades work on that mix, so every track is faded across a
+//! join together. A project with one track at its default level takes the plain path, and its
+//! samples are what they were before tracks existed.
 
 use std::path::PathBuf;
 
@@ -98,6 +104,25 @@ pub struct Renderer {
     /// One window per boundary: before segment 0, between segments, after the last.
     windows: Vec<Window>,
     extra: Vec<f32>,
+    /// What each track contributes to the left and the right, when there is mixing to do.
+    mix: Option<Vec<[f32; 2]>>,
+    scratch: Vec<f32>,
+}
+
+/// Scales interleaved frames by a gain for the left channel and one for the right. Audio that is
+/// not stereo has no sides, and takes the left gain.
+fn scale(buf: &mut [f32], channels: usize, gain: [f32; 2]) {
+    if gain == [1.0, 1.0] {
+        return;
+    }
+    if channels == 2 {
+        for frame in buf.as_chunks_mut::<2>().0 {
+            frame[0] *= gain[0];
+            frame[1] *= gain[1];
+        }
+    } else {
+        buf.iter_mut().for_each(|s| *s *= gain[0]);
+    }
 }
 
 impl Renderer {
@@ -107,8 +132,27 @@ impl Renderer {
     }
 
     pub fn with_timeline(project: &Project, paths: &Paths, tl: Timeline) -> Result<Renderer> {
+        Self::build(project, paths, tl, None)
+    }
+
+    /// A renderer for the mix at head, or for one track alone when `track` is given.
+    pub fn of(project: &Project, paths: &Paths, track: Option<usize>) -> Result<Renderer> {
+        Self::build(project, paths, Timeline::build(project)?, track)
+    }
+
+    /// A renderer that plays one track alone, at its own level and pan, whatever is muted or
+    /// soloed: for measuring a track, or hearing it by itself.
+    pub fn for_track(project: &Project, paths: &Paths, tl: Timeline, track: usize) -> Result<Renderer> {
+        Self::build(project, paths, tl, Some(track))
+    }
+
+    fn build(project: &Project, paths: &Paths, tl: Timeline, only: Option<usize>) -> Result<Renderer> {
         let mut used = vec![false; project.sources.len()];
-        tl.segs().iter().for_each(|s| used[s.src] = true);
+        for seg in tl.segs() {
+            used[seg.src] = true;
+            tl.attached(seg.src).iter().for_each(|a| used[a.clip] = true);
+        }
+        let mix = (only.is_some() || tl.needs_mix()).then(|| tl.mix_gains(project.channels as usize, only));
         for (source, used) in project.sources.iter().zip(&used) {
             if *used {
                 ensure_audio(paths, source, project.sample_rate)?;
@@ -139,6 +183,8 @@ impl Renderer {
             windows,
             tl,
             extra: Vec::new(),
+            mix,
+            scratch: Vec::new(),
         })
     }
 
@@ -162,6 +208,45 @@ impl Renderer {
         Ok(slots[src].as_mut().expect("just opened"))
     }
 
+    /// Fills `buf` with what is heard at frames `first..` of main-track source `src`, before any
+    /// crossfade: that source's audio with its level edits and, when there is mixing to do, every
+    /// track's audio at those frames, each with its own edits, level and pan, summed.
+    fn fill(&mut self, side: bool, src: usize, first: u64, buf: &mut [f32]) -> Result<()> {
+        let Renderer { tl, channels, files, main, side: aside, mix, scratch, .. } = self;
+        let ch = *channels;
+        let (slots, buffer) = if side { (aside, 1 << 14) } else { (main, 1 << 20) };
+        if tl.is_silence(src) {
+            buf.fill(0.0);
+        } else {
+            Self::reader(slots, files, src, buffer)?.read(first, ch, buf)?;
+        }
+        let Some(mix) = mix else {
+            tl.apply_gain(src, first, buf, ch);
+            return Ok(());
+        };
+        tl.apply_gain_for(0, src, first, buf, ch);
+        scale(buf, ch, mix[0]);
+        let end = first + (buf.len() / ch) as u64;
+        for i in 0..tl.attached(src).len() {
+            let a = tl.attached(src)[i];
+            let gain = mix[a.track];
+            if a.end <= first || a.start >= end || gain == [0.0, 0.0] {
+                continue;
+            }
+            let (from, to) = (a.start.max(first), a.end.min(end));
+            scratch.clear();
+            scratch.resize((to - from) as usize * ch, 0.0);
+            Self::reader(slots, files, a.clip, buffer)?.read(a.clip_start + (from - a.start), ch, scratch)?;
+            tl.apply_gain_for(a.track, src, from, scratch, ch);
+            scale(scratch, ch, gain);
+            let at = (from - first) as usize * ch;
+            for (out, s) in buf[at..at + scratch.len()].iter_mut().zip(scratch.iter()) {
+                *out += *s;
+            }
+        }
+        Ok(())
+    }
+
     /// Replaces `out` with `frames` interleaved frames starting at timeline position `t0`.
     /// Positions past the end of the timeline are silent.
     pub fn read(&mut self, t0: u64, frames: usize, out: &mut Vec<f32>) -> Result<()> {
@@ -182,8 +267,7 @@ impl Renderer {
             let k0 = t - seg_t;
             let k1 = (t1 - seg_t).min(n);
             let dst = &mut out[(t - t0) as usize * ch..(seg_t + k1 - t0) as usize * ch];
-            Self::reader(&mut self.main, &self.files, seg.src, 1 << 20)?.read(seg.start + k0, ch, dst)?;
-            self.tl.apply_gain(seg.src, seg.start + k0, dst, ch);
+            self.fill(false, seg.src, seg.start + k0, dst)?;
 
             // The join, or timeline start, this segment begins with.
             let w = self.windows[i];
@@ -197,12 +281,13 @@ impl Renderer {
                     }
                 } else {
                     let a = self.tl.segs()[i - 1];
-                    self.extra.clear();
-                    self.extra.resize(part.len(), 0.0);
+                    let mut extra = std::mem::take(&mut self.extra);
+                    extra.clear();
+                    extra.resize(part.len(), 0.0);
                     if w.tail {
-                        Self::reader(&mut self.side, &self.files, a.src, 1 << 14)?.read(a.end + k0, ch, &mut self.extra)?;
-                        self.tl.apply_gain(a.src, a.end + k0, &mut self.extra, ch);
+                        self.fill(true, a.src, a.end + k0, &mut extra)?;
                     }
+                    self.extra = extra;
                     let span = (w.before + w.after) as f64;
                     for (j, (frame, tail)) in part.chunks_exact_mut(ch).zip(self.extra.chunks_exact(ch)).enumerate() {
                         let d = (k0 + j as u64) as f64;
@@ -229,13 +314,13 @@ impl Renderer {
                     }
                 } else {
                     let b = self.tl.segs()[i + 1];
-                    self.extra.clear();
-                    self.extra.resize(part.len(), 0.0);
+                    let mut extra = std::mem::take(&mut self.extra);
+                    extra.clear();
+                    extra.resize(part.len(), 0.0);
                     if w.lead {
-                        let first = b.start - (n - from);
-                        Self::reader(&mut self.side, &self.files, b.src, 1 << 14)?.read(first, ch, &mut self.extra)?;
-                        self.tl.apply_gain(b.src, first, &mut self.extra, ch);
+                        self.fill(true, b.src, b.start - (n - from), &mut extra)?;
                     }
+                    self.extra = extra;
                     let span = (w.before + w.after) as f64;
                     for (j, (frame, lead)) in part.chunks_exact_mut(ch).zip(self.extra.chunks_exact(ch)).enumerate() {
                         // Frames into the window, which starts `before` frames ahead of the join.

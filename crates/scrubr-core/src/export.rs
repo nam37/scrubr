@@ -49,6 +49,8 @@ pub struct Options {
     /// Set to the number of frames written as the export goes, for a caller on another thread
     /// to show progress.
     pub progress: Option<Arc<AtomicU64>>,
+    /// Export this track alone, by its index in the timeline's tracks. The default is the mix.
+    pub track: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,7 +130,7 @@ pub fn export(project: &Project, paths: &Paths, out: &Path, options: &Options) -
         _ => {}
     }
 
-    let mut renderer = Renderer::new(project, paths)?;
+    let mut renderer = Renderer::of(project, paths, options.track)?;
     let total = renderer.total();
     let (t0, t1) = options.range.unwrap_or((0, total));
     if t1 > total || t0 >= t1 {

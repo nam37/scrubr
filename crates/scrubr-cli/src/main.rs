@@ -100,6 +100,9 @@ enum Command {
         /// Measure only this part of the timeline.
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
+        /// One track heard alone, by name or id. [default: the mix]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
     },
     /// Waveform image of the timeline or a range.
     Render {
@@ -113,6 +116,9 @@ enum Command {
         width: u32,
         #[arg(long, default_value_t = 480)]
         height: u32,
+        /// One track heard alone, by name or id. [default: the mix]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
     },
     /// Words with start and end times as JSON. Needs the optional transcription feature.
     Transcribe {
@@ -127,6 +133,9 @@ enum Command {
         /// Download a model from huggingface.co and exit. The only step that uses the network.
         #[arg(long, value_name = "MODEL", conflicts_with_all = ["project", "model", "range"])]
         fetch_model: Option<String>,
+        /// One track heard alone, by name or id. [default: the mix]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
     },
     /// Remove a range. The join gets a short crossfade.
     Cut {
@@ -155,6 +164,9 @@ enum Command {
         db: String,
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
+        /// One track, by name or id. [default: every track]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
         #[command(flatten)]
         edit: EditOpts,
     },
@@ -167,6 +179,9 @@ enum Command {
         /// Fade across this range instead.
         #[arg(long, value_name = "RANGE", conflicts_with = "length")]
         range: Option<String>,
+        /// One track, by name or id. [default: every track]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
         #[command(flatten)]
         edit: EditOpts,
     },
@@ -182,6 +197,9 @@ enum Command {
         /// The true-peak ceiling in dBTP. [default: -1]
         #[arg(long, value_name = "DBTP")]
         ceiling: Option<String>,
+        /// Measure and change one track alone, by name or id. [default: the mix]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
         #[command(flatten)]
         edit: EditOpts,
     },
@@ -192,6 +210,9 @@ enum Command {
         /// Ramp length inside each end of the range. 0 gives hard edges. [default: 5ms]
         #[arg(long, value_name = "LENGTH")]
         crossfade: Option<String>,
+        /// One track, by name or id. [default: every track]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
         #[command(flatten)]
         edit: EditOpts,
     },
@@ -205,6 +226,9 @@ enum Command {
         /// Crossfade length at both joins. [default: 5ms]
         #[arg(long, value_name = "LENGTH")]
         crossfade: Option<String>,
+        /// Put the file on this track, with silence on the others. [default: the main track]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
         #[command(flatten)]
         edit: EditOpts,
     },
@@ -260,6 +284,15 @@ enum Command {
         /// Export only this part of the timeline.
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
+        /// One track heard alone, by name or id. [default: the mix]
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
+    },
+    /// Add, list, set or remove tracks: lanes of audio that share the timeline and are mixed.
+    Track {
+        project: PathBuf,
+        #[command(subcommand)]
+        action: TrackAction,
     },
     /// Open the window on a project, for a person to review. It runs on its own.
     Open { project: Option<PathBuf> },
@@ -287,6 +320,58 @@ pub enum LabelAction {
     /// Remove a label by id.
     Rm {
         id: String,
+        #[command(flatten)]
+        edit: EditOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TrackAction {
+    /// Lay a file on a track of its own, or on one that is there with --track. Nothing on the
+    /// timeline moves; a file that runs past the end makes the timeline longer.
+    Add {
+        file: PathBuf,
+        /// The new track's name. [default: the file's name]
+        #[arg(long, value_name = "NAME", conflicts_with = "track")]
+        name: Option<String>,
+        /// Add the file to this track instead of making one.
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
+        /// Where on the timeline the file starts. `end` starts it where the timeline ends. [default: 0]
+        #[arg(long, value_name = "TIME")]
+        at: Option<String>,
+        #[command(flatten)]
+        edit: EditOpts,
+    },
+    /// List tracks with their level, pan, mute and solo, and where their audio sits now.
+    List,
+    /// Change a track's place in the mix, or its name.
+    Set {
+        /// The track, by name or id.
+        track: String,
+        /// The track's level in dB. 0 is as recorded.
+        #[arg(long, value_name = "DB")]
+        gain: Option<String>,
+        /// From -1, full left, to 1, full right. 0 is the centre.
+        #[arg(long, value_name = "PAN")]
+        pan: Option<String>,
+        #[arg(long, conflicts_with = "unmute")]
+        mute: bool,
+        #[arg(long)]
+        unmute: bool,
+        /// Hear only the soloed tracks.
+        #[arg(long, conflicts_with = "unsolo")]
+        solo: bool,
+        #[arg(long)]
+        unsolo: bool,
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        #[command(flatten)]
+        edit: EditOpts,
+    },
+    /// Take a track and its audio out of the project. Time does not change.
+    Rm {
+        track: String,
         #[command(flatten)]
         edit: EditOpts,
     },
@@ -361,22 +446,23 @@ fn run(cli: Cli) -> Result<Reply, Error> {
     match command {
         Command::New { project, from, force, author, session } => commands::new(&project, &from, force, author, session),
         Command::Info { project } => commands::info(&project),
-        Command::Analyze { project, loudness, peaks, silence, envelope, quietest, range } => commands::analyze(&project, loudness, peaks, silence, envelope, quietest, range),
-        Command::Render { project, png, range, width, height } => commands::render(&project, &png, range, width, height),
-        Command::Transcribe { project, model, range, fetch_model } => commands::transcribe(project.as_deref(), model, range, fetch_model),
+        Command::Analyze { project, loudness, peaks, silence, envelope, quietest, range, track } => commands::analyze(&project, loudness, peaks, silence, envelope, quietest, range, track),
+        Command::Render { project, png, range, width, height, track } => commands::render(&project, &png, range, width, height, track),
+        Command::Transcribe { project, model, range, fetch_model, track } => commands::transcribe(project.as_deref(), model, range, fetch_model, track),
         Command::Cut { project, range, crossfade, edit } => commands::cut(&project, &range, crossfade, &edit, false),
         Command::Keep { project, range, crossfade, edit } => commands::cut(&project, &range, crossfade, &edit, true),
-        Command::Gain { project, db, range, edit } => commands::gain(&project, &db, range, &edit),
-        Command::Fade { project, direction, length, range, edit } => commands::fade(&project, direction, length, range, &edit),
-        Command::Normalize { project, lufs, peak, ceiling, edit } => commands::normalize(&project, lufs, peak, ceiling, &edit),
-        Command::Mute { project, range, crossfade, edit } => commands::mute(&project, &range, crossfade, &edit),
-        Command::Insert { project, file, at, crossfade, edit } => commands::insert(&project, &file, &at, crossfade, &edit),
+        Command::Gain { project, db, range, track, edit } => commands::gain(&project, &db, range, track, &edit),
+        Command::Fade { project, direction, length, range, track, edit } => commands::fade(&project, direction, length, range, track, &edit),
+        Command::Normalize { project, lufs, peak, ceiling, track, edit } => commands::normalize(&project, lufs, peak, ceiling, track, &edit),
+        Command::Mute { project, range, crossfade, track, edit } => commands::mute(&project, &range, crossfade, track, &edit),
+        Command::Insert { project, file, at, crossfade, track, edit } => commands::insert(&project, &file, &at, crossfade, track, &edit),
         Command::Apply { project, ops, edit } => commands::apply(&project, &ops, &edit),
         Command::Undo { project, steps, edits, of_session, edit } => commands::undo(&project, steps, edits, of_session, &edit),
         Command::Redo { project, steps, edit } => commands::redo(&project, steps, &edit),
         Command::History { project } => commands::history(&project),
         Command::Label { project, action } => commands::label(&project, action),
-        Command::Export { project, out, bits, range } => commands::export(&project, &out, bits, range),
+        Command::Export { project, out, bits, range, track } => commands::export(&project, &out, bits, range, track),
+        Command::Track { project, action } => commands::track(&project, action),
         Command::Open { project } => commands::open(project.as_deref()),
         Command::Help { agent: true, .. } => Ok(Reply::new(None, json!({ "guide": AGENT_GUIDE }), AGENT_GUIDE.trim_end())),
         Command::Help { command, .. } => {

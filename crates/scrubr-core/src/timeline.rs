@@ -5,11 +5,16 @@
 //! frame and a timeline position map to each other one to one while the frame is visible.
 //! Level edits (gain, fade, mute, normalize) do not change the segments; they become a gain that
 //! is a function of the source frame, applied when audio is rendered.
+//!
+//! The segments are the main track, and they are time. Every other track's audio is attached to
+//! frames of the main track's sources, so wherever those frames are on the timeline, the attached
+//! audio is too: one cut takes the same moment out of every track. A level edit can name one
+//! track, and then it is a gain on that track's audio at those frames.
 
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::project::{FadeDir, Op, Project, Span};
+use crate::project::{FadeDir, MAIN_TRACK, Op, Project, Span};
 
 /// A piece of one source on the timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +52,33 @@ impl SrcSpan {
     }
 }
 
+/// A track as the log leaves it: its name and its place in the mix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackState {
+    pub id: String,
+    pub name: String,
+    pub gain_db: f64,
+    /// From -1.0, full left, to 1.0, full right. Zero leaves the track as it is.
+    pub pan: f64,
+    pub mute: bool,
+    pub solo: bool,
+    /// Taken out of the project. It keeps its place in the list so indexes stay put.
+    pub removed: bool,
+}
+
+/// A piece of a clip: frames of source `clip`, from `clip_start`, attached to frames
+/// `start..end` of one of the main track's sources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attach {
+    pub start: u64,
+    pub end: u64,
+    /// Index into [`Timeline::tracks`].
+    pub track: usize,
+    /// Index into the project's sources.
+    pub clip: usize,
+    pub clip_start: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ShapeKind {
     Gain(f32),
@@ -69,6 +101,8 @@ struct Piece {
 #[derive(Clone, Debug)]
 struct Shape {
     kind: ShapeKind,
+    /// The one track it changes, or every track.
+    track: Option<usize>,
     total: u64,
     /// Per source index, sorted by start.
     pieces: Vec<Vec<Piece>>,
@@ -103,10 +137,17 @@ pub struct Timeline {
     starts: Vec<u64>,
     /// Whole-timeline gain in dB, the sum of every gain and normalize edit without spans.
     global_db: f64,
-    global: f32,
+    /// The whole-timeline gain of each track as a factor: `global_db` and the track's own.
+    globals: Vec<f32>,
+    /// Whole-timeline gain in dB of each track alone.
+    track_db: Vec<f64>,
     shapes: Vec<Shape>,
     source_ids: Vec<String>,
     source_frames: Vec<u64>,
+    silence: Vec<bool>,
+    tracks: Vec<TrackState>,
+    /// Per main-track source, the clips attached to its frames, sorted by start.
+    attached: Vec<Vec<Attach>>,
 }
 
 fn invalid(what: String) -> Error {
@@ -126,10 +167,14 @@ impl Timeline {
             segs: Vec::new(),
             starts: Vec::new(),
             global_db: 0.0,
-            global: 1.0,
+            globals: Vec::new(),
+            track_db: vec![0.0],
             shapes: Vec::new(),
             source_ids: project.sources.iter().map(|s| s.id.clone()).collect(),
             source_frames: project.sources.iter().map(|s| s.frames).collect(),
+            silence: project.sources.iter().map(|s| s.silence).collect(),
+            tracks: vec![TrackState { id: MAIN_TRACK.to_string(), name: "main".to_string(), gain_db: 0.0, pan: 0.0, mute: false, solo: false, removed: false }],
+            attached: vec![Vec::new(); project.sources.len()],
         };
         let index: HashMap<&str, usize> = project.sources.iter().enumerate().map(|(i, s)| (s.id.as_str(), i)).collect();
         for op in project.applied_ops().into_iter().chain(extra) {
@@ -147,7 +192,16 @@ impl Timeline {
             at += seg.frames();
         }
         self.starts.push(at);
-        self.global = 10f64.powf(self.global_db / 20.0) as f32;
+        self.globals = self.track_db.iter().map(|db| 10f64.powf((self.global_db + db) / 20.0) as f32).collect();
+        for list in &mut self.attached {
+            list.sort_by_key(|a| (a.start, a.track));
+        }
+    }
+
+    /// The index of the track with this id. An edit can name a track that a later revert took
+    /// out of the log; such an edit then does nothing.
+    fn track_by_id(&self, id: &str) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == id)
     }
 
     fn src_spans(&self, spans: &[Span], index: &HashMap<&str, usize>) -> Result<Vec<SrcSpan>> {
@@ -176,18 +230,59 @@ impl Timeline {
                 let spans = self.src_spans(spans, index)?;
                 self.remove(&spans, *crossfade);
             }
-            Op::Gain { gain_db, spans: None } | Op::Normalize { gain_db, .. } => self.global_db += gain_db,
-            Op::Gain { gain_db, spans: Some(spans) } => {
+            Op::Gain { gain_db, spans: None, track } | Op::Normalize { gain_db, track, .. } => match track {
+                None => self.global_db += gain_db,
+                Some(id) => {
+                    if let Some(t) = self.track_by_id(id) {
+                        self.track_db[t] += gain_db;
+                    }
+                }
+            },
+            Op::Gain { gain_db, spans: Some(spans), track } => {
                 let spans = self.src_spans(spans, index)?;
-                self.shape(ShapeKind::Gain(10f64.powf(gain_db / 20.0) as f32), &spans);
+                self.shape(ShapeKind::Gain(10f64.powf(gain_db / 20.0) as f32), &spans, track);
             }
-            Op::Fade { dir, spans } => {
+            Op::Fade { dir, spans, track } => {
                 let spans = self.src_spans(spans, index)?;
-                self.shape(if *dir == FadeDir::In { ShapeKind::FadeIn } else { ShapeKind::FadeOut }, &spans);
+                self.shape(if *dir == FadeDir::In { ShapeKind::FadeIn } else { ShapeKind::FadeOut }, &spans, track);
             }
-            Op::Mute { spans, crossfade } => {
+            Op::Mute { spans, crossfade, track } => {
                 let spans = self.src_spans(spans, index)?;
-                self.shape(ShapeKind::Mute(*crossfade as u64), &spans);
+                self.shape(ShapeKind::Mute(*crossfade as u64), &spans, track);
+            }
+            Op::Track { track, name } => {
+                if self.track_by_id(track).is_none() {
+                    self.tracks.push(TrackState { id: track.clone(), name: name.clone(), gain_db: 0.0, pan: 0.0, mute: false, solo: false, removed: false });
+                    self.track_db.push(0.0);
+                }
+            }
+            Op::Clip { track, source: id, at } => {
+                let clip = source(id)?;
+                let spans = self.src_spans(at, index)?;
+                if let Some(track) = self.track_by_id(track) {
+                    let mut clip_start = 0;
+                    for span in spans.iter().filter(|s| s.frames() > 0) {
+                        self.attached[span.src].push(Attach { start: span.start, end: span.end, track, clip, clip_start });
+                        clip_start += span.frames();
+                    }
+                }
+            }
+            Op::TrackSet { track, name, gain_db, pan, mute, solo } => {
+                if let Some(t) = self.track_by_id(track) {
+                    let state = &mut self.tracks[t];
+                    if let Some(name) = name {
+                        state.name = name.clone();
+                    }
+                    state.gain_db = gain_db.unwrap_or(state.gain_db);
+                    state.pan = pan.unwrap_or(state.pan);
+                    state.mute = mute.unwrap_or(state.mute);
+                    state.solo = solo.unwrap_or(state.solo);
+                }
+            }
+            Op::TrackRemove { track } => {
+                if let Some(t) = self.track_by_id(track) {
+                    self.tracks[t].removed = true;
+                }
             }
             Op::Insert { source: id, at, crossfade } => {
                 let src = source(id)?;
@@ -207,7 +302,15 @@ impl Timeline {
         Ok(())
     }
 
-    fn shape(&mut self, kind: ShapeKind, spans: &[SrcSpan]) {
+    fn shape(&mut self, kind: ShapeKind, spans: &[SrcSpan], track: &Option<String>) {
+        let track = match track {
+            None => None,
+            Some(id) => match self.track_by_id(id) {
+                Some(t) => Some(t),
+                // The track is no longer in the log, so there is nothing for the edit to change.
+                None => return,
+            },
+        };
         let mut pieces = vec![Vec::new(); self.source_frames.len()];
         let mut offset = 0;
         for span in spans {
@@ -222,7 +325,7 @@ impl Timeline {
         for list in &mut pieces {
             list.sort_by_key(|p| p.start);
         }
-        self.shapes.push(Shape { kind, total: offset, pieces });
+        self.shapes.push(Shape { kind, track, total: offset, pieces });
     }
 
     /// Takes `spans` out of the timeline. Each run of removed audio leaves a join, or a trimmed
@@ -421,6 +524,93 @@ impl Timeline {
         self.source_frames.len()
     }
 
+    /// True for a source that is a stretch of silence: time with no main audio.
+    pub fn is_silence(&self, src: usize) -> bool {
+        self.silence[src]
+    }
+
+    // ---- tracks -------------------------------------------------------------------------------
+
+    /// Every track the log has made, the main one first. A removed track stays in the list,
+    /// marked, so indexes stay put.
+    pub fn tracks(&self) -> &[TrackState] {
+        &self.tracks
+    }
+
+    /// The index of the track with this id or name, if it is still in the project.
+    pub fn find_track(&self, key: &str) -> Option<usize> {
+        self.tracks.iter().position(|t| !t.removed && (t.id == key || t.name == key))
+    }
+
+    /// The clips attached to frames of main-track source `src`, sorted by where they start.
+    pub fn attached(&self, src: usize) -> &[Attach] {
+        &self.attached[src]
+    }
+
+    /// Where each clip of a track sits on the timeline now: its source and the timeline ranges
+    /// it is heard over, in order. A clip whose time has all been cut has no ranges.
+    pub fn clips(&self, track: usize) -> Vec<(usize, Vec<(u64, u64)>)> {
+        let mut out: Vec<(usize, Vec<(u64, u64)>)> = Vec::new();
+        for (src, list) in self.attached.iter().enumerate() {
+            for a in list.iter().filter(|a| a.track == track) {
+                let ranges = self.locate(src, a.start, a.end);
+                match out.iter_mut().find(|(clip, _)| *clip == a.clip) {
+                    Some((_, all)) => all.extend(ranges),
+                    None => out.push((a.clip, ranges)),
+                }
+            }
+        }
+        for (_, ranges) in &mut out {
+            // A clip laid across joins is attached in pieces; where they still touch it is one stretch.
+            ranges.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+            for &range in ranges.iter() {
+                match merged.last_mut() {
+                    Some(last) if last.1 == range.0 => last.1 = range.1,
+                    _ => merged.push(range),
+                }
+            }
+            *ranges = merged;
+        }
+        out.sort_by_key(|(clip, ranges)| (ranges.first().map_or(u64::MAX, |r| r.0), *clip));
+        out
+    }
+
+    /// True when rendering has more to do than play the main track as it is: there is another
+    /// track with audio, or the main track's place in the mix has been changed.
+    pub fn needs_mix(&self) -> bool {
+        let main = &self.tracks[0];
+        let others = self.attached.iter().flatten().any(|a| !self.tracks[a.track].removed);
+        others || main.gain_db != 0.0 || main.pan != 0.0 || main.mute || main.removed || self.tracks.iter().any(|t| t.solo && !t.removed)
+    }
+
+    /// What each track contributes to a mix of `channels` channels, as a gain for the left and
+    /// for the right: its level, its pan, and silence if it is muted, removed, or not one of
+    /// the soloed tracks when any are. With `only`, that track is heard alone at its own level
+    /// and pan, whatever is muted or soloed.
+    ///
+    /// Pan is a balance: at the centre both sides are untouched, and moving to one side turns
+    /// the other down, to silence at the end. It needs two channels and does nothing otherwise.
+    pub fn mix_gains(&self, channels: usize, only: Option<usize>) -> Vec<[f32; 2]> {
+        let any_solo = self.tracks.iter().any(|t| t.solo && !t.removed);
+        self.tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let heard = match only {
+                    Some(only) => i == only,
+                    None => !t.removed && !t.mute && (!any_solo || t.solo),
+                };
+                if !heard {
+                    return [0.0, 0.0];
+                }
+                let level = 10f64.powf(t.gain_db / 20.0);
+                let pan = if channels == 2 { t.pan.clamp(-1.0, 1.0) } else { 0.0 };
+                [(level * (1.0 - pan).min(1.0)) as f32, (level * (1.0 + pan).min(1.0)) as f32]
+            })
+            .collect()
+    }
+
     /// Source spans as the project stores them.
     pub fn stored(&self, spans: &[SrcSpan]) -> Vec<Span> {
         spans.iter().map(|s| Span(self.source_ids[s.src].clone(), s.start, s.end)).collect()
@@ -428,10 +618,16 @@ impl Timeline {
 
     // ---- level --------------------------------------------------------------------------------
 
-    /// The gain every level edit gives one source frame.
+    /// The gain every level edit gives the main track at one source frame.
     pub fn gain_at(&self, src: usize, frame: u64) -> f32 {
-        let mut gain = self.global;
-        for shape in &self.shapes {
+        self.gain_for(0, src, frame)
+    }
+
+    /// The gain every level edit gives one track's audio at a frame of main-track source `src`:
+    /// the edits made to every track, and those made to this one.
+    pub fn gain_for(&self, track: usize, src: usize, frame: u64) -> f32 {
+        let mut gain = self.globals[track];
+        for shape in self.shapes.iter().filter(|s| s.track.is_none_or(|t| t == track)) {
             let list = &shape.pieces[src];
             let i = list.partition_point(|p| p.end <= frame);
             if let Some(p) = list.get(i)
@@ -446,13 +642,19 @@ impl Timeline {
     /// Applies every level edit to `buf`, which holds interleaved frames of `src` starting at
     /// source frame `first`. The result for a frame does not depend on how the audio is chunked.
     pub fn apply_gain(&self, src: usize, first: u64, buf: &mut [f32], channels: usize) {
+        self.apply_gain_for(0, src, first, buf, channels)
+    }
+
+    /// [`Timeline::apply_gain`] for one track's audio at frames of main-track source `src`.
+    pub fn apply_gain_for(&self, track: usize, src: usize, first: u64, buf: &mut [f32], channels: usize) {
         let end = first + (buf.len() / channels) as u64;
-        if self.global != 1.0 {
+        let global = self.globals[track];
+        if global != 1.0 {
             for s in buf.iter_mut() {
-                *s *= self.global;
+                *s *= global;
             }
         }
-        for shape in &self.shapes {
+        for shape in self.shapes.iter().filter(|s| s.track.is_none_or(|t| t == track)) {
             let list = &shape.pieces[src];
             let mut i = list.partition_point(|p| p.end <= first);
             while let Some(p) = list.get(i) {
@@ -495,6 +697,7 @@ mod tests {
                 bits: 16,
                 float: false,
                 conformed: false,
+                silence: false,
             });
             ids.push(id);
         }
@@ -633,7 +836,7 @@ mod tests {
         assert_eq!(p.undo(5).unwrap(), vec!["e3".to_string(), "e2".to_string()]);
         assert!(p.undo(1).is_err());
         assert_eq!(p.redo(1).unwrap(), vec!["e2".to_string()]);
-        let (id, _) = p.push_edit(Op::Gain { gain_db: 1.0, spans: None }, None, &who());
+        let (id, _) = p.push_edit(Op::Gain { gain_db: 1.0, spans: None, track: None }, None, &who());
         // The id of the discarded edit is not handed out again.
         assert_eq!(id, "e4");
         assert_eq!(p.edits.iter().map(|e: &Edit| e.id.as_str()).collect::<Vec<_>>(), ["e1", "e2", "e4"]);
@@ -681,10 +884,10 @@ mod tests {
     fn level_edits_follow_their_source_frames() {
         let mut p = project(&[1000]);
         let tl = Timeline::build(&p).unwrap();
-        p.push_edit(Op::Gain { gain_db: -6.0, spans: Some(tl.stored(&tl.resolve(100, 200))) }, None, &who());
-        p.push_edit(Op::Fade { dir: FadeDir::In, spans: tl.stored(&tl.resolve(0, 10)) }, None, &who());
-        p.push_edit(Op::Mute { spans: tl.stored(&tl.resolve(500, 600)), crossfade: 4 }, None, &who());
-        p.push_edit(Op::Gain { gain_db: 6.0, spans: None }, None, &who());
+        p.push_edit(Op::Gain { gain_db: -6.0, spans: Some(tl.stored(&tl.resolve(100, 200))), track: None }, None, &who());
+        p.push_edit(Op::Fade { dir: FadeDir::In, spans: tl.stored(&tl.resolve(0, 10)), track: None }, None, &who());
+        p.push_edit(Op::Mute { spans: tl.stored(&tl.resolve(500, 600)), crossfade: 4, track: None }, None, &who());
+        p.push_edit(Op::Gain { gain_db: 6.0, spans: None, track: None }, None, &who());
         cut(&mut p, 0, 5, 0);
         let tl = Timeline::build(&p).unwrap();
         let up = 10f32.powf(6.0 / 20.0);

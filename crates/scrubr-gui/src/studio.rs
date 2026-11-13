@@ -602,7 +602,7 @@ pub struct Studio {
     /// A range to show instead of the whole timeline once the layout is known.
     view_request: Option<(f64, f64)>,
     selection: Option<(f64, f64)>,
-    /// The track the last press on the timeline was in, by id. "Mute on picked track" acts on it.
+    /// The track the last press on the timeline was in, by id. "Mute on track" acts on it.
     picked: Option<String>,
     cursor: f64,
     selected: Option<usize>,
@@ -3032,7 +3032,7 @@ static COMMANDS: [Command; 23] = [
     Command { menu: 1, label: "Mute selection", keys: Keys::Char('m'), divide: false, built: true, enabled: has_selection, run: mute_selection },
     Command {
         menu: 1,
-        label: "Mute on picked track",
+        label: "Mute on track",
         keys: Keys::Shift('m'),
         divide: false,
         built: true,

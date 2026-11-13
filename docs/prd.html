@@ -192,6 +192,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li><a href="#gui">GUI</a></li>
       <li><a href="#shared">Shared editing</a></li>
       <li><a href="#analysis">Analysis</a></li>
+      <li><a href="#stems">Stems</a></li>
       <li><a href="#stack">Stack</a></li>
       <li><a href="#milestones">Milestones</a></li>
       <li><a href="#risks">Risks</a></li>
@@ -227,6 +228,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <li>A person can open that project, hear each edit, see who made it, and undo or adjust it.</li>
           <li>Edits are sample-accurate, non-destructive and deterministic.</li>
           <li>Several tracks in one project, such as a microphone for each speaker and a music bed, mixed down at export.</li>
+          <li>Splitting a stretch of mixed audio into stems, such as a voice and the music under it, on the person's own machine.</li>
           <li>One binary for macOS, Windows and Linux.</li>
         </ul>
       </div>
@@ -425,8 +427,9 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li><strong>One track is the plain case.</strong> A project made before M3 opens as a project with one track, and nothing about it changes. The file's <code>format</code> number goes up, and a build that does not know the new format must refuse the file with a clear error, not misread it.</li>
       <li><strong>Time is shared.</strong> <code>cut</code> and <code>keep</code> remove time from every track, so tracks recorded together stay in step. <code>insert</code> adds time to every track, with silence on the others. No command cuts one track alone, so tracks cannot drift apart.</li>
       <li><strong>Level is per track.</strong> <code>gain</code>, <code>fade</code>, <code>mute</code> and <code>normalize</code> take <code>--track</code>, and act on the mix when none is named. Each track also has a level, a pan, a mute and a solo of its own. Pan is one fixed position between left and right, centre unless set, and it does not change over time.</li>
-      <li><strong>Adding a track moves nothing.</strong> <code>scrubr track add</code> places a file at a position on a new track. That is how a second microphone or a music bed joins a project, where <code>insert</code> splices a file into the timeline.</li>
+      <li><strong>Adding a track moves nothing.</strong> <code>scrubr track ep42.scrubr add</code> places a file at a position on a new track. That is how a second microphone or a music bed joins a project, where <code>insert</code> splices a file into the timeline.</li>
       <li><strong>Measuring.</strong> <code>analyze</code>, <code>render</code> and <code>transcribe</code> work on the mix, or on one track with <code>--track</code>. A transcript for each track avoids most of the trouble with people talking over each other, when each has their own recording.</li>
+      <li><strong>How it is stored.</strong> The main track's audio is the timeline, as before. Every other track's audio is attached to frames of the main track's sources, so a cut, an undo or a revert carries every track with it and none can drift. A stretch of time with no main audio is recorded as silence. The mixer settings are edits in the log, with an author, like the rest.</li>
       <li><strong>What stays the same.</strong> Edits in source coordinates, the batch rule, author and session on every edit, session undo and version checks.</li>
     </ul>
   </section>
@@ -457,7 +460,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <div class="cmd"><code>scrubr normalize ep42.scrubr --lufs -16</code><span>Normalize to integrated loudness, or to a peak with <code>--peak -1dB</code>. Gain stops at a true-peak ceiling, −1 dBTP by default.</span></div>
       <div class="cmd"><code>scrubr mute ep42.scrubr 30:12..30:13.4</code><span>Replace a range with silence and keep its length.</span></div>
       <div class="cmd"><code>scrubr insert ep42.scrubr sting.wav --at 0</code><span>Insert another file, resampled if its rate differs.</span></div>
-      <div class="cmd"><code>scrubr track add ep42.scrubr guest.wav --name guest</code><span>Add a file as a new track, list tracks, or remove one (M3). <code>--track guest</code> on level, analysis and transcript commands then names it.</span></div>
+      <div class="cmd"><code>scrubr stems ep42.scrubr 0:45..1:15 --mute-source</code><span>Split a range into stems on new tracks (M4): a voice and the rest, or four with <code>--stems 4</code>. Needs the optional stems feature and a model.</span></div>
+      <div class="cmd"><code>scrubr track ep42.scrubr add guest.wav --name guest</code><span>Add a file as a new track, list tracks, or remove one (M3). <code>--track guest</code> on level, analysis and transcript commands then names it.</span></div>
       <div class="cmd"><code>scrubr apply ep42.scrubr --ops cuts.json</code><span>Several operations in one write and one undo step.</span></div>
       <div class="cmd"><code>scrubr undo | redo | history ep42.scrubr</code><span>Move head, or list edits with author and session.</span></div>
       <div class="cmd"><code>scrubr label ep42.scrubr add 14:18.5..14:20.2 "check: cough?"</code><span>Leave a note for the person reviewing.</span></div>
@@ -565,7 +569,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>Labels, the notes agents leave for review, as speech bubbles beside the splice marks, in their author's colour, with a line over the range each one marks. Pointing at a bubble shows the note in a card, and clicking it selects the range.</li>
       <li>Level edits (gain, fades and mutes) marked along the foot of the waveform in their author's colour.</li>
       <li>Open and Export through the system's file dialogs. An export runs in the background and shows how far it has got. With no project, the window starts empty with an Open button.</li>
-      <li>Files tab (M3), the third tab in the side panel beside Activity and Labels: a file browser for adding more audio to the open project. It lists folders and the audio files scrubr can read, each with a Play button to hear it before adding, and adds one at the playhead or as a new track. It also lists the files the project already uses.</li>
+      <li>Files tab (M3), the third tab in the side panel beside Activity and Labels: a file browser for adding more audio to the open project. It lists folders and the audio files scrubr can read, each with a Play button to hear it first. "Insert" puts a file into the timeline at the playhead, and "Track" lays it on a new track from the playhead. It also lists the files the project already uses.</li>
       <li>Tracks (M3) as stacked lanes under one ruler, each with its name, level, pan, mute and solo.</li>
       <li>Live reload when the project file changes on disk, with a short notice naming the edit. The transport's notice line is empty unless there is something to say.</li>
       <li>One menu button holds every command, the same on all three platforms. The same list drives the tool buttons and the keyboard shortcuts.</li>
@@ -613,7 +617,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Silence</td><td><code>analyze --silence -45dB:1s</code></td><td>Ranges below the threshold for at least the given duration</td></tr>
           <tr><td>Level envelope</td><td><code>analyze --envelope 1s</code></td><td>RMS level in dBFS per window, for finding loud and quiet stretches</td></tr>
           <tr><td>Waveform image</td><td><code>render --png</code></td><td>PNG of the timeline or a range, drawn by the core without a GPU</td></tr>
-          <tr><td>Spectrogram (M4)</td><td><code>render --spectrogram</code></td><td>PNG for spotting hum, hiss and clicks</td></tr>
+          <tr><td>Stems (M4, optional)</td><td><code>stems</code></td><td>A range split onto new tracks, so each part can be measured and changed on its own</td></tr>
+          <tr><td>Spectrogram (M5)</td><td><code>render --spectrogram</code></td><td>PNG for spotting hum, hiss and clicks</td></tr>
           <tr><td>Quietest moment</td><td><code>analyze --quietest A..B</code></td><td>The quietest stretch between two times and its middle, with no threshold: where a cut is least likely to be heard</td></tr>
           <tr><td>Transcript (optional)</td><td><code>transcribe</code></td><td>Words with start and end times, so an agent can find what was said and cut by phrase</td></tr>
         </tbody>
@@ -643,6 +648,50 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <p>A fixed silence threshold does not carry across recordings: at −45 dB the podcast has almost no pauses, and the quiet meeting's soft speech counts as silence. The agent guide says to check loudness first.</p>
   </section>
 
+  <section id="stems">
+    <h2>Stem separation</h2>
+    <p>Planned for M4. A person or an agent picks a range of mixed audio and scrubr splits it into stems, each on a track of its own: a voice and everything else, or vocals, drums, bass and other for music. It runs on the person's machine with a model that is downloaded once. Nothing is sent anywhere.</p>
+    <p>For the recordings scrubr is mostly used on, the point is the voice. With a voice lifted off its music bed, the music can be turned down under the talk, or dropped. An agent, which cannot listen, can measure the voice and the music each on their own.</p>
+    <p class="key"><span class="tag">What stems are</span>Stems are estimates. The model was not there when the recording was mixed, so a little of each sound leaks into the others, most where sounds overlap. They are good for rebalancing and cleaning up, and not a way to get the original recordings back.</p>
+
+    <h3>How it fits scrubr</h3>
+    <ul>
+      <li><strong>Stems are ordinary tracks.</strong> Each stem is a new audio file on a new track, attached to the same moments of the main track as the range it came from. It is cut, restored and moved with them, like any other track.</li>
+      <li><strong>One edit.</strong> The new tracks arrive as one edit with one author, undone in one step and reverted with its session like any other.</li>
+      <li><strong>The original stays.</strong> With <code>--mute-source</code> the same edit mutes the track the stems came from over that range only, so the mix is not heard twice. It is an ordinary mute: visible, and undone with the rest.</li>
+      <li><strong>What goes in.</strong> The chosen track's own audio over the range, before level edits, with some audio either side for the model to work with where the source has it. The stems are cut back to the exact frames of the range. Level edits made to every track then apply to the stems as they do to everything else.</li>
+      <li><strong>Where the files live.</strong> Stems are written beside the project, in a folder of their own, and recorded as sources with a hash. They cannot be rebuilt cheaply, so they are not kept in the cache. They are removed when no edit in the log names them any more.</li>
+      <li><strong>No job queue.</strong> The command runs until it is done and prints its progress on stderr, as <code>transcribe</code> does. The window runs it in the background, as it does an export. Other edits can be made meanwhile.</li>
+      <li><strong>If the project changes meanwhile.</strong> Before the stems are added, scrubr checks that the audio it split is still on the timeline in one piece. If it is not, nothing is added and the reply says to run it again.</li>
+      <li><strong>Optional, like transcription.</strong> A Cargo feature that is off by default, and a model fetched once with <code>scrubr stems --fetch-model</code>. Stems that are already made play in any build.</li>
+    </ul>
+<pre><code><span class="pr">$</span> scrubr stems ep42.scrubr 0:45..1:15 --mute-source
+{
+  "ok": true,
+  "project_version": 9,
+  "edit": "e8",
+  "range": { "start": 45.0, "end": 75.0 },
+  "tracks": [
+    { "id": "t2", "name": "voice", "source": "src4" },
+    { "id": "t3", "name": "rest", "source": "src5" }
+  ],
+  "muted_source": "t1",
+  "model": "htdemucs",
+  "took_seconds": 14.2
+}
+<span class="pr">$</span> scrubr gain ep42.scrubr -6dB --track rest --range 0:45..1:15</code></pre>
+    <p>The numbers in that reply are an illustration, not a measurement.</p>
+
+    <h3>Not settled</h3>
+    <p>The way it fits the project is clear. The engine is not. Before M4 is planned in detail, a spike has to answer these, as one did for transcription:</p>
+    <ul>
+      <li><strong>Which engine.</strong> The model family is HTDemucs. It can run through ONNX Runtime, which is a native library scrubr would have to ship for each platform, or through a Rust implementation, which today leans on a GPU. Transcription was chosen partly because it builds with cargo alone; the same test applies here.</li>
+      <li><strong>The model's licence.</strong> The Demucs code is MIT. Whether the trained model is free to use outside research is disputed, because of the data it was trained on. scrubr would not ship the model, but it would fetch it, so this needs a clear answer or another model.</li>
+      <li><strong>Speed and memory on a CPU.</strong> Figures from elsewhere suggest a 30-second range takes from a few seconds to over a minute depending on the machine, and that memory use is well above the size of the model file. None of this has been measured for scrubr.</li>
+      <li><strong>Quality on speech.</strong> The model is trained on music. How cleanly it lifts a talking voice off a music bed, and what it does with room noise, has to be heard on real podcasts.</li>
+    </ul>
+  </section>
+
   <section id="stack">
     <h2>Technology</h2>
     <p>Candidate crates. Versions get pinned during M0 and M1.</p>
@@ -654,7 +703,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td><code>symphonia</code></td><td>Decode WAV, FLAC, MP3, OGG, AAC (.m4a)</td><td>Pure Rust</td></tr>
           <tr><td><code>hound</code></td><td>Write WAV</td><td></td></tr>
           <tr><td><code>flacenc</code></td><td>Write FLAC</td><td>Pure Rust</td></tr>
-          <tr><td><code>mp3lame-encoder</code></td><td>Write MP3 (M4)</td><td>Wraps LAME (LGPL). Optional feature.</td></tr>
+          <tr><td><code>mp3lame-encoder</code></td><td>Write MP3 (M5)</td><td>Wraps LAME (LGPL). Optional feature.</td></tr>
           <tr><td><code>cpal</code></td><td>Playback</td><td>Runs on its own audio thread</td></tr>
           <tr><td><code>rubato</code></td><td>Resampling</td><td>For inserts with a different rate</td></tr>
           <tr><td><code>ebur128</code></td><td>Loudness and true peak</td><td></td></tr>
@@ -663,6 +712,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td><code>notify</code></td><td>File watching in the GUI</td><td></td></tr>
           <tr><td><code>blake3</code></td><td>Source hashing</td><td></td></tr>
           <tr><td><code>fd-lock</code></td><td>Project write lock</td><td>OS advisory lock, released if the process dies</td></tr>
+          <tr><td>A stem separation engine, to be chosen</td><td>Stems (M4)</td><td>HTDemucs through ONNX Runtime, or a Rust implementation. Optional feature, off by default. A spike decides.</td></tr>
           <tr><td><code>whisper-candle-core</code>, <code>hf-hub</code></td><td>Transcription (M1)</td><td>Whisper in pure Rust on candle. Optional <code>transcribe</code> feature, off by default. Local model, no cloud.</td></tr>
         </tbody>
       </table>
@@ -720,12 +770,21 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <h3>Shared editing, files and multitrack</h3>
           <p>Session undo, labels on the timeline, notices naming each outside edit, and GUI write retries after a version conflict. Authorship arrives in M1 and live reload in M2.</p>
           <p>The Files tab in the side panel, for hearing and adding more files to the open project.</p>
-          <p>Multitrack: several tracks in one project, <code>scrubr track</code> and <code>--track</code> in the CLI, stacked lanes with level, pan, mute and solo in the window, and a mix-down for playback and export.</p>
+          <p>Multitrack: several tracks in one project, <code>scrubr track</code> and <code>--track</code> in the CLI, stacked lanes with level, pan, mute and solo in the window, and a mix-down for playback and export. All of it is built. In the window each track's level moves in 1 dB steps and its pan in tenths, and each step is an edit in the log.</p>
           <p class="exit"><b>Exit test</b>An agent and a person edit the same project in one sitting and no edits are lost. A two-microphone recording and a music bed are brought together from the Files tab, cleaned up by an agent track by track, and exported as one mix.</p>
         </div>
       </li>
       <li>
         <span class="id">M4</span>
+        <div class="body">
+          <h3>Stems</h3>
+          <p>Split a range into stems on new tracks: <code>scrubr stems</code> in the CLI and "Separate into stems" on a selection in the window, with progress and a way to stop. Voice and the rest by default, four stems for music. The model is fetched once, and the original can be muted over the range in the same edit. It builds on M3's tracks, so it cannot come before them.</p>
+          <p>A spike comes first, and can run while M3 is being built: pick the engine and the model, settle the model's licence, and measure speed, memory and quality on speech over music on a CPU.</p>
+          <p class="exit"><b>Exit test</b>An agent lifts the voice off the music in a 30-second stretch of a podcast and turns the music down under it. A person hears the difference, then undoes all of it in one step.</p>
+        </div>
+      </li>
+      <li>
+        <span class="id">M5</span>
         <div class="body">
           <h3>Extras</h3>
           <p>MP3 export, spectrograms, cut-by-words commands on top of the transcript, then effects such as noise reduction, EQ and compression.</p>
@@ -752,6 +811,9 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Transcripts have wrong words and loose word times, worst where people talk over each other</td><td>Cuts go at the quietest moment between words, not at word times. The agent transcribes again across each join, and labels what it is unsure of.</td></tr>
           <tr><td>The Whisper crate is young (0.1) and tested here on Windows only</td><td>It sits behind one trait in the core, so another engine can replace it without touching the CLI.</td></tr>
           <tr><td>Multitrack arrives after the core, the CLI and the window were built around one timeline</td><td>One track is the plain case of the same model, so earlier projects and commands keep working. The file format number goes up. Source coordinates, the batch rule and version checks do not change.</td></tr>
+          <tr><td>The stem model's licence may not allow general use</td><td>Settle it in the spike, before any code depends on the model. scrubr fetches the model and does not ship it; if the answer is no, use a model whose terms are clear.</td></tr>
+          <tr><td>Stem separation needs a native library, or is too slow or too hungry on a CPU</td><td>Optional feature, off by default. The spike measures it on ordinary machines before M4 is committed to.</td></tr>
+          <tr><td>Stems leak into each other, and an agent cannot hear it</td><td>The original is kept and only muted, so undoing loses nothing. The agent labels the range for the person to check.</td></tr>
           <tr><td>License contamination</td><td>No Audacity code. LAME only as an optional, dynamically linked feature.</td></tr>
         </tbody>
       </table>
@@ -768,6 +830,9 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>When a cut covers audio that an earlier edit had already removed, should it claim that hidden audio too, so it stays hidden if the earlier edit is reverted?</li>
       <li>Is <code>base.en</code> the right default model, or should recordings with several speakers default to a larger one such as <code>small.en</code>, about 1 GB?</li>
       <li>Should release builds include the transcription feature, or stay without it and leave it to people who build from source?</li>
+      <li>Which engine and model split stems, and is the model's licence clear enough to fetch it for people?</li>
+      <li>When a track that already has level edits of its own is split, should its stems start with the same edits?</li>
+      <li>Should the stems of one range be shown as a group that folds away, or as plain tracks?</li>
       <li>Should recording from a microphone ever be in scope?</li>
       <li>Is a browser build through Rune's WebGPU target worth revisiting once it matures?</li>
     </ul>

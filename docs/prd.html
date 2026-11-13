@@ -174,7 +174,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <dl class="plate">
       <div><dt>Status</dt><dd>Draft</dd></div>
       <div><dt>Owner</dt><dd>Neil</dd></div>
-      <div><dt>Updated</dt><dd>12 Nov 2026</dd></div>
+      <div><dt>Updated</dt><dd>13 Nov 2026</dd></div>
       <div><dt>Platforms</dt><dd>macOS · Windows · Linux</dd></div>
       <div><dt>Language</dt><dd>Rust</dd></div>
       <div><dt>GUI</dt><dd>Rune (pre-release)</dd></div>
@@ -193,6 +193,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li><a href="#shared">Shared editing</a></li>
       <li><a href="#analysis">Analysis</a></li>
       <li><a href="#stems">Stems</a></li>
+      <li><a href="#effects">Effects</a></li>
       <li><a href="#stack">Stack</a></li>
       <li><a href="#milestones">Milestones</a></li>
       <li><a href="#risks">Risks</a></li>
@@ -228,6 +229,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <li>A person can open that project, hear each edit, see who made it, and undo or adjust it.</li>
           <li>Edits are sample-accurate, non-destructive and deterministic.</li>
           <li>Several tracks in one project, such as a microphone for each speaker and a music bed, mixed down at export.</li>
+          <li>Effects on a selection or a whole track, such as EQ, noise reduction and compression, each one an edit that can be undone.</li>
           <li>One binary for macOS, Windows and Linux.</li>
         </ul>
       </div>
@@ -239,6 +241,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <li>A mixer beyond level, pan, mute and solo for each track: no buses, sends or automation</li>
           <li>Plugin hosting (VST3, LV2, AU)</li>
           <li>Real-time effect previews</li>
+          <li>Tone and instrument generators, novelty effects such as a vocoder or a wah, and a scripting language for effects</li>
           <li>A web build. Rune's web target is experimental and WebGPU-only.</li>
           <li>Any GPL-licensed code, including Audacity's. scrubr is written from scratch.</li>
         </ul>
@@ -617,6 +620,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Level envelope</td><td><code>analyze --envelope 1s</code></td><td>RMS level in dBFS per window, for finding loud and quiet stretches</td></tr>
           <tr><td>Waveform image</td><td><code>render --png</code></td><td>PNG of the timeline or a range, drawn by the core without a GPU</td></tr>
           <tr><td>Spectrogram (M4)</td><td><code>render --spectrogram</code></td><td>PNG for spotting hum, hiss and clicks</td></tr>
+          <tr><td>Spectrum (M5)</td><td><code>analyze --spectrum</code></td><td>Level in each frequency band over a range, as numbers: where the rumble, the hum or the hiss is</td></tr>
+          <tr><td>Clipping (M5)</td><td><code>analyze --clipping</code></td><td>Ranges where the recording hit full scale and was flattened</td></tr>
           <tr><td>Quietest moment</td><td><code>analyze --quietest A..B</code></td><td>The quietest stretch between two times and its middle, with no threshold: where a cut is least likely to be heard</td></tr>
           <tr><td>Transcript (optional)</td><td><code>transcribe</code></td><td>Words with start and end times, so an agent can find what was said and cut by phrase</td></tr>
         </tbody>
@@ -682,6 +687,68 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <ul>
       <li>ONNX Runtime ran HTDemucs about twenty times faster on a CPU than the Rust engine did, at the cost of a native library for each platform. Fetching that library on demand, as the model was, is the likely way to make it usable without a graphics card.</li>
       <li>A model with a clear licence that separates speech from music as well as HTDemucs would remove the other objection. Neither Spleeter nor DeepFilterNet does.</li>
+    </ul>
+  </section>
+
+  <section id="effects">
+    <h2>Effects</h2>
+    <p>Planned for M5. An effect changes how a stretch of audio sounds: it takes out rumble or hiss, evens out a level, turns music down under a voice. A person or an agent applies one to a selection, to a whole track or to everything. This section is a plan. None of it is built.</p>
+    <p class="key"><span class="tag">Why these fit</span>They are ordinary signal processing. They need no model, no graphics card and no download, and they run many times faster than the audio plays on any machine. That is the opposite of what stem separation asked for.</p>
+
+    <h3>How an effect fits scrubr</h3>
+    <ul>
+      <li><strong>An effect is an edit.</strong> It has an author and a session, it is in the log, and it is undone, redone and reverted like a cut. The log stores which effect, its settings as plain numbers, the audio it was applied to in source coordinates, and the track if one was named.</li>
+      <li><strong>The sources are still never changed.</strong> The effect runs once and writes the processed audio to a file in the project's cache folder. Playback, analysis and export read that file wherever those frames of that track are heard. Every effect gives the same output for the same input, so if the file is lost it is made again from the log.</li>
+      <li><strong>No processing while playing.</strong> Because the result is a file, playback costs what it costs today and a frame's value still depends only on its position. It also means there is no live preview: apply, listen, undo or adjust.</li>
+      <li><strong>Range and track.</strong> With no range an effect covers the whole timeline. <code>--track T</code> applies it to that track alone; without it, to every track, each processed by itself.</li>
+      <li><strong>As recorded, or after level edits.</strong> By default an effect hears the track's audio as recorded, and the gains and fades on it apply on top of the result, as they do for every other edit. With <code>--after-levels</code> it hears the audio after the level edits already made. Those edits are then part of the result and are not applied a second time; level edits made later still apply on top. A compressor or a limiter is the usual reason to ask for this.</li>
+      <li><strong>Effects stack.</strong> A later effect on the same audio hears the earlier one's result. If an earlier effect is undone or reverted, the later ones are run again on what is now there. The same holds for an effect that heard level edits which are later taken back. The log is the record; the files follow it.</li>
+      <li><strong>Disk.</strong> The cache keeps the files playback needs, which for a chain of effects is the last one. The steps in between are dropped and made again from the log if an undo needs them.</li>
+      <li><strong>Edges.</strong> The effect hears a little audio before the range so that a filter has settled by the first frame, and its result is crossfaded 5 ms against the original at each end.</li>
+      <li><strong>Effects that change length are a different kind.</strong> A change of tempo or speed makes time longer or shorter, and time is shared by every track. They act on every track or are refused. They are in the second wave.</li>
+      <li><strong>Measuring is not an effect.</strong> Finding clipping or reading a spectrum changes nothing, so those are <code>analyze</code> flags, and their findings can be left as labels for the person.</li>
+      <li><strong>Written from scratch.</strong> Each effect is built from published signal processing. No code is taken from Audacity or any other GPL program.</li>
+    </ul>
+<pre><code><span class="pr">$</span> scrubr analyze ep42.scrubr --spectrum --silence -50dB:1s
+<span class="pr">$</span> scrubr fx ep42.scrubr highpass --hz 80
+<span class="pr">$</span> scrubr fx ep42.scrubr denoise --profile 12:03.2..12:04.6 --reduce 12dB
+<span class="pr">$</span> scrubr fx ep42.scrubr compress --threshold -24dB --ratio 3
+<span class="pr">$</span> scrubr fx ep42.scrubr duck --track music --under voice --by 10dB
+<span class="pr">$</span> scrubr fx ep42.scrubr limit --ceiling -1dB --lufs -16 --after-levels</code></pre>
+    <p>The command and its flags are a sketch. In a batch an effect is one more operation, <code>{ "op": "fx", "effect": "highpass", "hz": 80 }</code>, under the same batch rule.</p>
+
+    <h3>Which effects</h3>
+    <div class="tbl">
+      <table class="w-wide">
+        <thead><tr><th>Wave</th><th>Effect</th><th>What it is for</th></tr></thead>
+        <tbody>
+          <tr><td>First</td><td>EQ: high-pass, low-pass, shelf, notch and bands</td><td>Rumble, mains hum, a boomy or a thin voice. One effect with several filter kinds.</td></tr>
+          <tr><td>First</td><td>Compressor</td><td>A voice that is loud in one sentence and quiet in the next.</td></tr>
+          <tr><td>First</td><td>Limiter</td><td>Holds peaks under a ceiling, so normalize can reach its loudness target on peaky speech.</td></tr>
+          <tr><td>First</td><td>Noise gate</td><td>Silences the room between sentences.</td></tr>
+          <tr><td>First</td><td>Noise reduction</td><td>Steady hiss or hum under speech, learned from a stretch where nobody is talking.</td></tr>
+          <tr><td>First</td><td>Click removal and clip repair</td><td>Mouth clicks, pops, and peaks that were flattened in recording.</td></tr>
+          <tr><td>First</td><td>Auto duck</td><td>Turns one track down while another is active: music under a voice.</td></tr>
+          <tr><td>First</td><td>Invert and reverse</td><td>Small, and cheap once the rest is there.</td></tr>
+          <tr><td>Second</td><td>Reverb, echo and delay</td><td>They ring on past the end of the range, which the first wave never has to deal with.</td></tr>
+          <tr><td>Second</td><td>Tempo, pitch and speed</td><td>They need a time-stretch method, to be tried in a spike first, and they change length.</td></tr>
+          <tr><td>Later</td><td>Editing on a spectrogram</td><td>Needs the spectrogram view from M4 to select in.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Three of the first wave do more than save steps. The limiter answers an open question about normalize. Auto duck gives most of what stem separation was wanted for whenever the music is on a track of its own. Noise reduction is something an agent can drive by measurement: <code>analyze --silence</code> finds a stretch with no speech, and that stretch is the noise to learn.</p>
+
+    <h3>In the window</h3>
+    <ul>
+      <li>An Effects menu that acts on the selection, or on the whole timeline when there is none, and on the picked track or on all of them.</li>
+      <li>Each effect opens a small card with its settings and an Apply button. The card remembers the last settings used.</li>
+      <li>An applied effect is a row in the activity log, and a mark along the foot of the lanes in its author's colour, as level edits are.</li>
+    </ul>
+
+    <h3>Not settled</h3>
+    <ul>
+      <li><strong>Trying a setting.</strong> Tuning a compressor by ear takes several tries. Apply and undo may be enough, or the card may need a way to hear a few seconds before applying.</li>
+      <li><strong>Running again.</strong> Stacking means an undo early in a chain can set several effects running again over a long recording. How long that takes, and what the window shows meanwhile, has to be measured.</li>
     </ul>
   </section>
 
@@ -770,7 +837,16 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
         <span class="id">M4</span>
         <div class="body">
           <h3>Extras</h3>
-          <p>MP3 export, spectrograms, cut-by-words commands on top of the transcript, then effects such as noise reduction, EQ and compression.</p>
+          <p>MP3 export, spectrograms, and cut-by-words commands on top of the transcript.</p>
+        </div>
+      </li>
+      <li>
+        <span class="id">M5</span>
+        <div class="body">
+          <h3>Effects</h3>
+          <p>Effects on a selection, a track or everything, each one an edit: the way an effect is stored and played, <code>scrubr fx</code> and the two new <code>analyze</code> flags in the CLI, the Effects menu in the window, and the first wave: EQ, compressor, limiter, noise gate, noise reduction, click removal and clip repair, auto duck, invert and reverse.</p>
+          <p>The second wave, reverb, echo, tempo and pitch, follows a spike on time-stretching and is not part of this milestone.</p>
+          <p class="exit"><b>Exit test</b>An agent takes a noisy, uneven recording with music on a second track. Working from measurements alone it removes the rumble and the hiss, evens the voice, ducks the music under it and reaches −16 LUFS without passing the ceiling. A person hears the result, changes one setting, and undoes the whole session in one step.</p>
         </div>
       </li>
     </ol>
@@ -787,7 +863,11 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Rune lists native audio as missing</td><td>Playback runs on a cpal thread. The GUI reads an atomic playhead position each frame.</td></tr>
           <tr><td>Long files are slow to draw and scrub</td><td>Peak pyramid cache, streaming decode, seek tables for compressed formats.</td></tr>
           <tr><td>Agent and person write at the same moment</td><td>A file lock around each write, and <code>--if-version</code> with exit code 3 for stale positions. The GUI retries after reloading.</td></tr>
-          <tr><td>Normalize can't reach its target without clipping</td><td>Gain stops at the true-peak ceiling and the reply reports the loudness achieved. A limiter is an open question.</td></tr>
+          <tr><td>Normalize can't reach its target without clipping</td><td>Gain stops at the true-peak ceiling and the reply reports the loudness achieved. The limiter planned for M5 is the way past that.</td></tr>
+          <tr><td>Effects written from scratch are wrong, or sound poor</td><td>Each has a test that measures it: a filter's response with a sweep, a limiter that never passes its ceiling, noise reduction scored on speech with known noise added. A person listens before M5 is called done.</td></tr>
+          <tr><td>With no live preview, effects are slow to tune by ear</td><td>Applying and undoing are quick, and the card keeps the last settings. Whether to add a way to hear a few seconds first is an open question.</td></tr>
+          <tr><td>Processed copies of long recordings fill the disk</td><td>They live in the cache and can be made again from the log. Only the last file of a chain is kept.</td></tr>
+          <tr><td>Undoing an early edit sets a chain of effects running again</td><td>Effects run many times faster than the audio plays. The time is measured on an hour-long recording before M5 is called done, and the window shows progress as it does for an export.</td></tr>
           <tr><td>Agents misjudge audio from numbers alone</td><td>Labels for human review, PNG renders, and transcripts from M1.</td></tr>
           <tr><td>Hard cuts click, and an agent can't hear it</td><td>Joins crossfade by default.</td></tr>
           <tr><td>Transcription brings a heavy dependency and a large model</td><td>Optional feature. The binary builds and works without it, and no model is bundled. The engine is pure Rust, and the model is one download of about 290 MB.</td></tr>
@@ -806,7 +886,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>Should <code>scrubr undo</code> from the CLI undo only the caller's own edits?</li>
       <li>After an undo, does a new edit discard the undone edits, or keep them recoverable as a branch?</li>
       <li>One project file plus a cache folder, or a single project folder?</li>
-      <li>Does v1 need a limiter so normalize can reach −16 LUFS on peaky speech, or is stopping at the ceiling and reporting enough?</li>
+      <li>Once the limiter is there (M5), should normalize use it by itself to reach its target on peaky speech, or only when asked?</li>
+      <li>Is apply-then-undo enough for tuning an effect by ear, or does the window need a way to hear a few seconds before applying?</li>
       <li>When a cut covers audio that an earlier edit had already removed, should it claim that hidden audio too, so it stays hidden if the earlier edit is reverted?</li>
       <li>Is <code>base.en</code> the right default model, or should recordings with several speakers default to a larger one such as <code>small.en</code>, about 1 GB?</li>
       <li>Should release builds include the transcription feature, or stay without it and leave it to people who build from source?</li>

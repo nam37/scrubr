@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rune::{Align, App, AppSpec, Chrome, Color, Cx, El, FileDialogOptions, FileDialogResult, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, ScrollSpec, Shape, TextEdit, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
+use rune::{Align, App, AppSpec, Chrome, Color, Cx, El, FileDialogOptions, FileDialogResult, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, Pixels, ScrollSpec, Shape, TextEdit, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
 use rune_kit::shell::{self, PaneState, SplitView, Toolbar};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuEntry, MenuItem, PaletteSeed, SegmentedControl, TextInput};
 use scrubr_core::edit::{self, DEFAULT_CROSSFADE_MS, Request, Revert};
@@ -26,7 +26,7 @@ use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, Wr
 use scrubr_core::render::Renderer;
 use scrubr_core::timeline::{SrcSpan, TrackState};
 use scrubr_core::transcribe::Word;
-use scrubr_core::{Kind, Peaks, Timeline, export, peaks, phrase, source, words};
+use scrubr_core::{Kind, Peaks, Timeline, export, peaks, phrase, source, spectrum, words};
 
 use crate::audio::Player;
 
@@ -534,16 +534,134 @@ enum Ask {
     Export,
 }
 
-/// Work the command line program is doing for the window: transcribing, or cutting by words.
-/// The window carries no speech model; `scrubr`, beside it, does.
+/// Work the command line program is doing for the window: transcribing, cutting by words,
+/// tightening pauses, measuring. The window carries no speech model; `scrubr`, beside it, does,
+/// and what it measures is what an agent measures.
 struct Job {
     /// What is being done, for the notice: "Transcribing", "Cutting".
     what: String,
     /// The last line of progress the program printed.
     said: Arc<Mutex<String>>,
-    /// What to tell the person when it is done, or why it failed.
-    result: mpsc::Receiver<Result<String, String>>,
+    /// What to tell the person when it is done, with the program's reply, or why it failed.
+    result: mpsc::Receiver<Result<(String, serde_json::Value), String>>,
     shown: String,
+    /// Something for the window to do with the reply, such as going to what was found.
+    after: Option<fn(&mut Studio, &serde_json::Value)>,
+}
+
+/// What the lanes show when they show a spectrogram: one picture of the mix, measured on a
+/// thread of its own each time the view comes to rest somewhere new.
+#[derive(Clone, Debug, PartialEq)]
+struct SpecView {
+    generation: u64,
+    /// Timeline frames.
+    start: u64,
+    end: u64,
+    columns: u32,
+    rows: u32,
+}
+
+type SpecAnswer = Option<(f64, u32, u32, Vec<u8>)>;
+
+#[derive(Default)]
+struct Spectro {
+    on: bool,
+    /// `--spectrogram`: measure before the first frame, for stills.
+    at_once: bool,
+    pixels: Pixels,
+    /// What the picture shows, and the frequency at its top edge.
+    shown: Option<SpecView>,
+    top_hz: f64,
+    /// What is being measured.
+    asked: Option<(SpecView, mpsc::Receiver<SpecAnswer>)>,
+}
+
+/// The lowest frequency the window's spectrogram shows, and the levels drawn black and brightest.
+const SPEC_MIN_HZ: f64 = 40.0;
+const SPEC_DB: (f64, f64) = (-100.0, -10.0);
+/// The strip at the top of the lanes that the spectrogram leaves clear, where splices are marked.
+const SPEC_TOP: f32 = 24.0;
+
+/// The stretch of the timeline in view, as a spectrogram to measure.
+fn spec_wanted(s: &Studio) -> Option<SpecView> {
+    let doc = s.doc.as_ref()?;
+    let [w, h] = s.wave;
+    let h = h - SPEC_TOP;
+    if !s.spectro.on || w < 8.0 || h < 8.0 {
+        return None;
+    }
+    let total = doc.tl.total();
+    let start = (s.start.max(0.0) as u64).min(total);
+    let end = ((s.start + w as f64 * s.fpp).ceil().max(0.0) as u64).min(total);
+    (end > start).then(|| SpecView { generation: s.generation, start, end, columns: (((end - start) as f64 / s.fpp).round() as u32).clamp(1, 2400), rows: (h as u32).clamp(16, 900) })
+}
+
+fn measure_spec(project: &Project, paths: &Paths, view: &SpecView) -> SpecAnswer {
+    let grid = spectrum::measure(project, paths, None, Some((view.start, view.end)), view.columns as usize, view.rows as usize, SPEC_MIN_HZ, None).ok()?;
+    let (w, h, bytes) = spectrum::rgba(&grid, SPEC_DB.0, SPEC_DB.1);
+    Some((grid.max_hz, w, h, bytes))
+}
+
+/// Keeps the spectrogram in step with the view. True when the picture changed.
+fn watch_spectrogram(s: &mut Studio) -> bool {
+    let mut changed = false;
+    if let Some((view, answer)) = &s.spectro.asked {
+        match answer.try_recv() {
+            Ok(Some((top_hz, w, h, bytes))) => {
+                s.spectro.pixels.set(w, h, bytes);
+                s.spectro.top_hz = top_hz;
+                s.spectro.shown = Some(view.clone());
+                s.spectro.asked = None;
+                changed = true;
+            }
+            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => s.spectro.asked = None,
+            Err(mpsc::TryRecvError::Empty) => return false,
+        }
+    }
+    let Some(wanted) = spec_wanted(s) else { return changed };
+    if s.spectro.shown.as_ref() == Some(&wanted) {
+        return changed;
+    }
+    let Some(doc) = &s.doc else { return changed };
+    let (project, paths, view) = (doc.project.clone(), s.paths.clone(), wanted.clone());
+    if s.spectro.at_once {
+        s.spectro.at_once = false;
+        if let Some((top_hz, w, h, bytes)) = measure_spec(&project, &paths, &view) {
+            s.spectro.pixels.set(w, h, bytes);
+            s.spectro.top_hz = top_hz;
+            s.spectro.shown = Some(view);
+        }
+        return true;
+    }
+    let (send, answer) = mpsc::channel();
+    if std::thread::Builder::new().name("scrubr-spectrogram".into()).spawn(move || drop(send.send(measure_spec(&project, &paths, &view)))).is_ok() {
+        s.spectro.asked = Some((wanted, answer));
+    }
+    changed
+}
+
+/// The spectrogram over the lanes: the picture last measured, put where its audio is now, so
+/// it moves with the view while a fresh one is on its way.
+fn spectrogram_sheet(s: &Studio, k: &Kit, w: f32, h: f32) -> El {
+    let night = oklch(0.06, 0.0, 0.0);
+    let h = h - SPEC_TOP;
+    let mut sheet = el().key("spectrogram").absolute(0.0, SPEC_TOP).size(w, h).clip_rounded(0.0).fill(night);
+    let Some(shown) = s.spectro.shown.as_ref().filter(|shown| shown.generation == s.generation) else {
+        return sheet.child(row().key("spectrogram-wait").absolute(0.0, 0.0).size(w, h).center().child(text("Measuring\u{2026}").font(k.ty.small).color(oklch(0.75, 0.0, 0.0))));
+    };
+    let x = ((shown.start as f64 - s.start) / s.fpp) as f32;
+    let wide = ((shown.end - shown.start) as f64 / s.fpp) as f32;
+    sheet = sheet.child(el().key("spectrogram-picture").absolute(x, 0.0).size(wide, h).pixels(&s.spectro.pixels));
+    // A few frequencies named at the left, where they fall on the logarithmic scale.
+    for (hz, name) in [(100.0, "100 Hz"), (1000.0, "1 kHz"), (5000.0, "5 kHz")] {
+        let y = ((hz / s.spectro.top_hz).ln() / (SPEC_MIN_HZ / s.spectro.top_hz).ln()) as f32 * (h - 1.0);
+        if hz < s.spectro.top_hz && y > 44.0 && y < h - 44.0 {
+            sheet = sheet
+                .child(el().key(format!("hz-line-{hz}")).absolute(0.0, y).size(6.0, 1.0).fill(oklch(0.85, 0.0, 0.0)))
+                .child(row().key(format!("hz-{hz}")).absolute(9.0, y - 8.0).h(16.0).px(4.0).center_y().radius(4.0).fill(night.alpha(0.65)).child(text(name).font(k.ty.small).color(oklch(0.88, 0.0, 0.0))));
+        }
+    }
+    sheet
 }
 
 /// A project being made from an audio file, on its own thread: the file is hashed, converted if
@@ -649,6 +767,7 @@ pub struct Studio {
     creating: Option<Creating>,
     adding: Option<Adding>,
     job: Option<Job>,
+    spectro: Spectro,
     /// The transcript file's modified time when it was last read.
     words_stamp: Option<SystemTime>,
     /// The card for finding words is open.
@@ -1042,6 +1161,7 @@ fn init_with(path: Option<PathBuf>) -> Studio {
         creating: None,
         adding: None,
         job: None,
+        spectro: Spectro { on: has("--spectrogram"), at_once: has("--spectrogram"), ..Default::default() },
         words_stamp: None,
         finding: false,
         find_text: TextEdit::default(),
@@ -1956,7 +2076,7 @@ fn cli() -> PathBuf {
 
 /// Has the command line program do something that needs the speech model, on its own thread.
 /// Its progress lines and its reply come back through the job.
-fn start_job(s: &mut Studio, what: String, args: Vec<String>, done: fn(&serde_json::Value) -> String) {
+fn start_job(s: &mut Studio, what: String, args: Vec<String>, done: fn(&serde_json::Value) -> String, after: Option<fn(&mut Studio, &serde_json::Value)>) {
     use std::io::{BufRead, Read};
     use std::process::{Command, Stdio};
     let said = Arc::new(Mutex::new(String::new()));
@@ -1972,7 +2092,7 @@ fn start_job(s: &mut Studio, what: String, args: Vec<String>, done: fn(&serde_js
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000);
         }
-        let outcome = (|| -> Result<String, String> {
+        let outcome = (|| -> Result<(String, serde_json::Value), String> {
             let mut child = command.spawn().map_err(|e| format!("{} could not be started ({e}). The command line program has to be beside the window's.", program.display()))?;
             // The reply is read on a thread of its own, so a long one cannot hold the program up
             // while its progress is being read here.
@@ -1995,7 +2115,7 @@ fn start_job(s: &mut Studio, what: String, args: Vec<String>, done: fn(&serde_js
             let _ = child.wait();
             let reply: serde_json::Value = serde_json::from_str(&text).map_err(|_| "The command line program gave no reply.".to_string())?;
             if reply["ok"] == true {
-                Ok(done(&reply))
+                Ok((done(&reply), reply))
             } else {
                 let part = |name: &str| reply["error"][name].as_str().unwrap_or_default().to_string();
                 Err(format!("{} {}", part("message"), part("hint")).trim().to_string())
@@ -2006,7 +2126,7 @@ fn start_job(s: &mut Studio, what: String, args: Vec<String>, done: fn(&serde_js
     match started {
         Ok(_) => {
             s.notice = Some(format!("{what}\u{2026}"));
-            s.job = Some(Job { what, said, result, shown: String::new() });
+            s.job = Some(Job { what, said, result, shown: String::new(), after });
         }
         Err(e) => s.notice = Some(format!("Could not start: {e}")),
     }
@@ -2017,8 +2137,17 @@ fn watch_job(s: &mut Studio) -> bool {
     let Some(job) = &mut s.job else { return false };
     match job.result.try_recv() {
         Ok(outcome) => {
+            let after = job.after;
             s.job = None;
-            s.notice = Some(outcome.unwrap_or_else(|why| why));
+            match outcome {
+                Ok((said, reply)) => {
+                    s.notice = Some(said);
+                    if let Some(after) = after {
+                        after(s, &reply);
+                    }
+                }
+                Err(why) => s.notice = Some(why),
+            }
             read_said(s);
             true
         }
@@ -2056,7 +2185,93 @@ fn transcribe(s: &mut Studio) {
         args.extend(["--track".to_string(), track.id.clone()]);
         what = format!("Transcribing {}", track.name);
     }
-    start_job(s, what, args, |reply| format!("Heard {} words.", reply["word_count"]));
+    start_job(s, what, args, |reply| format!("Heard {} words.", reply["word_count"]), None);
+}
+
+/// The project and, when part of the timeline is selected, that part as a `--range`.
+fn tool_args(s: &Studio, command: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = command.iter().map(|part| part.to_string()).collect();
+    args.insert(1, s.paths.project.to_string_lossy().into_owned());
+    if let Some((a, b)) = s.selection.filter(|(a, b)| b > a) {
+        args.extend(["--range".to_string(), format!("{}f..{}f", a.round() as u64, b.round() as u64)]);
+    }
+    args.push("--json".to_string());
+    args
+}
+
+/// Shortens every long pause in the selection, or in everything, as `scrubr tighten` does:
+/// one edit, undone in one step.
+fn tighten_pauses(s: &mut Studio) {
+    if s.job.is_some() || busy_adding(s) {
+        return;
+    }
+    let Some(version) = s.doc.as_ref().map(|doc| doc.project.version) else { return };
+    let mut args = tool_args(s, &["tighten"]);
+    args.extend(["--if-version".to_string(), version.to_string(), "--author".to_string(), "you".to_string()]);
+    s.hold_reloads = false;
+    start_job(
+        s,
+        "Tightening pauses".to_string(),
+        args,
+        |reply| format!("Shortened {} pauses to {:.1} s each: {:.1} s removed.", reply["pause_count"], reply["to_seconds"].as_f64().unwrap_or(0.0), reply["removed_seconds"].as_f64().unwrap_or(0.0)),
+        None,
+    );
+}
+
+/// Reads back every join the edits have left, as `scrubr analyze --joins` does, and goes to
+/// the first that does not sit in quiet.
+fn check_joins(s: &mut Studio) {
+    if s.doc.is_none() || s.job.is_some() {
+        return;
+    }
+    let args = tool_args(s, &["analyze", "--joins"]);
+    start_job(
+        s,
+        "Checking joins".to_string(),
+        args,
+        |reply| match (reply["join_count"].as_u64().unwrap_or(0), reply["joins_to_check"].as_u64().unwrap_or(0)) {
+            (0, _) => "There are no joins here: nothing has been cut or put in.".to_string(),
+            (1, 0) => "The one join sits in quiet.".to_string(),
+            (joins, 0) => format!("All {joins} joins sit in quiet."),
+            (joins, check) => format!("{check} of {joins} joins to check. The playhead is at the first."),
+        },
+        Some(|s, reply| {
+            let (Some(at), Some(rate)) = (first_to_check(reply).and_then(|j| j["at"].as_f64()), s.doc.as_ref().map(|d| d.rate() as f64)) else { return };
+            set_cursor(s, at * rate);
+            // A little before it in view, so what leads up to the join is seen and heard.
+            let w = s.wave[0] as f64;
+            if at * rate < s.start || at * rate > s.start + w * s.fpp {
+                s.start = at * rate - 0.3 * w * s.fpp;
+                clamp(s);
+            }
+        }),
+    );
+}
+
+fn first_to_check(reply: &serde_json::Value) -> Option<&serde_json::Value> {
+    reply["joins"].as_array()?.iter().find(|j| j["check"] == true)
+}
+
+/// Measures the loudness of the selection, or of everything.
+fn measure_loudness(s: &mut Studio) {
+    if s.doc.is_none() || s.job.is_some() {
+        return;
+    }
+    let args = tool_args(s, &["analyze", "--loudness"]);
+    start_job(
+        s,
+        "Measuring".to_string(),
+        args,
+        |reply| {
+            let l = &reply["loudness"];
+            let of = if reply["range"].is_object() { "The selection" } else { "The timeline" };
+            match l["integrated_lufs"].as_f64() {
+                Some(lufs) => format!("{of} is at {lufs:.1} LUFS, with a true peak of {:.1} dBTP and a range of {:.1} LU.", l["true_peak_dbtp"].as_f64().unwrap_or(0.0), l["range_lu"].as_f64().unwrap_or(0.0)),
+                None => format!("{of} is too quiet to measure."),
+            }
+        },
+        None,
+    );
 }
 
 /// The words the selection covers, as a phrase, with the track they were heard on if that was
@@ -2100,7 +2315,7 @@ fn cut_words(s: &mut Studio) {
         args.extend(["--heard-on".to_string(), track]);
     }
     s.hold_reloads = false;
-    start_job(s, "Cutting".to_string(), args, |reply| format!("Cut \u{201c}{}\u{201d}. The join was listened to and is clean.", reply["phrase"].as_str().unwrap_or_default()));
+    start_job(s, "Cutting".to_string(), args, |reply| format!("Cut \u{201c}{}\u{201d}. The join was listened to and is clean.", reply["phrase"].as_str().unwrap_or_default()), None);
 }
 
 /// Selects what a label marks, or goes to it when it marks a point.
@@ -2168,6 +2383,9 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
     }
     let version = (s.generation, s.start.to_bits(), s.fpp.to_bits(), w.to_bits(), h.to_bits(), scale.to_bits(), s.selection.map(|(a, b)| (a.to_bits(), b.to_bits())), s.selected, k.dark);
     area = area.child(memo("wave-shape", version, || canvas(wave_shape(s, doc, lk, w, h, scale)).absolute(0.0, 0.0).size(w, h)));
+    if s.spectro.on {
+        area = area.child(spectrogram_sheet(s, k, w, h));
+    }
     if let Some((a, b)) = s.selection {
         let (x0, x1) = ((((a - s.start) / s.fpp) as f32).max(0.0), (((b - s.start) / s.fpp) as f32).min(w));
         if x1 > x0 {
@@ -3337,9 +3555,10 @@ fn watch_export(s: &mut Studio) -> bool {
     let finished = match x.result.try_recv() {
         Ok(Ok(report)) => {
             let rate = s.doc.as_ref().map_or(48_000, |d| d.rate());
-            let format = match report.depth {
-                export::Depth::Int(bits) => format!("{} {bits}-bit", report.format.name().to_uppercase()),
-                export::Depth::Float => format!("{} 32-bit float", report.format.name().to_uppercase()),
+            let format = match (report.kbps, report.depth) {
+                (Some(kbps), _) => format!("MP3 {kbps} kbps"),
+                (None, export::Depth::Int(bits)) => format!("{} {bits}-bit", report.format.name().to_uppercase()),
+                (None, export::Depth::Float) => format!("{} 32-bit float", report.format.name().to_uppercase()),
             };
             let clipped = if report.clipped_samples > 0 { format!(" \u{b7} {} samples clipped", report.clipped_samples) } else { String::new() };
             format!("Exported {} to {} \u{b7} {format} \u{b7} {}{clipped}", timecode(report.frames as f64, rate), x.name, size_text(report.bytes))
@@ -3375,7 +3594,8 @@ fn flush_asks(s: &mut Studio, tx: &mut Tx) {
             let stem = s.paths.project.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "export".into());
             let options = FileDialogOptions { title: "Export".into(), directory: folder, file_name: Some(format!("{stem}.flac")), ..Default::default() }
                 .filter("FLAC", &["flac"])
-                .filter("WAV", &["wav"]);
+                .filter("WAV", &["wav"])
+                .filter("MP3", &["mp3"]);
             tx.save_file(options, |s: &mut Studio, result: FileDialogResult, _| match result {
                 Ok(Some(path)) => start_export(s, path),
                 Ok(None) => {}
@@ -3483,7 +3703,7 @@ impl Command {
     }
 }
 
-const MENUS: [&str; 4] = ["File", "Edit", "View", "Transport"];
+const MENUS: [&str; 5] = ["File", "Edit", "View", "Transport", "Tools"];
 
 fn always(_: &Studio) -> bool {
     true
@@ -3498,7 +3718,7 @@ fn has_splices(s: &Studio) -> bool {
     s.doc.as_ref().is_some_and(|d| !d.splices.is_empty())
 }
 
-static COMMANDS: [Command; 26] = [
+static COMMANDS: [Command; 30] = [
     Command { menu: 0, label: NEW, keys: Keys::Cmd('n'), divide: false, built: true, enabled: |s| s.creating.is_none(), run: start_fresh },
     Command { menu: 0, label: OPEN, keys: Keys::Cmd('o'), divide: false, built: true, enabled: always, run: |s| s.ask = Some(Ask::Open) },
     Command { menu: 0, label: "Export\u{2026}", keys: Keys::Cmd('e'), divide: false, built: true, enabled: |s| s.exporting.is_none(), run: |s| s.ask = Some(Ask::Export) },
@@ -3533,8 +3753,7 @@ static COMMANDS: [Command; 26] = [
     },
     Command { menu: 1, label: "Cut words", keys: Keys::Shift('x'), divide: false, built: true, enabled: |s| s.job.is_none() && chosen_words(s).is_some(), run: cut_words },
     Command { menu: 1, label: "Add label\u{2026}", keys: Keys::Char('l'), divide: true, built: true, enabled: always, run: begin_label },
-    Command { menu: 1, label: "Transcribe", keys: Keys::Cmd('t'), divide: true, built: true, enabled: |s| s.job.is_none(), run: transcribe },
-    Command { menu: 1, label: "Find words\u{2026}", keys: Keys::Cmd('f'), divide: false, built: true, enabled: has_words, run: begin_find },
+    Command { menu: 1, label: "Find words\u{2026}", keys: Keys::Cmd('f'), divide: true, built: true, enabled: has_words, run: begin_find },
     Command { menu: 1, label: "Set selection start", keys: Keys::Char('i'), divide: true, built: true, enabled: always, run: |s| mark_selection(s, true) },
     Command { menu: 1, label: "Set selection end", keys: Keys::Char('o'), divide: false, built: true, enabled: always, run: |s| mark_selection(s, false) },
     Command {
@@ -3596,6 +3815,13 @@ static COMMANDS: [Command; 26] = [
     },
     Command { menu: 3, label: "Previous splice", keys: Keys::Char('['), divide: false, built: true, enabled: has_splices, run: |s| step_splice(s, false) },
     Command { menu: 3, label: "Next splice", keys: Keys::Char(']'), divide: false, built: true, enabled: has_splices, run: |s| step_splice(s, true) },
+    // Tools look, listen and measure. Those that act on part of the timeline take the selection,
+    // or everything when there is none.
+    Command { menu: 4, label: "Spectrogram", keys: Keys::Char('s'), divide: false, built: true, enabled: always, run: |s| s.spectro.on = !s.spectro.on },
+    Command { menu: 4, label: "Transcribe", keys: Keys::Cmd('t'), divide: true, built: true, enabled: |s| s.job.is_none(), run: transcribe },
+    Command { menu: 4, label: "Tighten pauses", keys: Keys::Shift('p'), divide: false, built: true, enabled: |s| s.job.is_none(), run: tighten_pauses },
+    Command { menu: 4, label: "Check joins", keys: Keys::Shift('j'), divide: false, built: true, enabled: |s| s.job.is_none() && has_splices(s), run: check_joins },
+    Command { menu: 4, label: "Measure loudness", keys: Keys::Shift('l'), divide: false, built: true, enabled: |s| s.job.is_none(), run: measure_loudness },
 ];
 
 fn command(label: &str) -> &'static Command {
@@ -3623,11 +3849,18 @@ fn main_menu(s: &Studio, k: &Kit, layer: &mut Vec<El>) -> El {
             if c.divide {
                 entries.push(MenuEntry::Separator);
             }
+            if c.label == "Transcribe" {
+                // What the tools under it act on. It also gives the menu room for their names.
+                entries.push(MenuEntry::Label("On the selection, or on everything".into()));
+            }
             let mut item = MenuItem::new(c.label).shortcut(c.keys.label()).disabled(!c.available(s)).on_select_tx(move |s: &mut Studio, tx: &mut Tx| {
                 close_menu(s);
                 (c.run)(s);
                 flush_asks(s, tx);
             });
+            if c.label == "Spectrogram" {
+                item = item.checked(s.spectro.on);
+            }
             if !c.built {
                 item = item.badge("soon");
             }
@@ -3917,12 +4150,13 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
     changed |= watch_creating(s);
     changed |= watch_adding(s);
     changed |= watch_job(s);
+    changed |= watch_spectrogram(s);
     // A file being listened to stops showing as playing when it ends.
     if s.files.playing.as_ref().is_some_and(|(_, p)| p.done()) {
         s.files.playing = None;
         changed = true;
     }
-    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.creating.is_some() || s.adding.is_some() || s.job.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
+    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.creating.is_some() || s.adding.is_some() || s.job.is_some() || s.spectro.asked.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
 
     if s.pretend_edit_at.is_some_and(|at| t >= at) {
         s.pretend_edit_at = None;

@@ -230,6 +230,21 @@ fn colour(t: f32) -> [u8; 3] {
     std::array::from_fn(|c| (STOPS[i][c] + (STOPS[i + 1][c] - STOPS[i][c]) * part).round() as u8)
 }
 
+/// A grid as a picture: its width and height, and RGBA bytes row by row from the top. Levels at
+/// or under `floor_db` are black and those at or over `ceiling_db` the brightest colour.
+pub fn rgba(grid: &Grid, floor_db: f64, ceiling_db: f64) -> (u32, u32, Vec<u8>) {
+    let (columns, rows) = (grid.db.len(), grid.rows());
+    let span = (ceiling_db - floor_db).max(1.0) as f32;
+    let mut out = vec![255u8; columns * rows * 4];
+    for (x, column) in grid.db.iter().enumerate() {
+        for (y, &db) in column.iter().enumerate() {
+            let at = (y * columns + x) * 4;
+            out[at..at + 3].copy_from_slice(&colour((db - floor_db as f32) / span));
+        }
+    }
+    (columns as u32, rows as u32, out)
+}
+
 /// Draws a spectrogram of the timeline at head, or a range of it, to a PNG at `out`.
 pub fn render_png(project: &Project, paths: &Paths, out: &Path, options: &Options) -> Result<Report> {
     let (width, height) = (options.width, options.height);

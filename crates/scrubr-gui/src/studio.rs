@@ -2207,8 +2207,8 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
         }
     }
     // What was said, along the audio it was said in: a strip at the foot of each lane that has
-    // words. Close in, the words themselves, each a press away from being selected. Further out,
-    // thin marks where there is speech.
+    // words. Close in, the words themselves, each on a pill as long as the word was heard for and
+    // a press away from being selected. Further out, thin marks where there is speech.
     let across = w as f64 * s.fpp / doc.rate() as f64;
     let right = s.start + w as f64 * s.fpp;
     let x_of = |t: u64| ((t as f64 - s.start) / s.fpp) as f32;
@@ -2242,19 +2242,73 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
         let every = across <= WORDS_SECONDS;
         let pause = (PAUSE_SECONDS * doc.rate() as f64) as u64;
         let mut free = f32::NEG_INFINITY;
+        // Three layers, so a word that is longer written than said can lie over its neighbours'
+        // pills and still be read: plates under such words, then the pills, then the words.
+        let (mut plates, mut pills, mut labels) = (Vec::new(), Vec::new(), Vec::new());
         for (n, word) in shown.enumerate() {
             let at = first + n;
             let heard = x_of(word.start);
-            let (x, label) = if every {
-                // A word sits where it was heard, or just after the word before it when speech
-                // is too quick for both to fit: a sentence reads as a sentence, a little late.
-                // One that would end up far from its audio is left out.
-                let x = heard.max(free);
-                if x - heard > 220.0 {
+            if every {
+                let chosen = s.selection.is_some_and(|(a, b)| b > a && word.start as f64 >= a - 1.0 && word.end as f64 <= b + 1.0);
+                let (start, end) = (word.start, word.end);
+                // The pill is the word's own stretch of the waveform, start to end. One point is
+                // left between it and the next, since words are heard back to back.
+                let x0 = heard.max(-8.0);
+                let x1 = x_of(word.end).min(w + 8.0);
+                let wide = (x1 - x0 - 1.0).max(3.0);
+                let tint = if chosen { lk.you } else { k.c.text_base.alpha(if at % 2 == 0 { 0.22 } else { 0.12 }) };
+                pills.push(
+                    el().key(format!("span-{i}-{at}"))
+                        .absolute(x0, y)
+                        .size(wide, 16.0)
+                        .radius(4.0)
+                        .fill(lk.lane.alpha(0.92))
+                        .on_press(move |s: &mut Studio| pick_word(s, start, end))
+                        .child(el().size(wide, 16.0).radius(4.0).fill(tint)),
+                );
+                // The model was not sure of a faint word.
+                let ink = if chosen { lk.on_you } else if word.probability < 0.5 { k.c.text_faint } else { k.c.text_muted };
+                let needs = word.text.chars().count() as f32 * 5.9 + 6.0;
+                let centred = x0 + (wide - needs) / 2.0;
+                if needs <= wide && centred >= free {
+                    // Said slowly enough to be written inside its pill.
+                    labels.push(
+                        row()
+                            .key(format!("word-{i}-{at}"))
+                            .absolute(x0, y)
+                            .size(wide, 16.0)
+                            .center()
+                            .on_press(move |s: &mut Studio| pick_word(s, start, end))
+                            .child(text(word.text.clone()).font(k.ty.small).color(ink)),
+                    );
+                    free = x0 + wide;
                     continue;
                 }
-                (x, word.text.clone())
-            } else {
+                // Longer written than said: centred on its pill, or just after the word before it
+                // when speech is too quick for both to fit. A sentence reads as a sentence, a
+                // little late. A word that would end up far from its audio is left out, and its
+                // pill still shows where it was said.
+                let x = centred.max(free).max(if x0 >= 0.0 { 0.0 } else { f32::NEG_INFINITY });
+                if x - centred > 220.0 {
+                    continue;
+                }
+                if !chosen {
+                    plates.push(el().key(format!("plate-{i}-{at}")).absolute(x, y).size(needs, 16.0).radius(4.0).fill(lk.lane.alpha(0.9)));
+                }
+                labels.push(
+                    row()
+                        .key(format!("word-{i}-{at}"))
+                        .absolute(x, y)
+                        .h(16.0)
+                        .px(3.0)
+                        .center_y()
+                        .on_press(move |s: &mut Studio| pick_word(s, start, end))
+                        .child(text(word.text.clone()).font(k.ty.small).color(ink)),
+                );
+                free = x + needs + 3.0;
+                continue;
+            }
+            let (x, label) = {
                 // Further out only the word after each pause is written, where it was heard.
                 let starts = at == 0 || word.start >= said.words[at - 1].end + pause;
                 if !starts || heard < free {
@@ -2278,6 +2332,9 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
                     // The model was not sure of a faint word.
                     .child(text(label).font(k.ty.small).color(if chosen { lk.on_you } else if word.probability < 0.5 { k.c.text_faint } else { k.c.text_muted })),
             );
+        }
+        for layer in plates.into_iter().chain(pills).chain(labels) {
+            area = area.child(layer);
         }
     }
     if doc.magnify() > 1.05 {

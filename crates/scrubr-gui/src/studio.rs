@@ -15,7 +15,7 @@
 use std::f32::consts::FRAC_PI_2;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rune::{Align, App, AppSpec, Chrome, Color, Cx, El, FileDialogOptions, FileDialogResult, Icon, Key, KeyEvent, LineCap, Live, LiveText, Phase, ScrollSpec, Shape, TextEdit, TextStyle, Tx, canvas, col, el, icon, memo, oklch, row, text};
@@ -25,7 +25,8 @@ use scrubr_core::edit::{self, DEFAULT_CROSSFADE_MS, Request, Revert};
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts};
 use scrubr_core::render::Renderer;
 use scrubr_core::timeline::{SrcSpan, TrackState};
-use scrubr_core::{Kind, Peaks, Timeline, export, peaks, source};
+use scrubr_core::transcribe::Word;
+use scrubr_core::{Kind, Peaks, Timeline, export, peaks, phrase, source, words};
 
 use crate::audio::Player;
 
@@ -75,6 +76,14 @@ const RULER_H: f32 = 26.0;
 /// own bottom margin, as the splice marks and labels lie over the top one.
 const MARKS_H: f32 = 16.0;
 const TRANSPORT_H: f32 = 68.0;
+/// Every word is written out when no more than this many seconds fill the timeline's width:
+/// speech runs at about three words a second, and a word needs some forty points.
+const WORDS_SECONDS: f64 = 12.0;
+/// Out to this many seconds, the word each stretch of speech starts with is written, to find a
+/// place by. Further out thin marks show where there is speech.
+const STARTS_SECONDS: f64 = 90.0;
+/// The pause that separates one stretch of speech from the next, in seconds.
+const PAUSE_SECONDS: f64 = 0.35;
 /// The deepest zoom, in frames per point: one sample every 24 points.
 const MIN_FPP: f64 = 1.0 / 24.0;
 /// At this many frames per point or fewer, the lanes draw a line through the samples in place
@@ -206,6 +215,33 @@ struct Group {
     revertable: bool,
 }
 
+/// What was said on the mix or on one track, where it is on the timeline now.
+struct Said {
+    /// The track's place among the timeline's tracks, or `None` for the mix.
+    track: Option<usize>,
+    words: Vec<Word>,
+}
+
+/// The transcript kept for a project, on its timeline as it stands.
+fn said_of(paths: &Paths, tl: &Timeline) -> Vec<Said> {
+    let store = words::load(paths);
+    store
+        .sets
+        .iter()
+        .filter_map(|set| {
+            let track = match &set.track {
+                None => None,
+                Some(id) => Some(tl.tracks().iter().position(|t| t.id == *id && !t.removed)?),
+            };
+            Some(Said { track, words: words::on_timeline(set, tl) })
+        })
+        .collect()
+}
+
+fn words_stamp(paths: &Paths) -> Option<SystemTime> {
+    std::fs::metadata(words::file(paths)).and_then(|m| m.modified()).ok()
+}
+
 struct Doc {
     project: Project,
     tl: Timeline,
@@ -215,6 +251,8 @@ struct Doc {
     levels: Vec<LevelMark>,
     notes: Vec<Note>,
     groups: Vec<Group>,
+    /// What was said, if anything has listened: the mix, and any track heard alone.
+    said: Vec<Said>,
     /// The loudest sample on the timeline, 0.0 to 1.0, after the level edits.
     peak: f32,
 }
@@ -330,7 +368,8 @@ fn load(paths: &Paths) -> Result<Doc, String> {
         }
         last = Some((e.author.as_str(), &e.session));
     }
-    let mut doc = Doc { project, tl, peaks, states, splices, levels, notes, groups, peak: 1.0 };
+    let said = said_of(paths, &tl);
+    let mut doc = Doc { project, tl, peaks, states, splices, levels, notes, groups, said, peak: 1.0 };
     let total = doc.tl.total().max(1) as f64;
     doc.peak = (0..doc.project.channels.min(2) as usize)
         .flat_map(|c| doc.columns(c, 0.0, total / 2048.0, 2048))
@@ -358,6 +397,19 @@ enum Lane {
 impl Doc {
     fn rate(&self) -> u32 {
         self.project.sample_rate
+    }
+
+    /// The words to draw in a lane. A track shows what was heard on it alone; the main track
+    /// shows the mix when nothing listened to it by itself. A project with one track has one
+    /// strip of words, in its last lane.
+    fn said_for(&self, lane: Lane, last: bool) -> Option<&Said> {
+        let of = |track: Option<usize>| self.said.iter().find(|s| s.track == track && !s.words.is_empty());
+        match lane {
+            Lane::Track(0) => of(Some(0)).or_else(|| of(None)),
+            Lane::Track(t) => of(Some(t)),
+            Lane::Channel(_) if last => of(None).or_else(|| of(Some(0))),
+            Lane::Channel(_) => None,
+        }
     }
 
     /// The lanes, top to bottom.
@@ -482,6 +534,18 @@ enum Ask {
     Export,
 }
 
+/// Work the command line program is doing for the window: transcribing, or cutting by words.
+/// The window carries no speech model; `scrubr`, beside it, does.
+struct Job {
+    /// What is being done, for the notice: "Transcribing", "Cutting".
+    what: String,
+    /// The last line of progress the program printed.
+    said: Arc<Mutex<String>>,
+    /// What to tell the person when it is done, or why it failed.
+    result: mpsc::Receiver<Result<String, String>>,
+    shown: String,
+}
+
 /// A project being made from an audio file, on its own thread: the file is hashed, converted if
 /// it has to be, and its waveform is drawn up.
 struct Creating {
@@ -584,6 +648,15 @@ pub struct Studio {
     exporting: Option<Exporting>,
     creating: Option<Creating>,
     adding: Option<Adding>,
+    job: Option<Job>,
+    /// The transcript file's modified time when it was last read.
+    words_stamp: Option<SystemTime>,
+    /// The card for finding words is open.
+    finding: bool,
+    find_text: TextEdit,
+    /// Where the words looked for were found, and which of those is selected.
+    found: Vec<(u64, u64)>,
+    found_at: usize,
     doc: Option<Doc>,
     error: Option<String>,
     looks: [Look; 2],
@@ -935,6 +1008,7 @@ fn reload(s: &mut Studio) {
     // Keep the place the audio had reached: the player is about to be replaced.
     s.cursor = head(s);
     s.stamp = stamp(&s.paths);
+    s.words_stamp = words_stamp(&s.paths);
     s.generation += 1;
     match load(&s.paths) {
         Ok(doc) => {
@@ -967,6 +1041,12 @@ fn init_with(path: Option<PathBuf>) -> Studio {
         exporting: None,
         creating: None,
         adding: None,
+        job: None,
+        words_stamp: None,
+        finding: false,
+        find_text: TextEdit::default(),
+        found: Vec::new(),
+        found_at: 0,
         picked: None,
         doc: None,
         error: None,
@@ -1753,6 +1833,276 @@ fn label_composer(s: &Studio, doc: &Doc, lk: &Look, w: f32) -> Option<El> {
     Some(card)
 }
 
+/// Reads the kept transcript again: something has listened since it was last read.
+fn read_said(s: &mut Studio) {
+    if let Some(doc) = &mut s.doc {
+        doc.said = said_of(&s.paths, &doc.tl);
+    }
+    s.words_stamp = words_stamp(&s.paths);
+    s.generation += 1;
+}
+
+/// A press on a word selects the stretch it was heard over and puts the playhead at its start.
+fn pick_word(s: &mut Studio, start: u64, end: u64) {
+    s.selection = Some((start as f64, end as f64));
+    set_cursor(s, start as f64);
+}
+
+fn has_words(s: &Studio) -> bool {
+    s.doc.as_ref().is_some_and(|d| d.said.iter().any(|said| !said.words.is_empty()))
+}
+
+fn begin_find(s: &mut Studio) {
+    cancel_label(s);
+    s.finding = true;
+    s.find_text.focused = true;
+    s.hover_note = None;
+}
+
+fn cancel_find(s: &mut Studio) {
+    s.finding = false;
+    s.find_text.focused = false;
+}
+
+/// Goes to the next place the words in the find card were heard, and selects it.
+fn find_next(s: &mut Studio) {
+    let Some(doc) = &s.doc else { return };
+    let wanted: Vec<String> = s.find_text.text.split_whitespace().map(phrase::plain).filter(|w| !w.is_empty()).collect();
+    let mut found: Vec<(u64, u64)> = Vec::new();
+    for said in doc.said.iter().filter(|said| !wanted.is_empty() && said.words.len() >= wanted.len()) {
+        let heard: Vec<String> = said.words.iter().map(|w| phrase::plain(&w.text)).collect();
+        for i in 0..=heard.len() - wanted.len() {
+            if heard[i..i + wanted.len()] == wanted[..] {
+                found.push((said.words[i].start, said.words[i + wanted.len() - 1].end));
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    if found.is_empty() {
+        s.found = found;
+        if !wanted.is_empty() {
+            s.notice = Some(format!("\u{201c}{}\u{201d} is not among the words that were heard.", s.find_text.text.trim()));
+        }
+        return;
+    }
+    // The first one from the playhead on, then each one after it, round to the start again.
+    let from = s.selection.map_or(s.cursor, |(a, _)| a + 1.0);
+    let at = found.iter().position(|f| f.0 as f64 >= from).unwrap_or(0);
+    let (a, b) = found[at];
+    s.found = found;
+    s.found_at = at;
+    s.notice = None;
+    s.selection = Some((a as f64, b as f64));
+    set_cursor(s, a as f64);
+    reveal(s, a as f64);
+}
+
+/// The card for finding words: a field, and which match is selected.
+fn find_card(s: &Studio, lk: &Look, w: f32) -> Option<El> {
+    if !s.finding {
+        return None;
+    }
+    let k = &lk.k;
+    let cw = 300.0;
+    let count = if s.found.is_empty() { String::new() } else { format!("{} of {}", s.found_at + 1, s.found.len()) };
+    let field = TextInput::new(&s.find_text)
+        .placeholder("Words that were said")
+        .on_edit(|s: &mut Studio| &mut s.find_text)
+        .on_submit(|s: &mut Studio, _| find_next(s))
+        .on_key(|s: &mut Studio, e, _| {
+            let escape = matches!(e.key, Key::Escape);
+            if escape {
+                cancel_find(s);
+            }
+            escape
+        })
+        .build(k);
+    let mut card = col()
+        .key("find-words")
+        .absolute(((w - cw) / 2.0).max(8.0), 23.0)
+        .w(cw)
+        .radius(k.radius.md)
+        .clip_rounded(k.radius.md)
+        .fill(k.c.layer_03)
+        .border(1.0, k.c.border_base)
+        .child(
+            row()
+                .w_full()
+                .h(28.0)
+                .px(10.0)
+                .gap(6.0)
+                .center_y()
+                .fill(lk.you.alpha(0.14))
+                .child(text("Find words").font(k.ty.small_medium).color(lk.you))
+                .child(el().grow(1.0))
+                .child(text(count).key("find-count").font(lk.num(k.ty.small)).color(k.c.text_muted)),
+        )
+        .child(col().w_full().px(10.0).pt(9.0).pb(9.0).gap(7.0).child(field).child(text("Enter goes to the next \u{b7} Esc closes").font(k.ty.small).color(k.c.text_faint)));
+    for shadow in &k.elevation.floating {
+        card = card.box_shadow(*shadow);
+    }
+    Some(card)
+}
+
+/// The command line program, which is beside the window's own. `SCRUBR_CLI` names another.
+fn cli() -> PathBuf {
+    if let Some(named) = std::env::var_os("SCRUBR_CLI") {
+        return PathBuf::from(named);
+    }
+    let name = if cfg!(windows) { "scrubr.exe" } else { "scrubr" };
+    std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join(name))).unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Has the command line program do something that needs the speech model, on its own thread.
+/// Its progress lines and its reply come back through the job.
+fn start_job(s: &mut Studio, what: String, args: Vec<String>, done: fn(&serde_json::Value) -> String) {
+    use std::io::{BufRead, Read};
+    use std::process::{Command, Stdio};
+    let said = Arc::new(Mutex::new(String::new()));
+    let (answer, result) = mpsc::channel();
+    let lines = said.clone();
+    let started = std::thread::Builder::new().name("scrubr-job".into()).spawn(move || {
+        let program = cli();
+        let mut command = Command::new(&program);
+        command.args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            // No console window for a console program started by a window program.
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let outcome = (|| -> Result<String, String> {
+            let mut child = command.spawn().map_err(|e| format!("{} could not be started ({e}). The command line program has to be beside the window's.", program.display()))?;
+            // The reply is read on a thread of its own, so a long one cannot hold the program up
+            // while its progress is being read here.
+            let mut out = child.stdout.take();
+            let reply = std::thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(out) = &mut out {
+                    let _ = out.read_to_string(&mut text);
+                }
+                text
+            });
+            if let Some(err) = child.stderr.take() {
+                for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                    if let Ok(mut last) = lines.lock() {
+                        *last = line;
+                    }
+                }
+            }
+            let text = reply.join().unwrap_or_default();
+            let _ = child.wait();
+            let reply: serde_json::Value = serde_json::from_str(&text).map_err(|_| "The command line program gave no reply.".to_string())?;
+            if reply["ok"] == true {
+                Ok(done(&reply))
+            } else {
+                let part = |name: &str| reply["error"][name].as_str().unwrap_or_default().to_string();
+                Err(format!("{} {}", part("message"), part("hint")).trim().to_string())
+            }
+        })();
+        let _ = answer.send(outcome);
+    });
+    match started {
+        Ok(_) => {
+            s.notice = Some(format!("{what}\u{2026}"));
+            s.job = Some(Job { what, said, result, shown: String::new() });
+        }
+        Err(e) => s.notice = Some(format!("Could not start: {e}")),
+    }
+}
+
+/// Shows a job's progress, and what it came to when it ends. True when the window has changed.
+fn watch_job(s: &mut Studio) -> bool {
+    let Some(job) = &mut s.job else { return false };
+    match job.result.try_recv() {
+        Ok(outcome) => {
+            s.job = None;
+            s.notice = Some(outcome.unwrap_or_else(|why| why));
+            read_said(s);
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            let line = job.said.lock().map(|line| line.clone()).unwrap_or_default();
+            if line == job.shown {
+                return false;
+            }
+            // "transcribe: 0:10.000 of 0:46.010" reads as "Transcribing… 0:10.000 of 0:46.010".
+            let rest = line.split_once(": ").map_or(line.as_str(), |(_, rest)| rest).to_string();
+            s.notice = Some(format!("{}\u{2026} {rest}", job.what));
+            job.shown = line;
+            true
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            s.job = None;
+            s.notice = Some("It stopped without a result.".into());
+            true
+        }
+    }
+}
+
+/// Listens to the selection, or to everything when there is none, and keeps the words. The
+/// picked track is heard alone; otherwise the mix.
+fn transcribe(s: &mut Studio) {
+    if s.doc.is_none() || s.job.is_some() {
+        return;
+    }
+    let mut args = vec!["transcribe".to_string(), s.paths.project.to_string_lossy().into_owned(), "--json".to_string()];
+    if let Some((a, b)) = s.selection.filter(|(a, b)| b > a) {
+        args.extend(["--range".to_string(), format!("{}f..{}f", a.round() as u64, b.round() as u64)]);
+    }
+    let mut what = "Transcribing".to_string();
+    if let Some((_, track)) = picked_track(s) {
+        args.extend(["--track".to_string(), track.id.clone()]);
+        what = format!("Transcribing {}", track.name);
+    }
+    start_job(s, what, args, |reply| format!("Heard {} words.", reply["word_count"]));
+}
+
+/// The words the selection covers, as a phrase, with the track they were heard on if that was
+/// one track alone.
+fn chosen_words(s: &Studio) -> Option<(String, Option<String>)> {
+    let doc = s.doc.as_ref()?;
+    let (a, b) = s.selection.filter(|(a, b)| b > a)?;
+    let said = match picked_track(s) {
+        Some((t, _)) => doc.said_for(Lane::Track(t), false),
+        None => doc.said_for(Lane::Track(0), false),
+    }?;
+    let inside: Vec<&str> = said.words.iter().filter(|w| w.start as f64 >= a - 1.0 && w.end as f64 <= b + 1.0).map(|w| w.text.as_str()).collect();
+    (!inside.is_empty()).then(|| (inside.join(" "), said.track.map(|t| doc.tl.tracks()[t].id.clone())))
+}
+
+/// Cuts the selected words out, the way `scrubr cut --phrase` does: at the quietest moment
+/// either side, and only if listening across the join finds it clean.
+fn cut_words(s: &mut Studio) {
+    let Some((phrase, heard_on)) = chosen_words(s) else { return };
+    if s.job.is_some() || busy_adding(s) {
+        return;
+    }
+    let (Some(doc), Some((a, b))) = (&s.doc, s.selection) else { return };
+    // A little either side of the selection is listened to, so the pauses are in reach.
+    let margin = 1.5 * doc.rate() as f64;
+    let within = format!("{}f..{}f", (a - margin).max(0.0).round() as u64, ((b + margin).round() as u64).min(doc.tl.total()));
+    let mut args = vec![
+        "cut".to_string(),
+        s.paths.project.to_string_lossy().into_owned(),
+        "--phrase".to_string(),
+        phrase,
+        "--within".to_string(),
+        within,
+        "--if-version".to_string(),
+        doc.project.version.to_string(),
+        "--author".to_string(),
+        "you".to_string(),
+        "--json".to_string(),
+    ];
+    if let Some(track) = heard_on {
+        args.extend(["--heard-on".to_string(), track]);
+    }
+    s.hold_reloads = false;
+    start_job(s, "Cutting".to_string(), args, |reply| format!("Cut \u{201c}{}\u{201d}. The join was listened to and is clean.", reply["phrase"].as_str().unwrap_or_default()));
+}
+
 /// Selects what a label marks, or goes to it when it marks a point.
 fn pick_note(s: &mut Studio, i: usize) {
     let Some((a, b)) = s.doc.as_ref().and_then(|d| d.notes.get(i)).map(|n| (n.start as f64, n.end as f64)) else { return };
@@ -1856,6 +2206,80 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
             Lane::Track(t) => area = area.child(track_head(lk, &doc.tl.tracks()[t], y, t == 0, picked == Some(t))),
         }
     }
+    // What was said, along the audio it was said in: a strip at the foot of each lane that has
+    // words. Close in, the words themselves, each a press away from being selected. Further out,
+    // thin marks where there is speech.
+    let across = w as f64 * s.fpp / doc.rate() as f64;
+    let right = s.start + w as f64 * s.fpp;
+    let x_of = |t: u64| ((t as f64 - s.start) / s.fpp) as f32;
+    for (i, lane) in lanes.iter().enumerate() {
+        let last = i + 1 == lanes.len();
+        let Some(said) = doc.said_for(*lane, last) else { continue };
+        let y = h / lanes.len() as f32 * (i + 1) as f32 - if last { MARKS_H + 20.0 } else { 20.0 };
+        let first = said.words.partition_point(|word| (word.end as f64) < s.start);
+        let shown = said.words[first..].iter().take_while(|word| (word.start as f64) <= right);
+        if across > STARTS_SECONDS {
+            let mut marks = Shape::new();
+            let mut run: Option<(f32, f32)> = None;
+            for word in shown {
+                let x0 = x_of(word.start);
+                let x1 = x_of(word.end).max(x0 + 1.0);
+                run = match run {
+                    Some((a, b)) if x0 <= b + 1.5 => Some((a, b.max(x1))),
+                    Some((a, b)) => {
+                        marks = marks.line([a, 2.0], [b, 2.0], 2.0, LineCap::Butt, k.c.text_faint);
+                        Some((x0, x1))
+                    }
+                    None => Some((x0, x1)),
+                };
+            }
+            if let Some((a, b)) = run {
+                marks = marks.line([a, 2.0], [b, 2.0], 2.0, LineCap::Butt, k.c.text_faint);
+            }
+            area = area.child(canvas(marks).key(format!("said-{i}")).absolute(0.0, y + 12.0).size(w, 4.0));
+            continue;
+        }
+        let every = across <= WORDS_SECONDS;
+        let pause = (PAUSE_SECONDS * doc.rate() as f64) as u64;
+        let mut free = f32::NEG_INFINITY;
+        for (n, word) in shown.enumerate() {
+            let at = first + n;
+            let heard = x_of(word.start);
+            let (x, label) = if every {
+                // A word sits where it was heard, or just after the word before it when speech
+                // is too quick for both to fit: a sentence reads as a sentence, a little late.
+                // One that would end up far from its audio is left out.
+                let x = heard.max(free);
+                if x - heard > 220.0 {
+                    continue;
+                }
+                (x, word.text.clone())
+            } else {
+                // Further out only the word after each pause is written, where it was heard.
+                let starts = at == 0 || word.start >= said.words[at - 1].end + pause;
+                if !starts || heard < free {
+                    continue;
+                }
+                (heard, format!("{}\u{2026}", word.text.trim_end_matches(|c: char| c.is_ascii_punctuation())))
+            };
+            free = x + label.chars().count() as f32 * 5.9 + 9.0;
+            let chosen = s.selection.is_some_and(|(a, b)| b > a && word.start as f64 >= a - 1.0 && word.end as f64 <= b + 1.0);
+            let (start, end) = (word.start, word.end);
+            area = area.child(
+                row()
+                    .key(format!("word-{i}-{at}"))
+                    .absolute(x, y)
+                    .h(16.0)
+                    .px(3.0)
+                    .center_y()
+                    .radius(4.0)
+                    .fill(if chosen { lk.you } else { lk.lane.alpha(0.9) })
+                    .on_press(move |s: &mut Studio| pick_word(s, start, end))
+                    // The model was not sure of a faint word.
+                    .child(text(label).font(k.ty.small).color(if chosen { lk.on_you } else if word.probability < 0.5 { k.c.text_faint } else { k.c.text_muted })),
+            );
+        }
+    }
     if doc.magnify() > 1.05 {
         // Say so when the lanes are not at true scale.
         let note = format!("peak {:.1} dB · shown \u{00d7}{:.1}", 20.0 * doc.peak.log10(), doc.magnify());
@@ -1932,6 +2356,9 @@ fn wave_area(s: &Studio, doc: &Doc, lk: &Look, scale: f32) -> El {
         area = area.child(el().key("label-range").absolute(x0, 0.0).size((x1 - x0).max(1.5), h).fill(lk.you.alpha(if x1 - x0 > 1.5 { 0.10 } else { 0.8 })));
     }
     if let Some(card) = label_composer(s, doc, lk, w) {
+        area = area.child(card);
+    }
+    if let Some(card) = find_card(s, lk, w) {
         area = area.child(card);
     }
     area
@@ -2799,6 +3226,8 @@ fn open_project(s: &mut Studio, path: PathBuf) {
     s.paths = Paths::new(path);
     s.blank = false;
     s.fresh = false;
+    cancel_find(s);
+    s.found.clear();
     s.selection = None;
     s.picked = None;
     s.selected = None;
@@ -3012,7 +3441,7 @@ fn has_splices(s: &Studio) -> bool {
     s.doc.as_ref().is_some_and(|d| !d.splices.is_empty())
 }
 
-static COMMANDS: [Command; 23] = [
+static COMMANDS: [Command; 26] = [
     Command { menu: 0, label: NEW, keys: Keys::Cmd('n'), divide: false, built: true, enabled: |s| s.creating.is_none(), run: start_fresh },
     Command { menu: 0, label: OPEN, keys: Keys::Cmd('o'), divide: false, built: true, enabled: always, run: |s| s.ask = Some(Ask::Open) },
     Command { menu: 0, label: "Export\u{2026}", keys: Keys::Cmd('e'), divide: false, built: true, enabled: |s| s.exporting.is_none(), run: |s| s.ask = Some(Ask::Export) },
@@ -3045,7 +3474,10 @@ static COMMANDS: [Command; 23] = [
         enabled: |s| has_selection(s) && picked_track(s).is_some(),
         run: mute_on_track,
     },
+    Command { menu: 1, label: "Cut words", keys: Keys::Shift('x'), divide: false, built: true, enabled: |s| s.job.is_none() && chosen_words(s).is_some(), run: cut_words },
     Command { menu: 1, label: "Add label\u{2026}", keys: Keys::Char('l'), divide: true, built: true, enabled: always, run: begin_label },
+    Command { menu: 1, label: "Transcribe", keys: Keys::Cmd('t'), divide: true, built: true, enabled: |s| s.job.is_none(), run: transcribe },
+    Command { menu: 1, label: "Find words\u{2026}", keys: Keys::Cmd('f'), divide: false, built: true, enabled: has_words, run: begin_find },
     Command { menu: 1, label: "Set selection start", keys: Keys::Char('i'), divide: true, built: true, enabled: always, run: |s| mark_selection(s, true) },
     Command { menu: 1, label: "Set selection end", keys: Keys::Char('o'), divide: false, built: true, enabled: always, run: |s| mark_selection(s, false) },
     Command {
@@ -3351,10 +3783,11 @@ fn on_key(s: &mut Studio, e: &KeyEvent, tx: &mut Tx) -> bool {
     }
     // While a label is being written, keys are its text. If the field has lost the keyboard,
     // Esc still closes the card and nothing else runs a command.
-    if s.labeling.is_some() {
+    if s.labeling.is_some() || s.finding {
         let escape = matches!(e.key, Key::Escape);
         if escape {
             cancel_label(s);
+            cancel_find(s);
         }
         return escape;
     }
@@ -3426,12 +3859,13 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
     changed |= watch_export(s);
     changed |= watch_creating(s);
     changed |= watch_adding(s);
+    changed |= watch_job(s);
     // A file being listened to stops showing as playing when it ends.
     if s.files.playing.as_ref().is_some_and(|(_, p)| p.done()) {
         s.files.playing = None;
         changed = true;
     }
-    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.creating.is_some() || s.adding.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
+    tx.wake_after(Duration::from_millis(if still_playing || meters_lit { 4 } else if s.exporting.is_some() || s.creating.is_some() || s.adding.is_some() || s.job.is_some() || s.files.playing.is_some() { 100 } else { 500 }));
 
     if s.pretend_edit_at.is_some_and(|at| t >= at) {
         s.pretend_edit_at = None;
@@ -3446,6 +3880,10 @@ fn poll(s: &mut Studio, t: f64, tx: &mut Tx) -> bool {
                 s.fleeting = Some((word.clone(), t + 8.0));
                 s.notice = Some(word);
             }
+            changed = true;
+        } else if words_stamp(&s.paths) != s.words_stamp {
+            // Something has listened: `scrubr transcribe`, run by an agent or from here.
+            read_said(s);
             changed = true;
         }
     }

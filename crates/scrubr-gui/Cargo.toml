@@ -11,4 +11,6 @@ scrubr-core = { path = "../scrubr-core" }
 rune = { workspace = true, features = ["native-file-dialog"] }
 rune-kit = { workspace = true }
 cpal = "0.18"
+# Replies from the command line program, when it transcribes or cuts by words for the window.
+serde_json = "1"
 rtrb = "0.4"

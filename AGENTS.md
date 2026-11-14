@@ -46,7 +46,8 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr analyze P [--loudness] [--peaks] [--silence -45dB:1s] [--envelope 1s] [--range R]` | Measurements. With no flags: loudness and peaks |
 | `scrubr analyze P --quietest R [--quietest R ...]` | The quietest moment in each range, as `at`: where to put a cut between two words |
 | `scrubr render P --png out.png [--range R] [--width 1600] [--height 480]` | Waveform image. The reply gives `start` and `seconds_per_pixel`, so pixel x is at `start + x * seconds_per_pixel` |
-| `scrubr transcribe P [--range R] [--model base.en]` | Every word spoken, with `start` and `end`. Only in builds with the transcription feature; other builds say so |
+| `scrubr transcribe P [--range R] [--model base.en]` | Every word spoken, with `start` and `end`. What it hears is kept. Only in builds with the transcription feature; other builds say so |
+| `scrubr transcribe P --saved [--range R]` | The words kept from earlier runs, where they are on the timeline now. Instant, in any build |
 | `scrubr find P "words" [--within R]` | Where a phrase is said, and the cut that would take it out. Changes nothing. Needs the transcription feature |
 | `scrubr cut P R` | Remove a range |
 | `scrubr cut P --phrase "words" [--within R] [--occurrence N \| --all]` | Remove a phrase by its words, checked before it is written. Needs the transcription feature |
@@ -140,6 +141,13 @@ a track by its name or its id (`t2`).
   other. A sound can come back as a word, such as `MUSIC`. A word can have the same `start` and
   `end`. Word times are typically within 0.1 s, but about one in ten is off by 0.5 s or more, so
   do not cut on them directly.
+- **Kept transcripts.** What `transcribe` hears is kept against the audio, the way labels are.
+  After a cut, an insert or an undo, `scrubr transcribe P --saved` gives the words where they are
+  now without listening again: the words that were cut are gone and the rest have moved with
+  their audio. Its `covered` lists the ranges that have been listened to; audio outside them,
+  such as a file inserted since, has no words yet, so run `transcribe --range` over it. Listening
+  to a range again replaces its words. `--track T` keeps a transcript of that track by itself.
+  The window draws the kept words along the waveform for the person.
 - **Removing a phrase.** `scrubr cut P --phrase "you know"` does it in one step. It transcribes,
   finds the words, cuts at the quietest moment either side (never on the word times), and
   listens across the join as it would sound before writing anything. If the words either side

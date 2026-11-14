@@ -4370,6 +4370,7 @@ dependencies = [
  "rune",
  "rune-kit",
  "scrubr-core",
+ "serde_json",
 ]
 
 [[package]]

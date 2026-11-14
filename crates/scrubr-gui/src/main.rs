@@ -646,6 +646,13 @@ fn join_console() {}
 
 fn main() {
     join_console();
+    // The icon in the window's title bar, on the taskbar and in Alt+Tab (the Dock on macOS).
+    // Where the program carries its icon as a Windows resource, each window takes the size it
+    // shows from there: the small ones are drawn for their size, not scaled down.
+    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    rune::set_app_icon_resource(1);
+    #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+    let _ = rune::set_app_icon(include_bytes!("../../../assets/scrubr-256.png").as_slice());
     // A project opens in the project view, and so does no file at all: the view starts empty.
     // A bare WAV still opens the M0 spike below.
     let args = rune::extra_args();

@@ -510,8 +510,62 @@ fn export_counts_clipped_samples_and_never_touches_a_source() {
     assert!(report.clipped_samples > 1_000);
     let err = export::export(&fx.project(), &fx.paths, &fx.source(), &Default::default()).unwrap_err();
     assert_eq!(err.code(), "would_overwrite_source");
-    let err = export::export(&fx.project(), &fx.paths, &fx.root.join("out.mp3"), &Default::default()).unwrap_err();
+    let err = export::export(&fx.project(), &fx.paths, &fx.root.join("out.ogg"), &Default::default()).unwrap_err();
     assert_eq!((err.code(), err.exit_code()), ("format_not_supported", 5));
+}
+
+#[test]
+fn an_mp3_export_plays_back_as_the_same_audio() {
+    // Five seconds in stereo: a 440 Hz tone at -12 dBFS on the left and a 1 kHz tone at -18 on
+    // the right, silent for the fourth second.
+    let frames = 5 * RATE as u64;
+    let fx = Fixture::with(frames, 2, |f, c, _| {
+        let t = f as f32 / RATE as f32;
+        if (3.0..4.0).contains(&t) {
+            return 0.0;
+        }
+        if c == 0 { (TAU * 440.0 * t).sin() * 0.25 } else { (TAU * 1000.0 * t).sin() * 0.125 }
+    });
+    let out = fx.root.join("out").join("tone.mp3");
+    let report = export::export(&fx.project(), &fx.paths, &out, &Default::default()).unwrap();
+    assert_eq!((report.format, report.kbps, report.frames, report.clipped_samples), (export::Format::Mp3, Some(192), frames, 0));
+    // 192 kbps is 24,000 bytes a second, whatever is in it.
+    assert!((report.bytes as f64 - 5.0 * 24_000.0).abs() < 3_000.0, "{}", report.bytes);
+    let again = fx.root.join("again.mp3");
+    export::export(&fx.project(), &fx.paths, &again, &Default::default()).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&again).unwrap(), "the same version gives the same bytes");
+
+    // Read back as a project of its own, it is the same length to the frame and the same sound.
+    let back = Paths::new(fx.root.join("back.scrubr"));
+    edit::new_project(&back, &[out], &me(), false).unwrap();
+    let project = project::open(&back).unwrap();
+    let mut renderer = Renderer::new(&project, &back).unwrap();
+    assert_eq!(renderer.total(), frames);
+    let mut heard = Vec::new();
+    renderer.read(0, frames as usize, &mut heard).unwrap();
+    let level = |channel: usize, from: f64, to: f64| {
+        let (a, b) = ((from * RATE as f64) as usize, (to * RATE as f64) as usize);
+        let sum: f64 = heard[a * 2..b * 2].as_chunks::<2>().0.iter().map(|frame| (frame[channel] as f64).powi(2)).sum();
+        10.0 * (sum / (b - a) as f64).max(1e-12).log10()
+    };
+    // A sine's RMS is 3 dB under its peak.
+    assert!((level(0, 0.5, 2.5) + 15.0).abs() < 0.3 && (level(1, 0.5, 2.5) + 21.0).abs() < 0.3, "{} {}", level(0, 0.5, 2.5), level(1, 0.5, 2.5));
+    assert!(level(0, 3.2, 3.8) < -60.0 && level(1, 3.2, 3.8) < -60.0, "the silent second is silent: {} {}", level(0, 3.2, 3.8), level(1, 3.2, 3.8));
+
+    // A bitrate can be asked for, if MP3 has it at this rate. A bit depth cannot.
+    let small = export::export(&fx.project(), &fx.paths, &fx.root.join("small.mp3"), &export::Options { kbps: Some(96), ..Default::default() }).unwrap();
+    assert!(small.kbps == Some(96) && small.bytes < report.bytes * 6 / 10);
+    let options = |kbps, depth| export::Options { kbps, depth, ..Default::default() };
+    let e = export::export(&fx.project(), &fx.paths, &fx.root.join("x.mp3"), &options(Some(100), None)).unwrap_err();
+    assert!(e.code() == "bad_bitrate" && e.to_string().contains("100 kbps"));
+    assert_eq!(export::export(&fx.project(), &fx.paths, &fx.root.join("x.mp3"), &options(None, Some(Depth::Int(16)))).unwrap_err().code(), "bad_depth");
+    assert_eq!(export::export(&fx.project(), &fx.paths, &fx.root.join("x.flac"), &options(Some(128), None)).unwrap_err().code(), "bad_bitrate");
+    assert!(!fx.root.join("x.mp3").exists() && !fx.root.join("x.mp3.part").exists());
+    assert_eq!((export::default_kbps(22_050, 1), export::default_kbps(48_000, 1), export::mp3_bitrates(96_000).len()), (64, 128, 0));
+
+    // Louder than full scale is clamped and counted, as it is for WAV and FLAC.
+    fx.apply(vec![Request::Gain { db: 14.0, range: None }]);
+    assert!(export::export(&fx.project(), &fx.paths, &fx.root.join("hot.mp3"), &Default::default()).unwrap().clipped_samples > 10_000);
 }
 
 // ---- normalize -------------------------------------------------------------------------------

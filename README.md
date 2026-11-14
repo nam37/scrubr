@@ -57,19 +57,21 @@ The name comes from scrubbing: dragging the playhead to hear the audio under it.
 
 ## A session
 
-Clean up a podcast: cut the long pauses, set the loudness, leave a note, export.
+Clean up a podcast: shorten the long pauses, check the joins, set the loudness, leave a note,
+export.
 
 ```sh
 export SCRUBR_AUTHOR=codex SCRUBR_SESSION=s7
 
 scrubr new ep42.scrubr --from raw/ep42.wav
-scrubr analyze ep42.scrubr --loudness --silence -45dB:1s > report.json
-# turn report.silence into cuts.json, keeping 0.15 s of each pause at both ends
-scrubr apply ep42.scrubr --ops cuts.json --if-version 1
+scrubr analyze ep42.scrubr --loudness --pauses 1s > report.json
+scrubr tighten ep42.scrubr --over 1s --to 0.3s --if-version 1
+scrubr analyze ep42.scrubr --joins          # which joins do not sit in quiet?
 scrubr normalize ep42.scrubr --lufs -16
 scrubr label ep42.scrubr add 14:18.5..14:20.2 "check: cough?"
 scrubr render ep42.scrubr --png check.png
 scrubr export ep42.scrubr out/ep42.flac
+scrubr export ep42.scrubr out/ep42.mp3 --bitrate 128
 scrubr open ep42.scrubr          # hand it to a person
 ```
 
@@ -81,10 +83,15 @@ Every reply is JSON when stdout is not a terminal:
   "project_version": 1,
   "timeline_seconds": 3449.0,
   "loudness": {"integrated_lufs": -21.4, "true_peak_dbtp": -7.2, "range_lu": 8.1},
-  "silence": [{"start": 3.2, "end": 4.85}, {"start": 412.1, "end": 414.02}],
-  "silence_count": 38
+  "levels": {"floor_dbfs": -58.3, "speech_dbfs": -19.6, "quiet_under_dbfs": -50.3},
+  "pause_count": 38,
+  "pause_seconds": 61.4,
+  "pauses": [{"start": 3.2, "end": 4.85, "seconds": 1.65}, {"start": 412.1, "end": 414.02, "seconds": 1.92}]
 }
 ```
+
+No level was given for what counts as quiet: scrubr measures where this recording's own quiet and
+speech sit, so a soft recording and a loud one are read the same way.
 
 The agent passes `project_version` back as `--if-version`. If someone edited the project in
 between, nothing is written and the reply says what to run next:
@@ -163,9 +170,10 @@ An agent cannot listen, so scrubr gives it numbers, images and safe retries.
 
 | | |
 |---|---|
-| **Measurements** | Loudness and true peak (EBU R128), sample peaks and clipping, silence ranges, a level envelope, and the quietest moment in a range: where to put a cut between two words. |
-| **Images** | `render --png` draws the waveform of the timeline or a range, on the CPU, with no window. |
-| **Transcripts** | Every word with a start and an end, from a Whisper model on your own machine. Optional; see [below](#transcription-and-cutting-by-words). |
+| **Measurements** | Loudness and true peak (EBU R128), sample peaks and clipping, a level envelope, silence ranges, pauses judged against the recording's own quiet, and the quietest moment in a range: where to put a cut between two words. |
+| **A check on its own edits** | `analyze --joins` reads back every join the edits left: whether it sits in quiet or on sound, the words either side, and which ones to look at again. |
+| **Images** | `render --png` draws the waveform of the timeline or a range, and with `--spectrogram` what kind of sound is in it: a hum, hiss or a click shows where a waveform shows nothing. On the CPU, with no window. |
+| **Transcripts** | Every word with a start and an end, from a Whisper model on your own machine. Kept against the audio, so after an edit the words are where they are now without listening again. Optional; see [below](#transcription-and-cutting-by-words). |
 | **Dry runs** | `--dry-run` on any edit reports what would change and writes nothing. |
 | **Version checks** | `--if-version N` refuses an edit, with exit code 3, if the project changed since the agent measured it. |
 | **Batches** | `apply` takes many operations as one edit and one undo step. Every range refers to the timeline as it was before the batch, so 38 silences from one `analyze` are cut in one step with no arithmetic. |
@@ -187,6 +195,12 @@ There is no MCP server; a shell is enough.
 - Splices marked on the timeline in their author's colour. Selecting one shows the audio that was
   removed there.
 - Labels as speech bubbles over the range each one marks.
+- The words that were said, drawn along the waveform once it has been transcribed. Each word sits
+  on a pill as long as it was spoken for. Press a word to select it, find a phrase, or cut the
+  words you selected.
+- A Tools menu for what looks, listens and measures: a spectrogram of the lanes, Transcribe,
+  Tighten pauses, Check joins and Measure loudness, on the selection or on everything. They run
+  the same commands an agent runs.
 - Tracks as stacked lanes under one ruler, each with its name, level, pan, mute and solo.
 - A Files tab for hearing audio files and adding them to the project, into the timeline or as a
   new track.
@@ -209,6 +223,13 @@ reviewing and refining what they did.
 | <kbd>M</kbd> | Mute the selection |
 | <kbd>Shift</kbd>+<kbd>M</kbd> | Mute the selection on the picked track alone |
 | <kbd>L</kbd> | Add a label |
+| <kbd>S</kbd> | Show the lanes as a spectrogram, or as a waveform again |
+| <kbd>Ctrl</kbd>+<kbd>T</kbd> | Transcribe the selection, or everything |
+| <kbd>Ctrl</kbd>+<kbd>F</kbd> | Find words |
+| <kbd>Shift</kbd>+<kbd>X</kbd> | Cut the selected words, checked by listening across the join |
+| <kbd>Shift</kbd>+<kbd>P</kbd> | Tighten pauses |
+| <kbd>Shift</kbd>+<kbd>J</kbd> | Check joins |
+| <kbd>Shift</kbd>+<kbd>L</kbd> | Measure loudness |
 | <kbd>Esc</kbd> | Deselect |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | Undo, redo |
 | <kbd>↑</kbd> <kbd>↓</kbd> | Zoom in or out |
@@ -263,11 +284,15 @@ its development package (`libasound2-dev` on Debian and Ubuntu).
 | `scrubr info P` | Timeline length, format, sources, head, version |
 | `scrubr analyze P [--loudness] [--peaks] [--silence -45dB:1s] [--envelope 1s]` | Measurements |
 | `scrubr analyze P --quietest R` | The quietest moment in a range |
+| `scrubr analyze P --pauses [0.3s]` | Every pause of that length or more, with no level to choose |
+| `scrubr analyze P --joins` | Every join the edits left, and which to check |
 | `scrubr render P --png out.png [--range R]` | Waveform image |
-| `scrubr transcribe P [--range R]` | Every word spoken, with times |
+| `scrubr render P --png out.png --spectrogram` | Spectrogram image, for hum, hiss and clicks |
+| `scrubr transcribe P [--range R]` | Every word spoken, with times. `--saved` gives the words kept from earlier runs; `--models` lists the models |
 | `scrubr find P "words"` | Where a phrase is said. Changes nothing |
 | `scrubr cut P R` · `cut P --phrase "words"` | Remove a range, or a phrase by its words |
 | `scrubr keep P R` | Remove everything outside a range |
+| `scrubr tighten P [--over 0.6s] [--to 0.3s]` | Shorten every long pause, as one edit |
 | `scrubr mute P R` | Silence a range and keep its length |
 | `scrubr gain P +2dB [--range R]` | Change level |
 | `scrubr fade P in 0.5s` · `fade P out 2s` | Fade the start or the end, or across a range |
@@ -280,6 +305,7 @@ its development package (`libasound2-dev` on Debian and Ubuntu).
 | `scrubr history P` | Every edit with author, session and state |
 | `scrubr label P add R "text"` · `list` · `rm` | Notes for the reviewer |
 | `scrubr export P out.flac [--bits 16\|24\|32\|32f]` | Render to WAV or FLAC |
+| `scrubr export P out.mp3 [--bitrate 192]` | Render to MP3 |
 | `scrubr open P` | Open the project in the window |
 
 `P` is a project file and `R` is a range. `scrubr help <command>` lists a command's arguments, and
@@ -325,8 +351,15 @@ sound before writing anything. If the phrase is not gone, or the words either si
 it writes nothing and replies `cut_not_clean`. A sentence between pauses cuts cleanly. A few words
 in the middle of running speech often do not, and are refused, which is what the check is for.
 
+What a model hears is kept against the audio. After a cut, `scrubr transcribe P --saved` gives the
+words where they are now, in a fraction of a second, and the window draws them along the waveform.
+A model starts a word early when a pause comes before it, so those times are moved to where the
+level shows the pause ends.
+
 Measured with `base.en` on one Windows desktop, on the CPU alone, it runs about six times faster
-than the audio plays.
+than the audio plays. `scrubr transcribe --models` lists the larger models. `small.en` was tried:
+three times slower, no more accurate on the test recordings, and it hears fewer of the ums and
+false starts, not more. `base.en` is the default.
 
 ## Status
 
@@ -336,8 +369,7 @@ than the audio plays.
 | M1 | Core and command line: project file, edit log, analysis, transcription, PNG rendering, WAV and FLAC export, the agent guide | Built |
 | M2 | The window: waveform, selection, playback, history, live reload, export | Built |
 | M3 | Shared editing, the Files tab and multitrack | Built |
-| M4 | Cutting by words | Built |
-| M4 | MP3 export, spectrograms, words drawn on the waveform | Not started |
+| M4 | Cutting by words, words on the waveform, pauses and joins, spectrograms, MP3 export, the window's Tools menu | Built |
 | M5 | Effects, each one an edit: EQ, compressor, limiter, noise gate, noise reduction, click removal, auto duck | Planned |
 
 Not planned for the first version: recording, MIDI, plugin hosting, real-time effect previews, a
@@ -355,7 +387,7 @@ The code is three crates:
 
 | Crate | Job |
 |---|---|
-| [`scrubr-core`](crates/scrubr-core) | The engine: project file, edit log, decoding and encoding, DSP, analysis, peak cache and PNG rendering. No UI dependencies |
+| [`scrubr-core`](crates/scrubr-core) | The engine: project file, edit log, decoding and encoding, DSP, analysis, peak cache, and waveform and spectrogram images. No UI dependencies |
 | [`scrubr-cli`](crates/scrubr-cli) | The `scrubr` command: argument and time parsing, JSON and text output |
 | [`scrubr-gui`](crates/scrubr-gui) | The window, on Rune, with playback through cpal |
 

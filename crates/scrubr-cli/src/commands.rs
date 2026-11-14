@@ -559,7 +559,7 @@ pub fn spectrogram(project: &Path, png: &Path, range: Option<String>, width: u32
     Ok(Reply::new(Some(p.version), fields, text))
 }
 
-pub fn export(project: &Path, out: &Path, bits: Option<String>, range: Option<String>, track: Option<String>) -> Result<Reply> {
+pub fn export(project: &Path, out: &Path, bits: Option<String>, bitrate: Option<String>, range: Option<String>, track: Option<String>) -> Result<Reply> {
     let paths = Paths::new(project);
     let p = project::open(&paths)?;
     let rate = p.sample_rate;
@@ -571,21 +571,32 @@ pub fn export(project: &Path, out: &Path, bits: Option<String>, range: Option<St
             Err(_) => return Err(Error::usage("bad_depth", format!("\"{text}\" is not a sample format.")).hint("Use --bits 16, 24, 32 or 32f.")),
         },
     };
+    // "192", "192k" and "192kbps" all say the same.
+    let kbps = match bitrate.as_deref() {
+        None => None,
+        Some(text) => match text.to_ascii_lowercase().trim_end_matches("kbps").trim_end_matches('k').trim().parse::<u32>() {
+            Ok(kbps) => Some(kbps),
+            Err(_) => return Err(Error::usage("bad_bitrate", format!("\"{text}\" is not a bitrate.")).hint("Give kilobits a second, for example --bitrate 192.")),
+        },
+    };
     let tl = Timeline::build(&p)?;
     let range = range.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?;
     let only = alone(&paths, &tl, &track)?;
-    let report = export::export(&p, &paths, out, &export::Options { depth, range, progress: None, track: only })?;
-    let (bits, float) = match report.depth {
-        Depth::Int(bits) => (bits, false),
-        Depth::Float => (32, true),
+    let report = export::export(&p, &paths, out, &export::Options { depth, range, progress: None, track: only, kbps })?;
+    let (bits, float) = match (report.kbps, report.depth) {
+        (Some(_), _) => (None, false),
+        (None, Depth::Int(bits)) => (Some(bits), false),
+        (None, Depth::Float) => (Some(32), true),
+    };
+    let kind = match (report.kbps, bits) {
+        (Some(kbps), _) => format!("{kbps} kbps"),
+        (None, bits) => format!("{}-bit{}", bits.unwrap_or(0), if float { " float" } else { "" }),
     };
     let mut text = format!(
-        "Exported {} to {}: {} {}-bit{}, {} Hz, {} ch, {} bytes.",
+        "Exported {} to {}: {} {kind}, {} Hz, {} ch, {} bytes.",
         timecode(report.frames, rate),
         out.display(),
         report.format.name().to_uppercase(),
-        bits,
-        if float { " float" } else { "" },
         rate,
         p.channels,
         report.bytes
@@ -598,6 +609,7 @@ pub fn export(project: &Path, out: &Path, bits: Option<String>, range: Option<St
         "format": report.format.name(),
         "bits": bits,
         "float": float,
+        "bitrate_kbps": report.kbps,
         "sample_rate": rate,
         "channels": p.channels,
         "seconds": seconds(report.frames, rate),
@@ -1521,7 +1533,7 @@ quietest in 0:01.000..0:03.000: 0:02.000 (0:01.500..0:02.500, -120.0 dBFS)");
         assert!(text.contains("clipped samples") && text.ends_with("envelope: 4 windows of 0:01.000 (use --json for the levels)"), "{text}");
         let text = undo(&project, 1, vec![], None, &opts(false)).unwrap().text;
         assert_eq!(text, "Undid e4. Head is e3. Timeline 0:03.500 -> 0:03.500. Version 6.");
-        let text = export(&project, &dir.path().join("out.wav"), None, Some("0..1".into()), None).unwrap().text;
+        let text = export(&project, &dir.path().join("out.wav"), None, None, Some("0..1".into()), None).unwrap().text;
         assert!(text.starts_with("Exported 0:01.000 to ") && text.contains("WAV 16-bit, 48000 Hz, 2 ch, 192044 bytes."), "{text}");
         let err = open_with(Some(&project), &dir.path().join("no-such-window")).unwrap_err();
         assert!(err.to_string().contains("was not found at") && err.hint_text().is_some_and(|h| h.contains("SCRUBR_GUI")), "{err}");

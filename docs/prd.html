@@ -470,7 +470,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <div class="cmd"><code>scrubr apply ep42.scrubr --ops cuts.json</code><span>Several operations in one write and one undo step.</span></div>
       <div class="cmd"><code>scrubr undo | redo | history ep42.scrubr</code><span>Move head, or list edits with author and session.</span></div>
       <div class="cmd"><code>scrubr label ep42.scrubr add 14:18.5..14:20.2 "check: cough?"</code><span>Leave a note for the person reviewing.</span></div>
-      <div class="cmd"><code>scrubr export ep42.scrubr out/ep42.flac</code><span>Render head to WAV, FLAC or MP3.</span></div>
+      <div class="cmd"><code>scrubr export ep42.scrubr out/ep42.flac</code><span>Render head to WAV, FLAC or MP3. An MP3 takes <code>--bitrate</code> in kbps in place of <code>--bits</code>.</span></div>
       <div class="cmd"><code>scrubr help --agent</code><span>Print the agent guide.</span></div>
       <div class="cmd"><code>scrubr open ep42.scrubr</code><span>Open the GUI. Plain <code>scrubr</code> opens it empty.</span></div>
     </div>
@@ -504,6 +504,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
 <span class="pr">$</span> scrubr label ep42.scrubr add 14:18.5..14:20.2 "check: cough?"
 <span class="pr">$</span> scrubr render ep42.scrubr --png check.png
 <span class="pr">$</span> scrubr export ep42.scrubr out/ep42.flac</code></pre>
+    <p>Since M4 the first three lines can be one. <code>scrubr tighten ep42.scrubr --over 1s --to 0.3s</code> finds the pauses against the recording's own quiet and shortens them as one edit, and <code>scrubr analyze ep42.scrubr --joins</code> reads every join back.</p>
     <p>The analyze call returns:</p>
 <pre><code>{
   "ok": true,
@@ -577,6 +578,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>New project (Ctrl+N) opens an empty project at once, with the Files tab showing and no dialog. The project is made when its first file is added: beside that file and named after it, with a number added if the name is taken. Until then nothing is written, because a project takes its sample rate and channels from its first file.</li>
       <li>Files tab (M3), the third tab in the side panel beside Activity and Labels: a file browser for adding more audio to the open project. It lists folders and the audio files scrubr can read, each with a Play button to hear it first. "Insert" puts a file into the timeline at the playhead, and "Track" lays it on a new track from the playhead. It also lists the files the project already uses.</li>
       <li>Words on the waveform (M4): what was said, drawn along the audio it was said in. Transcribe (Ctrl+T) listens to the selection or to everything; a press on a word selects it; Find words (Ctrl+F) goes from one place a phrase was said to the next; Cut words (Shift+X) cuts the selected words with the same check as <code>scrubr cut --phrase</code>.</li>
+      <li>A Tools menu (M4), for what looks, listens and measures. Spectrogram (S) turns the lanes into a spectrogram of the mix, measured again each time the view comes to rest, with the selection, the playhead, the splice marks and the words still drawn over it. Transcribe (Ctrl+T), Tighten pauses (Shift+P), Check joins (Shift+J) and Measure loudness (Shift+L) act on the selection, or on everything when there is none. They run the same commands an agent runs, through the <code>scrubr</code> program beside the window, so the two cannot disagree. Tighten pauses is one edit under the person's name and one undo. Check joins says how many joins do not sit in quiet and puts the playhead on the first.</li>
       <li>Tracks (M3) as stacked lanes under one ruler, each with its name, level, pan, mute and solo. A selection can be muted on one track alone, and a track can be removed. Cuts always act on every track.</li>
       <li>Live reload when the project file changes on disk, with a short notice naming the edit. The transport's notice line is empty unless there is something to say.</li>
       <li>One menu button holds every command, the same on all three platforms. The same list drives the tool buttons and the keyboard shortcuts.</li>
@@ -638,7 +640,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <h3>Transcription</h3>
     <p class="key"><span class="tag">Decided</span><code>transcribe</code> runs OpenAI's Whisper models on the person's own machine, in pure Rust, through the <code>whisper-candle-core</code> crate. It is an optional Cargo feature, <code>transcribe</code>, off by default, so the standard build carries no machine-learning code and says so if the command is run.</p>
     <ul>
-      <li><strong>Model install.</strong> No model ships with scrubr. <code>scrubr transcribe --fetch-model base.en</code> downloads one from Hugging Face once, about 290 MB for <code>base.en</code>, the default. That is the only step that uses the network. A model can also be given as a folder.</li>
+      <li><strong>Model install.</strong> No model ships with scrubr. <code>scrubr transcribe --fetch-model base.en</code> downloads one from Hugging Face once, about 290 MB for <code>base.en</code>, the default. That is the only step that uses the network. A model can also be given as a folder. <code>scrubr transcribe --models</code> lists the models there are, the size of each and which are installed.</li>
       <li><strong>Privacy.</strong> Audio never leaves the machine.</li>
       <li><strong>Why Whisper.</strong> It gives a start and an end for every word, takes any vocabulary, and the pure-Rust build needs nothing beyond cargo (checked on Windows so far). Two smaller engines were tried first. <code>vosk-rust</code> returned no word times and needed its models converted by hand. <code>utter</code> recognises only a fixed grammar of a few hundred words.</li>
       <li><strong>How it runs.</strong> The timeline is rendered with its edits, mixed to mono, resampled to 16 kHz and handed over in pieces of at most five minutes, each split at the quietest moment near its end. Digital silence is skipped.</li>
@@ -657,6 +659,24 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <p class="key"><span class="tag">Cutting by phrase</span>Word times are not exact enough to cut on. <code>scrubr cut --phrase</code> finds the phrase in the transcript, takes the quietest moment between the word inside and the word outside each end, and then listens across the join as it would sound, before writing. If the phrase is not gone, or the words either side no longer follow each other, nothing is written and the reply says so. An agent can do the same by hand with <code>analyze --quietest</code> and <code>transcribe --range</code>.</p>
     <p>Tried on the recordings above: a whole sponsor sentence came out of the synthetic voice in one command, in ten seconds. On the podcast a short sentence between two pauses was cut cleanly from a 160-second window in about half a minute. Two attempts at a few words in the middle of running speech were refused by the check, which is what it is for: there was no pause to cut in, and the cut would have taken a neighbouring word. On the meeting, cutting by hand with the same rule landed in the right pause for about five ends in six.</p>
     <p>A fixed silence threshold does not carry across recordings: at −45 dB the podcast has almost no pauses, and the quiet meeting's soft speech counts as silence. <code>analyze --pauses</code> and <code>scrubr tighten</code> therefore take no level: they find quiet from the recording, as the next section describes.</p>
+
+    <h3>MP3 export (M4)</h3>
+    <p>Built. <code>scrubr export out.mp3</code> writes a constant bitrate through <code>rusty_mp3</code>, an encoder written in Rust under the Apache licence, so a build still needs nothing beyond cargo and there are no LGPL terms to meet. The default is 192 kbps for stereo and 128 for mono; <code>--bitrate</code> sets another. The window's Export dialog offers MP3 beside FLAC and WAV.</p>
+    <p>Measured against LAME, the usual encoder, through ffmpeg on the same audio, with ffmpeg decoding both:</p>
+    <div class="tbl">
+      <table>
+        <thead><tr><th></th><th>scrubr</th><th>LAME</th></tr></thead>
+        <tbody class="num">
+          <tr><td>Speed, 5 minutes of podcast at 192 kbps</td><td>3.3 s, 91× real time</td><td>2.8 s, 107×</td></tr>
+          <tr><td>Size at each bitrate</td><td colspan="2">The same to within 0.3%</td></tr>
+          <tr><td>Length when played back</td><td>Exact, to the sample</td><td>Exact</td></tr>
+          <tr><td>Podcast: signal over error at 96, 128, 192 kbps</td><td>22.9, 26.1, 31.7 dB</td><td>22.8, 25.0, 30.2 dB</td></tr>
+          <tr><td>Music: signal over error at 96, 128, 192 kbps</td><td>32.1, 35.3, 40.4 dB</td><td>23.9, 24.9, 29.8 dB</td></tr>
+          <tr><td>What is kept above 16 kHz at 96 kbps</td><td>8 dB down</td><td>32 dB down</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>None of these is how it sounds. An MP3 encoder puts its error where the ear will not notice, so a larger error can sound better, and LAME's choice to drop the top of the range at low bitrates is deliberate. What the figures do show is that the files are valid, the right size and length, and not broken anywhere. The encoder's authors report listening-model scores within 0.1 to 0.3 of LAME's on a five-point scale. A person should listen to one export before relying on it at 96 kbps or under. The export is refused for more than two channels or a sample rate above 48 kHz, which MP3 does not have.</p>
 
     <h3>Pacing and checking a cut (M4)</h3>
     <p>Pauses, joins, the first step on word times and the list of speech models are built. Lining words up against the audio inside running speech is not. These came from reading how <a href="https://github.com/Forward-Future/scarlet" target="_blank" rel="noopener">Scarlet</a>, an agent-driven video editor, cuts dialogue. Its rule is scrubr's own: the tool measures, the agent decides.</p>
@@ -698,7 +718,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <ul>
       <li><strong>Truer word times inside running speech.</strong> Scarlet lines Whisper's words up against the audio a second time and reports the usual error falling from about 90 ms to about 40 ms. Moving times out of pauses does that for the words next to a pause, which are the ones a cut lands beside, and does nothing for the rest. A spike is to find out whether the rest can be done in Rust without a native library.</li>
     </ul>
-    <p>Noted for later, not planned: a Tighten command in the window; saying what sounds in a gap between words, since a gap can hold a word the model skipped; playing what a cut removed and then the join, from the activity log; and edits that wait as suggestions until the person approves them.</p>
+    <p>Noted for later, not planned: saying what sounds in a gap between words, since a gap can hold a word the model skipped; playing what a cut removed and then the join, from the activity log; and edits that wait as suggestions until the person approves them.</p>
 
     <h3>Words on the waveform (M4)</h3>
     <p>Built. The window shows what was said along the audio it was said in, so a person finds a place by reading and not only by listening.</p>
@@ -832,7 +852,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td><code>symphonia</code></td><td>Decode WAV, FLAC, MP3, OGG, AAC (.m4a)</td><td>Pure Rust</td></tr>
           <tr><td><code>hound</code></td><td>Write WAV</td><td></td></tr>
           <tr><td><code>flacenc</code></td><td>Write FLAC</td><td>Pure Rust</td></tr>
-          <tr><td><code>mp3lame-encoder</code></td><td>Write MP3 (M4)</td><td>Wraps LAME (LGPL). Optional feature.</td></tr>
+          <tr><td><code>rusty_mp3</code></td><td>Write MP3</td><td>Pure Rust, Apache-2.0, no dependencies of its own. Chosen over LAME, which is a C library under the LGPL; the other pure-Rust encoder, <code>shine-rs</code>, is LGPL too.</td></tr>
+          <tr><td><code>rustfft</code></td><td>Spectrograms</td><td>Pure Rust</td></tr>
           <tr><td><code>cpal</code></td><td>Playback</td><td>Runs on its own audio thread</td></tr>
           <tr><td><code>rubato</code></td><td>Resampling</td><td>For inserts with a different rate</td></tr>
           <tr><td><code>ebur128</code></td><td>Loudness and true peak</td><td></td></tr>
@@ -906,10 +927,10 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
         <span class="id">M4</span>
         <div class="body">
           <h3>Extras</h3>
-          <p>MP3 export, spectrograms, and cut-by-words commands on top of the transcript.</p>
+          <p>MP3 export, spectrograms, and cut-by-words commands on top of the transcript. A Tools menu in the window for what looks, listens and measures.</p>
           <p>Words on the waveform: the window draws the transcript along the audio, first one made by the command line, then with its own Transcribe command, word selection and search.</p>
           <p>Pacing and checking a cut: larger speech models on offer, <code>scrubr tighten</code> for pauses, <code>scrubr analyze --joins</code> to check what an edit left, and a spike on truer word times.</p>
-          <p>Cutting by words, words on the waveform, pauses and joins (<code>analyze --pauses</code>, <code>scrubr tighten</code>, <code>analyze --joins</code>, word times moved out of pauses), the list of speech models and spectrograms (<code>render --spectrogram</code>) are built. Truer word times inside running speech and MP3 export are not started.</p>
+          <p>All of it is built: cutting by words, words on the waveform, pauses and joins (<code>analyze --pauses</code>, <code>scrubr tighten</code>, <code>analyze --joins</code>, word times moved out of pauses), the list of speech models, spectrograms (<code>render --spectrogram</code>, and a view in the window), MP3 export and the window's Tools menu. One spike is left open: truer word times inside running speech.</p>
         </div>
       </li>
       <li>
@@ -948,7 +969,9 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Transcribing a long recording takes minutes</td><td>About ten minutes for an hour. It runs once, in the background, and is kept in the cache against the source, so edits do not throw it away.</td></tr>
           <tr><td>The Whisper crate is young (0.1) and tested here on Windows only</td><td>It sits behind one trait in the core, so another engine can replace it without touching the CLI.</td></tr>
           <tr><td>Multitrack arrives after the core, the CLI and the window were built around one timeline</td><td>One track is the plain case of the same model, so earlier projects and commands keep working. The file format number goes up. Source coordinates, the batch rule and version checks do not change.</td></tr>
-          <tr><td>License contamination</td><td>No Audacity code. LAME only as an optional, dynamically linked feature.</td></tr>
+          <tr><td>License contamination</td><td>No Audacity code and no LAME. MP3 is written by an encoder in Rust under the Apache licence.</td></tr>
+          <tr><td>The MP3 encoder is young, and its output has been measured but not listened to</td><td>It was checked against LAME for valid files, size, length and error. A person listens before relying on it at low bitrates. It sits behind one function in the core, so LAME could take its place as an optional feature.</td></tr>
+          <tr><td>The window's tools and an agent's commands drift apart</td><td>The Tools menu runs the <code>scrubr</code> program beside the window, so there is one implementation of each.</td></tr>
         </tbody>
       </table>
     </div>
@@ -963,7 +986,9 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>Once the limiter is there (M5), should normalize use it by itself to reach its target on peaky speech, or only when asked?</li>
       <li>Is apply-then-undo enough for tuning an effect by ear, or does the window need a way to hear a few seconds before applying?</li>
       <li>When a cut covers audio that an earlier edit had already removed, should it claim that hidden audio too, so it stays hidden if the earlier edit is reverted?</li>
-      <li>Is <code>base.en</code> the right default model, or should recordings with several speakers default to a larger one such as <code>small.en</code>, about 1 GB?</li>
+      <li>Stumbles, fillers and false starts are not in any Whisper transcript, small or large. Pauses and doubled words find some. Is a model trained to write speech down as spoken worth a spike?</li>
+      <li>Should MP3 export offer a variable bitrate, or is a constant one enough for speech?</li>
+      <li>Should the window's spectrogram show the picked track alone, and should there be a way to select a band of frequencies in it?</li>
       <li>Should release builds include the transcription feature, or stay without it and leave it to people who build from source?</li>
       <li>Should recording from a microphone ever be in scope?</li>
       <li>Is a browser build through Rune's WebGPU target worth revisiting once it matures?</li>

@@ -194,7 +194,7 @@ fn exit_codes_and_error_shape_follow_the_prd() {
     assert!(error["hint"].as_str().unwrap().contains("--if-version 2"));
     assert_eq!(bench.project_text(), before, "a refused edit writes nothing");
     // 5: decode and encode failures.
-    bench.run(&["export", "ep.scrubr", "out.mp3"]).fails(5, "format_not_supported");
+    bench.run(&["export", "ep.scrubr", "out.ogg"]).fails(5, "format_not_supported");
     fs::write(bench.root.join("junk.wav"), b"this is not audio").unwrap();
     bench.run(&["insert", "ep.scrubr", "junk.wav", "--at", "0"]).fails(5, "decode_failed");
     // 4: a source changed on disk. Every command stops, readers included.
@@ -578,4 +578,25 @@ fn a_spectrogram_is_drawn_and_says_how_to_read_a_pixel() {
     bench.run(&["render", "ep.scrubr", "--png", "x.png", "--spectrogram", "--width", "100"]).fails(1, "bad_size");
     // Without the flag it is the waveform it always was.
     assert!(bench.run(&["render", "ep.scrubr", "--png", "wave.png"]).ok()["kind"].is_null());
+}
+
+#[test]
+fn an_mp3_is_exported_at_the_bitrate_asked_for() {
+    let bench = Bench::with_project();
+    // Twelve seconds of stereo at 48 kHz: 192 kbps unless told otherwise.
+    let reply = bench.run(&["export", "ep.scrubr", "out/ep.mp3"]).ok();
+    assert_eq!((reply["format"].clone(), reply["bitrate_kbps"].clone(), reply["bits"].clone(), reply["float"].clone()), (json!("mp3"), json!(192), json!(null), json!(false)));
+    assert_eq!((reply["seconds"].clone(), reply["channels"].clone(), reply["sample_rate"].clone()), (json!(12.0), json!(2), json!(48000)));
+    let bytes = reply["bytes"].as_u64().unwrap();
+    assert!((bytes as f64 - 12.0 * 24_000.0).abs() < 3_000.0 && fs::metadata(bench.root.join("out/ep.mp3")).unwrap().len() == bytes, "{reply}");
+    let small = bench.run(&["export", "ep.scrubr", "small.mp3", "--bitrate", "64k", "--range", "0..6"]).ok();
+    assert!(small["bitrate_kbps"] == json!(64) && (small["bytes"].as_u64().unwrap() as f64 - 6.0 * 8_000.0).abs() < 2_000.0, "{small}");
+    // The file can be read back: as a source of a project of its own it is as long as it was.
+    let back = bench.run(&["new", "back.scrubr", "--from", "out/ep.mp3"]).ok();
+    assert_eq!(back["timeline_seconds"], json!(12.0));
+    let error = bench.run(&["export", "ep.scrubr", "x.mp3", "--bitrate", "100"]).fails(1, "bad_bitrate");
+    assert!(error["hint"].as_str().unwrap().contains("96, 112, 128"));
+    bench.run(&["export", "ep.scrubr", "x.mp3", "--bitrate", "loud"]).fails(1, "bad_bitrate");
+    bench.run(&["export", "ep.scrubr", "x.mp3", "--bits", "16"]).fails(1, "bad_depth");
+    bench.run(&["export", "ep.scrubr", "x.wav", "--bitrate", "128"]).fails(1, "bad_bitrate");
 }

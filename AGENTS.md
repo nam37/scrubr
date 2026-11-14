@@ -70,12 +70,12 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr history P` | Every edit with author, session and state |
 | `scrubr label P add R "text"` / `label P list` / `label P rm l1` | Notes for the reviewer. A single time instead of a range marks a point |
 | `scrubr export P out.flac [--bits 16\|24\|32\|32f] [--range R]` | Render to `.wav` or `.flac` |
+| `scrubr export P out.mp3 [--bitrate 192] [--range R]` | Render to `.mp3` at a constant bitrate. 192 kbps for stereo and 128 for mono unless you say |
 | `scrubr open P` | Open the project in the window, for the person to review. Returns at once |
 
 Edit commands (`cut` to `redo`, and `label add`/`rm`) accept `--dry-run`, `--if-version N`,
 `--author` and `--session`, and so do `track add`, `set` and `rm`. `scrubr open` needs the
-window's program, `scrubr-gui`, beside `scrubr`; without it the reply is `gui_not_found`. Not in
-this build: MP3 export.
+window's program, `scrubr-gui`, beside `scrubr`; without it the reply is `gui_not_found`.
 
 ## Batches
 
@@ -124,6 +124,9 @@ a track by its name or its id (`t2`).
 - **The window** shows a lane for each track, with its mute, solo, level and pan. The person
   can change those there, mute a selection on one track, and remove a track. Each change is an
   edit in `history` under their name.
+- **The window's Tools menu** runs what you run: Transcribe, Tighten pauses (`scrubr tighten`),
+  Check joins (`analyze --joins`) and Measure loudness, on the selection or on everything, and
+  a spectrogram of the lanes. So "tighten 9 pauses" by `you` in `history` is the person's own.
 
 ## What edits do
 
@@ -163,6 +166,12 @@ a track by its name or its id (`t2`).
   `top_hz * (bottom_hz / top_hz) ^ ((y - plot.top) / (plot.height - 1))`. `level` says which
   levels are black and brightest. Each column shows the most that sounded at each pitch in its
   time, so a click still shows in a wide view. `--track T` and `--range R` work as for a waveform.
+- **MP3.** `export out.mp3` writes a constant bitrate, in kbps: 32 to 320 at 32, 44.1 and
+  48 kHz, 8 to 160 at lower rates; the error for a bitrate MP3 does not have lists the ones it
+  does. An MP3 has no bit depth, so `--bits` is refused. MP3 holds one or two channels at up to
+  48 kHz; anything else is refused with `mp3_not_possible`: export FLAC or WAV. The file plays
+  back at exactly the length exported. It is lossy: keep a FLAC as the master and make the
+  MP3 from the project, not from another MP3.
 - **Silence ranges** from `analyze --silence` are exact, and their threshold is a fixed level
   that you choose. In a quiet recording speech itself falls below -45 dB and is reported as
   silence, so for pauses in speech use `--pauses`. Cutting a range whole butts words together;

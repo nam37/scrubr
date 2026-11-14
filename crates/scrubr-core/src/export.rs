@@ -1,6 +1,7 @@
-//! Rendering the timeline to a file: WAV through hound, FLAC through flacenc.
+//! Rendering the timeline to a file: WAV through hound, FLAC through flacenc, MP3 through
+//! rusty_mp3. All three are written in Rust, so a build needs nothing beyond cargo.
 //!
-//! Both encoders are fed block by block from the streaming renderer and write block by block,
+//! Each encoder is fed block by block from the streaming renderer and writes block by block,
 //! single-threaded, so the same project version always gives the same bytes on one platform.
 
 use std::fs::{self, File};
@@ -22,6 +23,7 @@ use crate::render::{Renderer, walk};
 pub enum Format {
     Wav,
     Flac,
+    Mp3,
 }
 
 impl Format {
@@ -29,6 +31,7 @@ impl Format {
         match self {
             Format::Wav => "wav",
             Format::Flac => "flac",
+            Format::Mp3 => "mp3",
         }
     }
 }
@@ -51,13 +54,19 @@ pub struct Options {
     pub progress: Option<Arc<AtomicU64>>,
     /// Export this track alone, by its index in the timeline's tracks. The default is the mix.
     pub track: Option<usize>,
+    /// MP3 only: the bitrate in kbps, constant through the file. The default is
+    /// [`default_kbps`] for the project's rate and channels.
+    pub kbps: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Report {
     pub path: PathBuf,
     pub format: Format,
+    /// The sample format written. An MP3 has none: see `kbps`.
     pub depth: Depth,
+    /// The bitrate of an MP3.
+    pub kbps: Option<u32>,
     pub frames: u64,
     pub bytes: u64,
     /// Samples that were over full scale and had to be clamped. Zero for float output.
@@ -76,10 +85,28 @@ pub fn format_for(path: &Path) -> Result<Format> {
     match ext.as_str() {
         "wav" => Ok(Format::Wav),
         "flac" => Ok(Format::Flac),
-        "mp3" => Err(Error::codec("format_not_supported", "MP3 export is not in this build; it is planned for milestone M4.")
-            .hint("Export to .flac or .wav instead.")),
+        "mp3" => Ok(Format::Mp3),
         _ => Err(Error::codec("format_not_supported", format!("scrubr cannot tell the export format from \"{}\".", path.display()))
-            .hint("Name the output with a .wav or .flac extension.")),
+            .hint("Name the output with a .wav, .flac or .mp3 extension.")),
+    }
+}
+
+/// The bitrates an MP3 can have at a sample rate, in kbps, or none if MP3 has no such rate.
+pub fn mp3_bitrates(sample_rate: u32) -> &'static [u32] {
+    match sample_rate {
+        32_000 | 44_100 | 48_000 => &[32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+        8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000 => &[8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+        _ => &[],
+    }
+}
+
+/// The MP3 bitrate used when none is asked for: enough that speech and music both hold up.
+pub fn default_kbps(sample_rate: u32, channels: u16) -> u32 {
+    match (sample_rate >= 32_000, channels >= 2) {
+        (true, true) => 192,
+        (true, false) => 128,
+        (false, true) => 128,
+        (false, false) => 64,
     }
 }
 
@@ -113,8 +140,28 @@ pub fn export(project: &Project, paths: &Paths, out: &Path, options: &Options) -
                 .hint("Export to a different file name."));
         }
     }
+    let mut kbps = None;
+    if format == Format::Mp3 {
+        let allowed = mp3_bitrates(project.sample_rate);
+        if allowed.is_empty() || project.channels > 2 {
+            return Err(Error::usage("mp3_not_possible", format!("An MP3 cannot hold {} Hz audio in {} channels.", project.sample_rate, project.channels))
+                .hint("MP3 takes one or two channels at 8, 11.025, 12, 16, 22.05, 24, 32, 44.1 or 48 kHz. Export to .flac or .wav instead."));
+        }
+        if options.depth.is_some() {
+            return Err(Error::usage("bad_depth", "An MP3 has no bit depth.").hint("Leave --bits out, and set the size with --bitrate."));
+        }
+        let asked = options.kbps.unwrap_or_else(|| default_kbps(project.sample_rate, project.channels));
+        if !allowed.contains(&asked) {
+            let list = allowed.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+            return Err(Error::usage("bad_bitrate", format!("An MP3 at {} Hz cannot be {asked} kbps.", project.sample_rate)).hint(format!("Use one of {list}.")));
+        }
+        kbps = Some(asked);
+    } else if options.kbps.is_some() {
+        return Err(Error::usage("bad_bitrate", format!("A {} file has no bitrate to set.", format.name().to_uppercase())).hint("Leave --bitrate out, or export to .mp3."));
+    }
     let first = project.sources.first();
     let depth = options.depth.unwrap_or_else(|| match first {
+        _ if format == Format::Mp3 => Depth::Float,
         Some(s) if s.float && format == Format::Wav => Depth::Float,
         Some(s) if s.float => Depth::Int(24),
         Some(s) => Depth::Int(s.bits.clamp(16, if format == Format::Flac { 24 } else { 32 })),
@@ -150,6 +197,7 @@ pub fn export(project: &Project, paths: &Paths, out: &Path, options: &Options) -
     let written = match format {
         Format::Wav => write_wav(project, &mut renderer, &part, depth, t0, t1, options.progress.as_deref()),
         Format::Flac => write_flac(project, &mut renderer, &part, depth, t0, t1, options.progress.as_deref()),
+        Format::Mp3 => write_mp3(project, &mut renderer, &part, kbps.expect("set above for MP3"), t0, t1, options.progress.as_deref()),
     };
     let clipped_samples = match written {
         Ok(clipped) => clipped,
@@ -160,7 +208,7 @@ pub fn export(project: &Project, paths: &Paths, out: &Path, options: &Options) -
     };
     fs::rename(&part, out).map_err(|e| io_at(out, e))?;
     let bytes = fs::metadata(out).map_err(|e| io_at(out, e))?.len();
-    Ok(Report { path: out.to_path_buf(), format, depth, frames: t1 - t0, bytes, clipped_samples })
+    Ok(Report { path: out.to_path_buf(), format, depth, kbps, frames: t1 - t0, bytes, clipped_samples })
 }
 
 /// [`walk`], telling `progress` how many frames are done after each block.
@@ -205,6 +253,45 @@ fn write_wav(project: &Project, renderer: &mut Renderer, path: &Path, depth: Dep
         Ok(())
     })?;
     writer.finalize()?;
+    Ok(clipped)
+}
+
+/// Constant bitrate, joint stereo where it helps. Samples over full scale are clamped and
+/// counted, as for integer output: an MP3 decoder clips them anyway.
+fn write_mp3(project: &Project, renderer: &mut Renderer, path: &Path, kbps: u32, t0: u64, t1: u64, progress: Option<&AtomicU64>) -> Result<u64> {
+    use rusty_mp3::{Mp3Encoder, Mp3EncoderConfig};
+    let failed = |e: &dyn std::fmt::Debug| encode_failed(path, e);
+    let mut encoder = Mp3Encoder::new(Mp3EncoderConfig { bitrate_kbps: kbps, vbr_quality: None });
+    let mut file = BufWriter::with_capacity(1 << 20, File::create(path).map_err(|e| io_at(path, e))?);
+    let (channels, rate) = (project.channels, project.sample_rate);
+    let mut clamped: Vec<f32> = Vec::new();
+    let mut clipped = 0u64;
+    let drain = |encoder: &mut Mp3Encoder, file: &mut BufWriter<File>| -> Result<()> {
+        while let Ok(packet) = encoder.next_packet() {
+            file.write_all(&packet).map_err(|e| io_at(path, e))?;
+        }
+        Ok(())
+    };
+    walk_counted(renderer, t0, t1, progress, |block| {
+        clamped.clear();
+        clamped.extend(block.iter().map(|&s| {
+            if !(-1.0..=1.0).contains(&s) {
+                clipped += 1;
+            }
+            s.clamp(-1.0, 1.0)
+        }));
+        encoder.push_pcm_f32(&clamped, channels, rate).map_err(|e| failed(&e))?;
+        drain(&mut encoder, &mut file)
+    })?;
+    encoder.finish();
+    drain(&mut encoder, &mut file)?;
+    // The first frame says how long the audio is and how much padding to drop, which is only
+    // known now. It was written as a placeholder of the same length, and is put right here.
+    if let Some(tag) = encoder.lame_tag_frame() {
+        file.seek(SeekFrom::Start(0)).map_err(|e| io_at(path, e))?;
+        file.write_all(tag).map_err(|e| io_at(path, e))?;
+    }
+    file.flush().map_err(|e| io_at(path, e))?;
     Ok(clipped)
 }
 

@@ -363,11 +363,14 @@ enum Command {
     /// Render head to WAV or FLAC.
     Export {
         project: PathBuf,
-        /// The output file. Its extension picks the format: .wav or .flac.
+        /// The output file. Its extension picks the format: .wav, .flac or .mp3.
         out: PathBuf,
         /// Sample format: 16, 24, 32 or 32f (float, WAV only). The default follows the source.
         #[arg(long, value_name = "BITS")]
         bits: Option<String>,
+        /// MP3 only: the bitrate in kbps, such as 128 or 192. [default: 192 for stereo, 128 for mono]
+        #[arg(long, value_name = "KBPS")]
+        bitrate: Option<String>,
         /// Export only this part of the timeline.
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
@@ -560,7 +563,7 @@ fn run(cli: Cli) -> Result<Reply, Error> {
         Command::Redo { project, steps, edit } => commands::redo(&project, steps, &edit),
         Command::History { project } => commands::history(&project),
         Command::Label { project, action } => commands::label(&project, action),
-        Command::Export { project, out, bits, range, track } => commands::export(&project, &out, bits, range, track),
+        Command::Export { project, out, bits, bitrate, range, track } => commands::export(&project, &out, bits, bitrate, range, track),
         Command::Track { project, action } => commands::track(&project, action),
         Command::Open { project } => commands::open(project.as_deref()),
         Command::Help { agent: true, .. } => Ok(Reply::new(None, json!({ "guide": AGENT_GUIDE }), AGENT_GUIDE.trim_end())),

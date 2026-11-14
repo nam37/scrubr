@@ -14,6 +14,7 @@ use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, Wr
 use scrubr_core::phrase::{self, Pick};
 use scrubr_core::render::Renderer;
 use scrubr_core::transcribe::{self, Heard};
+use scrubr_core::words;
 use scrubr_core::{Kind, Timeline, WavFile};
 
 const RATE: u32 = 48_000;
@@ -1194,4 +1195,92 @@ fn a_cut_that_would_take_the_wrong_word_is_not_made() {
     // A version the caller no longer holds is refused before anything is listened to.
     let e = cut_phrase(&fx, "charlie", Pick::Only, 0.0, &WriteOpts { if_version: Some(version + 5), ..Default::default() }).unwrap_err();
     assert_eq!(e.kind(), Kind::Conflict);
+}
+
+// ---- a transcript kept against the audio -----------------------------------------------------
+
+fn listen(fx: &Fixture, range: Option<(u64, u64)>) -> Vec<transcribe::Word> {
+    transcribe::transcribe(&fx.project(), &fx.paths, range, &mut Tones { late: 0.0 }, &mut |_, _| {}).unwrap()
+}
+
+/// Listens to a range of the timeline (all of it when `None`) and keeps what was heard.
+fn listen_and_keep(fx: &Fixture, range: Option<(u64, u64)>) {
+    let tl = Timeline::build(&fx.project()).unwrap();
+    let heard = listen(fx, range);
+    words::save(&fx.paths, &tl, None, range.unwrap_or((0, tl.total())), "tones", &heard).unwrap();
+}
+
+/// The kept words where they are now, without listening.
+fn kept(fx: &Fixture) -> Vec<transcribe::Word> {
+    let tl = Timeline::build(&fx.project()).unwrap();
+    let store = words::load(&fx.paths);
+    words::set_for(&store, &tl, None).map(|set| words::on_timeline(set, &tl)).unwrap_or_default()
+}
+
+/// True when two lists of words say the same and sit within 20 ms of each other.
+fn same_words(a: &[transcribe::Word], b: &[transcribe::Word]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.text == y.text && x.start.abs_diff(y.start) <= 960 && x.end.abs_diff(y.end) <= 960)
+}
+
+#[test]
+fn a_kept_transcript_follows_its_audio_through_edits() {
+    let fx = spoken();
+    assert!(kept(&fx).is_empty(), "nothing is kept until something has listened");
+    listen_and_keep(&fx, None);
+    let first = kept(&fx);
+    assert_eq!(first, listen(&fx, None));
+    assert_eq!(transcribe::text(&first), "alpha bravo charlie delta echo bravo foxtrot");
+
+    // A phrase is cut: the words that remain are where a fresh listen finds them, and nothing
+    // had to listen again.
+    cut_phrase(&fx, "charlie delta", Pick::Only, 0.0, &WriteOpts::default()).unwrap();
+    assert_eq!(transcribe::text(&kept(&fx)), "alpha bravo echo bravo foxtrot");
+    assert!(same_words(&kept(&fx), &listen(&fx, None)));
+    // Undo, and they are all back.
+    edit::undo(&fx.paths, &WriteOpts::default(), 1).unwrap();
+    assert_eq!(kept(&fx), first);
+
+    // New audio in the middle moves the later words along. It has not been listened to, and the
+    // store says so.
+    write_wav(&fx.root.join("sting.wav"), RATE, 1, 24, RATE as u64 / 2, |f, _| if (2_400..21_600).contains(&f) { (TAU * pitch(5) * f as f32 / RATE as f32).sin() * 0.4 } else { 0.0 });
+    fx.apply(vec![Request::Insert { file: fx.root.join("sting.wav"), at: RATE as u64, crossfade: 0 }]);
+    let moved = kept(&fx);
+    assert_eq!(transcribe::text(&moved), "alpha bravo charlie delta echo bravo foxtrot");
+    assert_eq!((moved[0].start, moved[1].start), (first[0].start, first[1].start + RATE as u64 / 2));
+    let covered = |fx: &Fixture| {
+        let tl = Timeline::build(&fx.project()).unwrap();
+        words::covered(words::set_for(&words::load(&fx.paths), &tl, None).unwrap(), &tl)
+    };
+    assert_eq!(covered(&fx), [(0, RATE as u64), (RATE as u64 * 3 / 2, RATE as u64 * 11 / 2)]);
+    // Listening to that stretch alone fills it in, and doing it twice adds nothing twice.
+    for _ in 0..2 {
+        listen_and_keep(&fx, Some((RATE as u64, RATE as u64 * 3 / 2)));
+        assert_eq!(transcribe::text(&kept(&fx)), "alpha foxtrot bravo charlie delta echo bravo foxtrot");
+        assert_eq!(covered(&fx), [(0, RATE as u64 * 11 / 2)]);
+    }
+    assert!(same_words(&kept(&fx), &listen(&fx, None)));
+}
+
+#[test]
+fn a_word_a_cut_runs_through_ends_at_the_cut() {
+    let fx = spoken();
+    listen_and_keep(&fx, None);
+    // "bravo" is heard from 1.10 s to 1.45 s. Cut from 1.25 s to 1.40 s: it still starts where
+    // it did and now ends at the cut. Cut its start as well and it is gone.
+    let bravo = kept(&fx)[1].clone();
+    assert_eq!((bravo.text.as_str(), bravo.start, bravo.end), ("bravo", 52_800, 69_600));
+    fx.apply(vec![cut(60_000, 67_200, 0)]);
+    let now = kept(&fx);
+    assert_eq!((now[1].text.as_str(), now[1].start, now[1].end), ("bravo", 52_800, 60_000));
+    assert_eq!(now.len(), 7);
+    fx.apply(vec![cut(50_000, 56_000, 0)]);
+    assert_eq!(transcribe::text(&kept(&fx)), "alpha charlie delta echo bravo foxtrot");
+
+    // The mix and a track heard alone are kept apart.
+    let tl = Timeline::build(&fx.project()).unwrap();
+    words::save(&fx.paths, &tl, Some(0), (0, tl.total()), "tones", &listen(&fx, None)[..2]).unwrap();
+    let store = words::load(&fx.paths);
+    assert_eq!(words::on_timeline(words::set_for(&store, &tl, Some(0)).unwrap(), &tl).len(), 2);
+    assert_eq!(words::on_timeline(words::set_for(&store, &tl, None).unwrap(), &tl).len(), 6);
+    assert_eq!(store.sets.iter().map(|s| s.track.as_deref()).collect::<Vec<_>>(), [None, Some("t1")]);
 }

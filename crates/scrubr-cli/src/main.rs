@@ -136,6 +136,10 @@ enum Command {
         /// One track heard alone, by name or id. [default: the mix]
         #[arg(long, value_name = "TRACK")]
         track: Option<String>,
+        /// Do not listen: give the words kept from earlier runs, where they are on the timeline
+        /// now. Instant, and works in any build.
+        #[arg(long, conflicts_with_all = ["model", "fetch_model"])]
+        saved: bool,
     },
     /// Remove a range. The join gets a short crossfade.
     Cut {
@@ -487,7 +491,8 @@ fn run(cli: Cli) -> Result<Reply, Error> {
         Command::Info { project } => commands::info(&project),
         Command::Analyze { project, loudness, peaks, silence, envelope, quietest, range, track } => commands::analyze(&project, loudness, peaks, silence, envelope, quietest, range, track),
         Command::Render { project, png, range, width, height, track } => commands::render(&project, &png, range, width, height, track),
-        Command::Transcribe { project, model, range, fetch_model, track } => commands::transcribe(project.as_deref(), model, range, fetch_model, track),
+        Command::Transcribe { project, range, track, saved: true, .. } => commands::transcript(project.as_deref(), range, track),
+        Command::Transcribe { project, model, range, fetch_model, track, saved: false } => commands::transcribe(project.as_deref(), model, range, fetch_model, track),
         Command::Cut { project, range, phrase, occurrence, all, within, heard_on, no_verify, model, crossfade, edit } => match (range, phrase) {
             (Some(range), None) => commands::cut(&project, &range, crossfade, &edit, false),
             (None, Some(phrase)) => commands::cut_phrase(&project, &phrase, occurrence, all, within, heard_on, no_verify, model, crossfade, &edit),

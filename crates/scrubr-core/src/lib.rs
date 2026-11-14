@@ -16,6 +16,7 @@ pub mod source;
 pub mod timeline;
 pub mod transcribe;
 pub mod wav;
+pub mod words;
 
 use std::path::Path;
 

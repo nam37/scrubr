@@ -382,6 +382,8 @@ fn features_not_in_this_build_say_so() {
     assert!(error["message"].as_str().unwrap().contains("optional feature"));
     assert!(error["hint"].as_str().unwrap().contains("--features transcribe"));
     bench.run(&["transcribe", "nope.scrubr"]).fails(2, "project_not_found");
+    // Reading back a kept transcript needs no model, only a transcript.
+    bench.run(&["transcribe", "ep.scrubr", "--saved"]).fails(2, "no_transcript");
     // Cutting by words rests on the transcript.
     let error = bench.run(&["cut", "ep.scrubr", "--phrase", "you know"]).fails(1, "feature_not_built");
     assert!(error["hint"].as_str().unwrap().contains("cut by time"));

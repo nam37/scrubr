@@ -1037,6 +1037,51 @@ fn open_with(project: Option<&Path>, gui: &Path) -> Result<Reply> {
     Ok(Reply::new(opened.map(|(_, version)| version), fields, text))
 }
 
+/// The fields of a reply that lists words, and the words as running text.
+fn words_reply(words: &[scrubr_core::transcribe::Word], range: (u64, u64), total: u64, rate: u32, engine: &str) -> (Map<String, Value>, String) {
+    let text = scrubr_core::transcribe::text(words);
+    let listed: Vec<Value> = words
+        .iter()
+        .map(|w| json!({ "word": w.text, "start": seconds(w.start, rate), "end": seconds(w.end, rate), "p": (w.probability * 1000.0).round() / 1000.0 }))
+        .collect();
+    let mut fields = Map::new();
+    fields.insert("timeline_seconds".into(), json!(seconds(total, rate)));
+    fields.insert("range".into(), json!({ "start": seconds(range.0, rate), "end": seconds(range.1, rate) }));
+    fields.insert("engine".into(), json!(engine));
+    fields.insert("word_count".into(), json!(words.len()));
+    fields.insert("text".into(), json!(text));
+    fields.insert("words".into(), Value::Array(listed));
+    (fields, text)
+}
+
+/// `transcribe --saved`: the words kept from earlier runs, where they are on the timeline now.
+/// Nothing listens, so it is instant and needs no model.
+pub fn transcript(project: Option<&Path>, range: Option<String>, track: Option<String>) -> Result<Reply> {
+    let Some(project) = project else {
+        return Err(Error::usage("bad_usage", "Transcribe needs a project.").hint("For example `scrubr transcribe <project> --saved`."));
+    };
+    let paths = Paths::new(project);
+    let p = project::open(&paths)?;
+    let rate = p.sample_rate;
+    let tl = Timeline::build(&p)?;
+    let (start, end) = range.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?.unwrap_or((0, tl.total()));
+    let only = alone(&paths, &tl, &track)?;
+    let store = scrubr_core::words::load(&paths);
+    let Some(set) = scrubr_core::words::set_for(&store, &tl, only) else {
+        let what = track.as_ref().map_or("this project".to_string(), |t| format!("track {t}"));
+        return Err(Error::not_found("no_transcript", format!("No transcript has been kept for {what}."))
+            .hint(format!("Run `scrubr transcribe {}` once. What it hears is kept, and follows the audio through edits.", paths.shown.display())));
+    };
+    let words: Vec<_> = scrubr_core::words::on_timeline(set, &tl).into_iter().filter(|w| w.start >= start && w.start < end).collect();
+    let (mut fields, text) = words_reply(&words, (start, end), tl.total(), rate, &set.model);
+    fields.insert("saved".into(), json!(true));
+    // What has been listened to. Audio outside these ranges may hold words nobody has heard yet.
+    let covered: Vec<Value> = scrubr_core::words::covered(set, &tl).iter().map(|(a, b)| json!({ "start": seconds(*a, rate), "end": seconds(*b, rate) })).collect();
+    fields.insert("covered".into(), Value::Array(covered));
+    let shown = format!("{} words kept in {}, heard by {} (use --json for word times):\n{text}", words.len(), range_text((start, end), rate), set.model);
+    Ok(Reply { version: Some(p.version), fields, text: shown })
+}
+
 #[cfg(not(feature = "transcribe"))]
 pub fn transcribe(project: Option<&Path>, _model: Option<String>, _range: Option<String>, _fetch_model: Option<String>, _track: Option<String>) -> Result<Reply> {
     // Make sure the project is real before talking about features, so a wrong path reads as one.
@@ -1075,19 +1120,12 @@ pub fn transcribe(project: Option<&Path>, model: Option<String>, range: Option<S
     })?;
     let took = began.elapsed().as_secs_f64();
     let (start, end) = range.unwrap_or((0, tl.total()));
-    let text = speech::text(&words);
-    let listed: Vec<Value> = words
-        .iter()
-        .map(|w| json!({ "word": w.text, "start": seconds(w.start, rate), "end": seconds(w.end, rate), "p": (w.probability * 1000.0).round() / 1000.0 }))
-        .collect();
-    let mut fields = Map::new();
-    fields.insert("timeline_seconds".into(), json!(seconds(tl.total(), rate)));
-    fields.insert("range".into(), json!({ "start": seconds(start, rate), "end": seconds(end, rate) }));
-    fields.insert("engine".into(), json!(engine.name()));
+    // Kept against the audio, so the window can show the words and `--saved` can give them back
+    // after edits without listening again.
+    scrubr_core::words::save(&paths, &tl, only, (start, end), &engine.name(), &words)?;
+    let (mut fields, text) = words_reply(&words, (start, end), tl.total(), rate, &engine.name());
     fields.insert("took_seconds".into(), json!((took * 10.0).round() / 10.0));
-    fields.insert("word_count".into(), json!(words.len()));
-    fields.insert("text".into(), json!(text));
-    fields.insert("words".into(), Value::Array(listed));
+    fields.insert("saved".into(), json!(true));
     let shown = format!("{} words in {} by {}, in {took:.1} s (use --json for word times):\n{text}", words.len(), range_text((start, end), rate), engine.name());
     Ok(Reply { version: Some(p.version), fields, text: shown })
 }

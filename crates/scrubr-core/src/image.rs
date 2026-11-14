@@ -49,13 +49,13 @@ const RULER: u32 = 24;
 
 const BACKGROUND: [u8; 3] = [0xFF, 0xFF, 0xFF];
 const LANE: [u8; 3] = [0xF4, 0xF5, 0xF7];
-const RULE: [u8; 3] = [0xD8, 0xDC, 0xE2];
+pub(crate) const RULE: [u8; 3] = [0xD8, 0xDC, 0xE2];
 const WAVE: [u8; 3] = [0x1A, 0x1D, 0x23];
 const CLIP: [u8; 3] = [0xD0, 0x2B, 0x2B];
-const JOIN: [u8; 3] = [0xA3, 0x5C, 0x00];
+pub(crate) const JOIN: [u8; 3] = [0xA3, 0x5C, 0x00];
 const TEXT: [u8; 3] = [0x59, 0x61, 0x70];
 
-fn fill(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, [r, g, b]: [u8; 3]) {
+pub(crate) fn fill(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, [r, g, b]: [u8; 3]) {
     let Some(rect) = Rect::from_xywh(x, y, w.max(0.0), h.max(0.0)) else { return };
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(r, g, b, 255));
@@ -83,7 +83,7 @@ fn glyph(c: char) -> [u8; 7] {
 }
 
 /// Draws `text` with its top-left corner at `(x, y)`, two pixels per glyph dot.
-fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32) {
+pub(crate) fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32) {
     for (i, c) in text.chars().enumerate() {
         for (row, bits) in glyph(c).iter().enumerate() {
             for col in 0..5 {
@@ -96,7 +96,7 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32) {
 }
 
 /// `1:02:03`, `12:03` or, when ticks are closer than a second, `12:03.250`.
-fn tick_label(seconds: f64, decimals: usize) -> String {
+pub(crate) fn tick_label(seconds: f64, decimals: usize) -> String {
     let whole = seconds.floor() as u64;
     let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
     let mut out = if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") };
@@ -108,7 +108,7 @@ fn tick_label(seconds: f64, decimals: usize) -> String {
 }
 
 /// The tick spacing, in seconds, that puts labels at least `min_px` apart.
-fn tick_step(seconds_per_px: f64, min_px: f64) -> (f64, usize) {
+pub(crate) fn tick_step(seconds_per_px: f64, min_px: f64) -> (f64, usize) {
     const STEPS: [(f64, usize); 21] = [
         (0.001, 3), (0.002, 3), (0.005, 3), (0.01, 2), (0.02, 2), (0.05, 2), (0.1, 1), (0.2, 1), (0.5, 1),
         (1.0, 0), (2.0, 0), (5.0, 0), (10.0, 0), (15.0, 0), (30.0, 0), (60.0, 0), (120.0, 0), (300.0, 0),

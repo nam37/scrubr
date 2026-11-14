@@ -93,10 +93,13 @@ pub fn find(
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Vec<Found>> {
     let wanted = words_of(phrase)?;
-    let words = transcribe::transcribe_track(project, paths, track, within, engine, progress)?;
+    let mut words = transcribe::transcribe_track(project, paths, track, within, engine, progress)?;
     let rate = project.sample_rate;
     let mut renderer = Renderer::of(project, paths, track)?;
     let (lo, hi) = within.unwrap_or((0, renderer.total()));
+    // Words next to a pause are put where the level says the pause is, so the search for a
+    // quiet moment starts from truer edges.
+    crate::pacing::settle(project, paths, track, (lo, hi), &mut words)?;
     let (margin, edge) = ((MARGIN_SECONDS * rate as f64) as u64, (EDGE_SECONDS * rate as f64) as u64);
     let mut out = Vec::new();
     for at in locate(&words, &wanted) {

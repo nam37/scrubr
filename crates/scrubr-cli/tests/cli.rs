@@ -382,6 +382,8 @@ fn features_not_in_this_build_say_so() {
     assert!(error["message"].as_str().unwrap().contains("optional feature"));
     assert!(error["hint"].as_str().unwrap().contains("--features transcribe"));
     bench.run(&["transcribe", "nope.scrubr"]).fails(2, "project_not_found");
+    // The list of models is the speech library's, so it is not in this build either.
+    bench.run(&["transcribe", "--models"]).fails(1, "feature_not_built");
     // Reading back a kept transcript needs no model, only a transcript.
     bench.run(&["transcribe", "ep.scrubr", "--saved"]).fails(2, "no_transcript");
     // Cutting by words rests on the transcript.
@@ -557,4 +559,23 @@ fn pauses_are_listed_shortened_and_the_joins_read_back() {
     // Undoing the tighten brings the waits back.
     bench.run(&["undo", "ep.scrubr", "--edit", "e2"]).ok();
     assert!(near(&bench.run(&["info", "ep.scrubr"]).ok()["timeline_seconds"], 6.4));
+}
+
+#[test]
+fn a_spectrogram_is_drawn_and_says_how_to_read_a_pixel() {
+    let bench = Bench::with_project();
+    let reply = bench.run(&["render", "ep.scrubr", "--png", "out/spec.png", "--spectrogram", "--width", "600", "--height", "300"]).ok();
+    assert_eq!(reply["kind"], json!("spectrogram"));
+    assert_eq!(reply["plot"], json!({ "left": 66, "top": 24, "width": 534, "height": 276 }));
+    assert_eq!(reply["frequency"], json!({ "scale": "log", "top_hz": 20000.0, "bottom_hz": 40.0 }));
+    assert_eq!((reply["start"].clone(), reply["end"].clone()), (json!(0.0), json!(12.0)));
+    assert!((reply["seconds_per_pixel"].as_f64().unwrap() - 12.0 / 534.0).abs() < 1e-9);
+    assert!(fs::metadata(bench.root.join("out/spec.png")).unwrap().len() > 1000);
+    // A range, and the frequencies to show.
+    let reply = bench.run(&["render", "ep.scrubr", "--png", "low.png", "--spectrogram", "--range", "2..5", "--min-hz", "100", "--max-hz", "8000"]).ok();
+    assert_eq!(reply["frequency"], json!({ "scale": "log", "top_hz": 8000.0, "bottom_hz": 100.0 }));
+    bench.run(&["render", "ep.scrubr", "--png", "x.png", "--spectrogram", "--min-hz", "9000", "--max-hz", "100"]).fails(1, "bad_frequency");
+    bench.run(&["render", "ep.scrubr", "--png", "x.png", "--spectrogram", "--width", "100"]).fails(1, "bad_size");
+    // Without the flag it is the waveform it always was.
+    assert!(bench.run(&["render", "ep.scrubr", "--png", "wave.png"]).ok()["kind"].is_null());
 }

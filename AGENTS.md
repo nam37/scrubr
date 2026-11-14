@@ -48,6 +48,7 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr analyze P --pauses [0.3s] [--range R]` | Every pause of that length or more. Quiet is found from the recording, so there is no level to choose |
 | `scrubr analyze P --joins [--range R]` | Every join the edits have left: in quiet or on sound, the words either side. `check` marks the ones to look at |
 | `scrubr render P --png out.png [--range R] [--width 1600] [--height 480]` | Waveform image. The reply gives `start` and `seconds_per_pixel`, so pixel x is at `start + x * seconds_per_pixel` |
+| `scrubr render P --png out.png --spectrogram [--min-hz 40] [--max-hz N]` | Spectrogram image: what kind of sound, not only how loud. For hum, hiss and clicks |
 | `scrubr transcribe P [--range R] [--model base.en]` | Every word spoken, with `start` and `end`. What it hears is kept. Only in builds with the transcription feature; other builds say so |
 | `scrubr transcribe P --saved [--range R]` | The words kept from earlier runs, where they are on the timeline now. Instant, in any build |
 | `scrubr find P "words" [--within R]` | Where a phrase is said, and the cut that would take it out. Changes nothing. Needs the transcription feature |
@@ -153,6 +154,15 @@ a track by its name or its id (`t2`).
   at those with `render` or `transcribe --range`, then fix or label them. A join in quiet names
   no clipped word, because word times are loose and the level is not. With no transcript kept,
   `has_words` is false and only the levels are given.
+- **Spectrograms.** `render --spectrogram` draws time across and frequency up the image, low
+  at the bottom, on a logarithmic scale; brighter is louder. A hum is a level line low down
+  (50 or 60 Hz and its multiples), hiss a haze across the top that stays through the pauses,
+  a click a thin upright line, speech a stack of wavering bands. The picture has a ruler above
+  and a scale at the left, so read a pixel through the reply's `plot`: time is
+  `start + (x - plot.left) * seconds_per_pixel`, and frequency is
+  `top_hz * (bottom_hz / top_hz) ^ ((y - plot.top) / (plot.height - 1))`. `level` says which
+  levels are black and brightest. Each column shows the most that sounded at each pitch in its
+  time, so a click still shows in a wide view. `--track T` and `--range R` work as for a waveform.
 - **Silence ranges** from `analyze --silence` are exact, and their threshold is a fixed level
   that you choose. In a quiet recording speech itself falls below -45 dB and is reported as
   silence, so for pauses in speech use `--pauses`. Cutting a range whole butts words together;
@@ -192,7 +202,10 @@ a track by its name or its id (`t2`).
     end of the earlier word and B 0.3 s after the start of the later one, cut at the `at` it
     returns, then `transcribe --range` across the join to check.
 - **Models.** If the reply is `model_not_installed`, tell the person;
-  `scrubr transcribe --fetch-model base.en` downloads it once.
+  `scrubr transcribe --fetch-model base.en` downloads it once. `scrubr transcribe --models`
+  lists the models there are, the size of each download and whether it is installed.
+  `--model NAME` on `transcribe`, `find` and `cut --phrase` uses one. Downloading is the
+  person's call: the larger ones are one to six gigabytes.
 - **Undo.** After `undo`, a new edit discards the undone ones. `undo --edit` and `--of-session`
   add a revert instead, so later edits and labels stay where they are; undo the revert to bring
   the edits back.

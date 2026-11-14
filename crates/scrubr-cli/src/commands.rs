@@ -514,6 +514,51 @@ pub fn render(project: &Path, png: &Path, range: Option<String>, width: u32, hei
     Ok(Reply::new(Some(p.version), fields, text))
 }
 
+/// `render --spectrogram`.
+#[allow(clippy::too_many_arguments)]
+pub fn spectrogram(project: &Path, png: &Path, range: Option<String>, width: u32, height: u32, track: Option<String>, min_hz: Option<f64>, max_hz: Option<f64>) -> Result<Reply> {
+    use scrubr_core::spectrum;
+    let paths = Paths::new(project);
+    let p = project::open(&paths)?;
+    let rate = p.sample_rate;
+    let tl = Timeline::build(&p)?;
+    let range = range.as_deref().map(|text| time::parse_range(text, scale(&p, &tl))).transpose()?;
+    let only = alone(&paths, &tl, &track)?;
+    let defaults = spectrum::Options::default();
+    let options = spectrum::Options { width, height, range, track: only, min_hz: min_hz.unwrap_or(defaults.min_hz), max_hz, ..defaults };
+    let r = spectrum::render_png(&p, &paths, png, &options)?;
+    let seconds_per_pixel = r.frames_per_pixel / rate as f64;
+    let text = format!(
+        "Wrote {} ({}x{}): a spectrogram of {}, {:.0} to {:.0} Hz on a logarithmic scale, {:.0} to {:.0} dBFS from black to bright. The plot starts at pixel ({}, {}); {:.6} s per pixel.",
+        png.display(),
+        r.width,
+        r.height,
+        range_text((r.start, r.end), rate),
+        r.bottom_hz,
+        r.top_hz,
+        r.floor_db,
+        r.ceiling_db,
+        r.plot_left,
+        r.plot_top,
+        seconds_per_pixel
+    );
+    let fields = json!({
+        "png": png.to_string_lossy(),
+        "kind": "spectrogram",
+        "width": r.width,
+        "height": r.height,
+        "start": seconds(r.start, rate),
+        "end": seconds(r.end, rate),
+        "seconds_per_pixel": seconds_per_pixel,
+        "plot": { "left": r.plot_left, "top": r.plot_top, "width": r.plot_width, "height": r.plot_height },
+        "frequency": { "scale": "log", "top_hz": r.top_hz, "bottom_hz": r.bottom_hz },
+        "level": { "black_dbfs": r.floor_db, "brightest_dbfs": r.ceiling_db },
+        "window_seconds": r.window as f64 / rate as f64,
+        "track": track,
+    });
+    Ok(Reply::new(Some(p.version), fields, text))
+}
+
 pub fn export(project: &Path, out: &Path, bits: Option<String>, range: Option<String>, track: Option<String>) -> Result<Reply> {
     let paths = Paths::new(project);
     let p = project::open(&paths)?;
@@ -1256,6 +1301,35 @@ pub fn transcribe(project: Option<&Path>, model: Option<String>, range: Option<S
     fields.insert("times_moved_out_of_pauses".into(), json!(settled));
     let shown = format!("{} words in {} by {}, in {took:.1} s (use --json for word times):\n{text}", words.len(), range_text((start, end), rate), engine.name());
     Ok(Reply { version: Some(p.version), fields, text: shown })
+}
+
+/// `transcribe --models`: what can be fetched, and what is here.
+#[cfg(not(feature = "transcribe"))]
+pub fn speech_models() -> Result<Reply> {
+    transcribe(None, None, None, None, None)
+}
+
+#[cfg(feature = "transcribe")]
+pub fn speech_models() -> Result<Reply> {
+    use scrubr_core::transcribe::whisper;
+    let offered = whisper::offered();
+    let mut text = String::from("Speech models (OpenAI Whisper, from huggingface.co). A larger one hears more of what was said as it was said, and is slower.");
+    for m in &offered {
+        text.push_str(&format!(
+            "\n  {:<15} {:>5} MB  {:<12} {}{}",
+            m.name,
+            m.megabytes,
+            if m.english_only { "English" } else { "any language" },
+            if m.installed { "installed" } else { "not installed" },
+            if m.name == whisper::DEFAULT_MODEL { "  (the default)" } else { "" }
+        ));
+    }
+    text.push_str("\nInstall one with `scrubr transcribe --fetch-model NAME`, then use it with `--model NAME`.");
+    let listed: Vec<Value> = offered
+        .iter()
+        .map(|m| json!({ "name": m.name, "megabytes": m.megabytes, "english_only": m.english_only, "installed": m.installed, "default": m.name == whisper::DEFAULT_MODEL, "source": format!("huggingface.co/{}", m.repo) }))
+        .collect();
+    Ok(Reply::new(None, json!({ "models": listed }), text))
 }
 
 // ---- cutting by words ------------------------------------------------------------------------

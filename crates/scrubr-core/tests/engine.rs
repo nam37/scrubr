@@ -1473,3 +1473,51 @@ fn word_times_are_moved_out_of_the_pauses_either_side() {
     assert!(words[5].start == before[5].start && near(words[5].end, 4.2), "{:?}", words[5]);
     assert_eq!(words[6..], before[6..]);
 }
+
+// ---- spectrograms ----------------------------------------------------------------------------
+
+#[test]
+fn a_spectrogram_shows_what_sounds_where_and_when() {
+    use scrubr_core::spectrum;
+    // Four seconds: a 60 Hz hum all the way through at -40 dBFS, a 1 kHz tone at -12 dBFS from
+    // 1 s to 2 s, and one click at 3 s.
+    let fx = Fixture::with(4 * RATE as u64, 1, |f, _, _| {
+        let t = f as f32 / RATE as f32;
+        let hum = (TAU * 60.0 * t).sin() * 0.01;
+        let tone = if (1.0..2.0).contains(&t) { (TAU * 1000.0 * t).sin() * 0.25 } else { 0.0 };
+        let click = if f == 3 * RATE as u64 { 0.9 } else { 0.0 };
+        hum + tone + click
+    });
+    let grid = spectrum::measure(&fx.project(), &fx.paths, None, None, 400, 240, 40.0, None).unwrap();
+    assert_eq!((grid.db.len(), grid.rows(), grid.max_hz), (400, 240, 20_000.0));
+    let at = |seconds: f64, hz: f64| grid.db[(seconds * 100.0) as usize][grid.row_of_hz(hz).round() as usize];
+    // Rows and frequencies turn into each other.
+    assert!((grid.hz_of_row(grid.row_of_hz(1000.0)) - 1000.0).abs() < 1e-6);
+    assert!((grid.hz_of_row(0.0) - 20_000.0).abs() < 1e-6 && (grid.hz_of_row(239.0) - 40.0).abs() < 1e-6);
+    // The tone reads at its level, where and when it sounds, and nowhere else.
+    assert!((at(1.5, 1000.0) + 12.0).abs() < 1.5, "{}", at(1.5, 1000.0));
+    assert!(at(0.5, 1000.0) < -90.0 && at(2.6, 1000.0) < -90.0 && at(1.5, 5000.0) < -90.0, "{} {} {}", at(0.5, 1000.0), at(2.6, 1000.0), at(1.5, 5000.0));
+    // The hum is a level line low down, from start to end.
+    for seconds in [0.2, 1.5, 2.5, 3.8] {
+        assert!((at(seconds, 60.0) + 40.0).abs() < 2.5, "{} at {seconds}", at(seconds, 60.0));
+        assert!(at(seconds, 200.0) < -80.0, "{} at {seconds}", at(seconds, 200.0));
+    }
+    // The click is an upright line: every pitch at once, for a moment.
+    let click = (3.0f64 * 100.0) as usize;
+    let lit = |column: usize| grid.db[column].iter().filter(|&&db| db > -65.0).count();
+    assert_eq!(lit(click), 240);
+    // Away from it only the hum's own rows are lit.
+    assert!(lit(click - 30) < 60 && lit(click + 30) < 60, "{} {}", lit(click - 30), lit(click + 30));
+
+    // The image is written, and says how to read a pixel.
+    let png = fx.root.join("out").join("spec.png");
+    let report = spectrum::render_png(&fx.project(), &fx.paths, &png, &spectrum::Options { width: 466, height: 264, ..Default::default() }).unwrap();
+    assert_eq!((report.plot_left, report.plot_top, report.plot_width, report.plot_height), (66, 24, 400, 240));
+    assert_eq!((report.bottom_hz, report.top_hz), (40.0, 20_000.0));
+    assert!(std::fs::metadata(&png).unwrap().len() > 1000);
+    // Closer in, the window is shorter, so the click is a thinner line.
+    let close = spectrum::measure(&fx.project(), &fx.paths, None, Some((RATE as u64 * 29 / 10, RATE as u64 * 31 / 10)), 400, 120, 40.0, None).unwrap();
+    assert!(close.window < grid.window);
+    let e = spectrum::measure(&fx.project(), &fx.paths, None, None, 400, 240, 500.0, Some(100.0)).unwrap_err();
+    assert_eq!((e.kind(), e.code()), (Kind::Usage, "bad_frequency"));
+}

@@ -4353,6 +4353,7 @@ dependencies = [
  "hf-hub",
  "hound",
  "rubato 5.0.1",
+ "rustfft",
  "serde",
  "serde_json",
  "symphonia",

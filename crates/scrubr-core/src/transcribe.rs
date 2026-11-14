@@ -251,6 +251,45 @@ pub mod whisper {
         })
     }
 
+    /// A model that can be asked for by name.
+    #[derive(Clone, Debug)]
+    pub struct Offered {
+        pub name: &'static str,
+        /// Where `fetch` downloads it from, on huggingface.co.
+        pub repo: &'static str,
+        /// The size of the download, in megabytes.
+        pub megabytes: u32,
+        /// Trained on English alone. The others hear any language.
+        pub english_only: bool,
+        pub installed: bool,
+    }
+
+    /// Every model that can be fetched, smallest first, English ones before the rest. A larger
+    /// model hears more of what was said as it was said, and is slower in step with its size.
+    pub fn offered() -> Vec<Offered> {
+        const SIZES: [(&str, u32); 12] = [
+            ("tiny.en", 151),
+            ("base.en", 290),
+            ("small.en", 967),
+            ("medium.en", 3056),
+            ("tiny", 151),
+            ("base", 290),
+            ("small", 967),
+            ("medium", 3056),
+            ("large-v3-turbo", 1618),
+            ("large-v3", 3087),
+            ("large-v2", 6173),
+            ("large-v1", 6173),
+        ];
+        SIZES
+            .iter()
+            .filter_map(|&(name, megabytes)| {
+                let model = name.parse::<WhichModel>().ok()?;
+                Some(Offered { name, repo: model.hf_repo(), megabytes, english_only: !model.is_multilingual(), installed: is_installed(name).unwrap_or(false) })
+            })
+            .collect()
+    }
+
     /// Whether `name` can be loaded without downloading anything.
     pub fn is_installed(name: &str) -> Result<bool> {
         Ok(local(name)?.is_some())

@@ -9,6 +9,7 @@ pub mod error;
 pub mod export;
 pub mod image;
 pub mod pacing;
+pub mod spectrum;
 pub mod peaks;
 pub mod phrase;
 pub mod project;

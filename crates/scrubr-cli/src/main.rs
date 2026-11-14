@@ -127,6 +127,16 @@ enum Command {
         /// One track heard alone, by name or id. [default: the mix]
         #[arg(long, value_name = "TRACK")]
         track: Option<String>,
+        /// Draw a spectrogram in place of the waveform: time across, frequency up the image on
+        /// a logarithmic scale, brighter where there is more sound. For hum, hiss and clicks.
+        #[arg(long)]
+        spectrogram: bool,
+        /// The lowest frequency a spectrogram shows, in Hz. [default: 40]
+        #[arg(long, value_name = "HZ", requires = "spectrogram")]
+        min_hz: Option<f64>,
+        /// The highest frequency a spectrogram shows, in Hz. [default: half the sample rate, at most 20000]
+        #[arg(long, value_name = "HZ", requires = "spectrogram")]
+        max_hz: Option<f64>,
     },
     /// Words with start and end times as JSON. Needs the optional transcription feature.
     Transcribe {
@@ -148,6 +158,10 @@ enum Command {
         /// now. Instant, and works in any build.
         #[arg(long, conflicts_with_all = ["model", "fetch_model"])]
         saved: bool,
+        /// List the speech models that can be fetched, with the size of each download and
+        /// whether it is on this machine, and exit.
+        #[arg(long, conflicts_with_all = ["project", "model", "range", "fetch_model", "track", "saved"])]
+        models: bool,
     },
     /// Remove a range. The join gets a short crossfade.
     Cut {
@@ -523,9 +537,11 @@ fn run(cli: Cli) -> Result<Reply, Error> {
             commands::analyze(&project, loudness, peaks, silence, envelope, quietest, pauses, joins, range, track)
         }
         Command::Tighten { project, over, to, range, heard_on, crossfade, edit } => commands::tighten(&project, &over, &to, range, heard_on, crossfade, &edit),
-        Command::Render { project, png, range, width, height, track } => commands::render(&project, &png, range, width, height, track),
+        Command::Render { project, png, range, width, height, track, spectrogram: false, .. } => commands::render(&project, &png, range, width, height, track),
+        Command::Render { project, png, range, width, height, track, spectrogram: true, min_hz, max_hz } => commands::spectrogram(&project, &png, range, width, height, track, min_hz, max_hz),
+        Command::Transcribe { models: true, .. } => commands::speech_models(),
         Command::Transcribe { project, range, track, saved: true, .. } => commands::transcript(project.as_deref(), range, track),
-        Command::Transcribe { project, model, range, fetch_model, track, saved: false } => commands::transcribe(project.as_deref(), model, range, fetch_model, track),
+        Command::Transcribe { project, model, range, fetch_model, track, saved: false, models: false } => commands::transcribe(project.as_deref(), model, range, fetch_model, track),
         Command::Cut { project, range, phrase, occurrence, all, within, heard_on, no_verify, model, crossfade, edit } => match (range, phrase) {
             (Some(range), None) => commands::cut(&project, &range, crossfade, &edit, false),
             (None, Some(phrase)) => commands::cut_phrase(&project, &phrase, occurrence, all, within, heard_on, no_verify, model, crossfade, &edit),

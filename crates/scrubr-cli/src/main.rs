@@ -97,6 +97,14 @@ enum Command {
         /// range and can be given several times.
         #[arg(long, value_name = "RANGE")]
         quietest: Vec<String>,
+        /// Every pause of at least this length, found against the recording's own quiet and not
+        /// a fixed level. [default length: 0.3s]
+        #[arg(long, value_name = "LENGTH", num_args = 0..=1, default_missing_value = "0.3s")]
+        pauses: Option<String>,
+        /// Every join the edits have left: whether it sits in quiet or on sound, and the words
+        /// either side from the kept transcript.
+        #[arg(long)]
+        joins: bool,
         /// Measure only this part of the timeline.
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
@@ -189,6 +197,28 @@ enum Command {
         /// The Whisper model. [default: base.en]
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
+    },
+    /// Shorten every long pause, as one edit. Pauses are found against the recording's own
+    /// quiet. The quiet before the first sound and after the last is left alone.
+    Tighten {
+        project: PathBuf,
+        /// Pauses longer than this are shortened.
+        #[arg(long, value_name = "LENGTH", default_value = "0.6s")]
+        over: String,
+        /// The length each is shortened to. Half is left at each end of the pause.
+        #[arg(long, value_name = "LENGTH", default_value = "0.3s")]
+        to: String,
+        /// Only pauses inside this part of the timeline.
+        #[arg(long, value_name = "RANGE")]
+        range: Option<String>,
+        /// Listen for pauses on this track alone, by name or id. The cuts are still made on every track.
+        #[arg(long, value_name = "TRACK")]
+        heard_on: Option<String>,
+        /// Crossfade length at each join. 0 gives hard, sample-exact joins. [default: 5ms]
+        #[arg(long, value_name = "LENGTH")]
+        crossfade: Option<String>,
+        #[command(flatten)]
+        edit: EditOpts,
     },
     /// Remove everything outside a range.
     Keep {
@@ -489,7 +519,10 @@ fn run(cli: Cli) -> Result<Reply, Error> {
     match command {
         Command::New { project, from, force, author, session } => commands::new(&project, &from, force, author, session),
         Command::Info { project } => commands::info(&project),
-        Command::Analyze { project, loudness, peaks, silence, envelope, quietest, range, track } => commands::analyze(&project, loudness, peaks, silence, envelope, quietest, range, track),
+        Command::Analyze { project, loudness, peaks, silence, envelope, quietest, pauses, joins, range, track } => {
+            commands::analyze(&project, loudness, peaks, silence, envelope, quietest, pauses, joins, range, track)
+        }
+        Command::Tighten { project, over, to, range, heard_on, crossfade, edit } => commands::tighten(&project, &over, &to, range, heard_on, crossfade, &edit),
         Command::Render { project, png, range, width, height, track } => commands::render(&project, &png, range, width, height, track),
         Command::Transcribe { project, range, track, saved: true, .. } => commands::transcript(project.as_deref(), range, track),
         Command::Transcribe { project, model, range, fetch_model, track, saved: false } => commands::transcribe(project.as_deref(), model, range, fetch_model, track),
@@ -532,7 +565,16 @@ fn run(cli: Cli) -> Result<Reply, Error> {
     }
 }
 
+/// The command list is large enough that parsing it in an unoptimised build overruns the
+/// megabyte Windows gives a program's first thread, so the work is done on a thread with room.
 fn main() -> ExitCode {
+    match std::thread::Builder::new().stack_size(16 << 20).spawn(start).map(|thread| thread.join()) {
+        Ok(Ok(code)) => code,
+        _ => ExitCode::from(5),
+    }
+}
+
+fn start() -> ExitCode {
     let args = shield_negative_numbers(std::env::args());
     let json = args.iter().any(|a| a == "--json") || !std::io::stdout().is_terminal();
     let cli = match Cli::try_parse_from(&args) {

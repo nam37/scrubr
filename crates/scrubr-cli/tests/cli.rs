@@ -486,3 +486,75 @@ fn tracks_are_added_mixed_measured_and_exported_from_the_command_line() {
     assert_eq!(peak(&bench.run(&["analyze", "ep.scrubr", "--peaks", "--range", "3.6..4.4"]).ok(), 0), -120.0);
     assert_eq!(bench.run(&["info", "ep.scrubr"]).ok()["timeline_seconds"], json!(12.0));
 }
+
+#[test]
+fn pauses_are_listed_shortened_and_the_joins_read_back() {
+    // Bursts of tone over room noise, each 0.35 s: a wait of 1.2 s after the third and 0.9 s
+    // after the fifth, and a quarter of a second between the others. Nothing is digital silence.
+    let dir = tempfile::tempdir().unwrap();
+    let bench = Bench { root: dir.path().to_path_buf(), _dir: dir };
+    let starts = [0.5f32, 1.1, 1.7, 3.25, 3.85, 5.1, 5.7];
+    write_wav(&bench.root.join("ep.wav"), 7.0, |t| {
+        let n = ((t * RATE as f32) as u32).wrapping_mul(2_654_435_761);
+        let room = ((n >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.004;
+        match starts.iter().find(|&&s| t >= s && t < s + 0.35) {
+            Some(&s) => (TAU * 500.0 * (t - s)).sin() * 0.3 + room,
+            None => room,
+        }
+    });
+    bench.run(&["new", "ep.scrubr", "--from", "ep.wav"]).ok();
+    let near = |value: &Value, seconds: f64| (value.as_f64().unwrap() - seconds).abs() < 0.03;
+
+    // No level is given: quiet is found from the recording.
+    let reply = bench.run(&["analyze", "ep.scrubr", "--pauses"]).ok();
+    assert!(reply["loudness"].is_null(), "asked for alone, nothing else is measured: {reply}");
+    let levels = &reply["levels"];
+    assert!(levels["floor_dbfs"].as_f64().unwrap() < -55.0 && levels["speech_dbfs"].as_f64().unwrap() > -20.0, "{reply}");
+    assert!(levels["quiet_under_dbfs"].as_f64().unwrap() > levels["floor_dbfs"].as_f64().unwrap());
+    let found = reply["pauses"].as_array().unwrap();
+    assert_eq!((found.len(), reply["pause_count"].clone()), (4, json!(4)), "the default is 0.3 s or more: {reply}");
+    assert!(found[0]["at_edge"] == json!(true) && found[3]["at_edge"] == json!(true) && found[1]["at_edge"].is_null());
+    assert!(near(&found[1]["start"], 2.05) && near(&found[1]["end"], 3.25) && near(&found[1]["seconds"], 1.2), "{reply}");
+    assert!(near(&found[2]["start"], 4.2) && near(&found[2]["end"], 5.1), "{reply}");
+    assert_eq!(bench.run(&["analyze", "ep.scrubr", "--pauses", "0.1s"]).ok()["pause_count"], json!(8));
+    assert_eq!(bench.run(&["analyze", "ep.scrubr", "--pauses", "1s", "--range", "1..6"]).ok()["pause_count"], json!(1));
+
+    // A dry run says what would go and writes nothing.
+    let dry = bench.run(&["tighten", "ep.scrubr", "--dry-run"]).ok();
+    assert_eq!((dry["dry_run"].clone(), dry["pause_count"].clone(), dry["project_version"].clone()), (json!(true), json!(2), json!(1)), "{dry}");
+    bench.run(&["tighten", "ep.scrubr", "--if-version", "7"]).fails(3, "version_conflict");
+
+    let done = bench.run_as("codex", "s9", &["tighten", "ep.scrubr", "--if-version", "1"]).ok();
+    assert_eq!((done["op"].clone(), done["pause_count"].clone(), done["over_seconds"].clone(), done["to_seconds"].clone()), (json!("tighten"), json!(2), json!(0.6), json!(0.3)), "{done}");
+    assert!(near(&done["removed_seconds"], 1.5) && near(&done["timeline_seconds"], 5.5), "{done}");
+    let first = &done["pauses"][0];
+    assert!(near(&first["cut"]["start"], 2.2) && near(&first["cut"]["end"], 3.1), "half of what is left at each end: {done}");
+    // One edit under the agent's name, and one undo step.
+    let history = bench.run(&["history", "ep.scrubr"]).ok();
+    let edits = history["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 2);
+    assert!(edits[1]["author"] == json!("codex") && edits[1]["session"] == json!("s9"), "{history}");
+    // The two waits are 0.3 s now, and nothing longer than 0.6 s is left between sounds.
+    let after = bench.run(&["analyze", "ep.scrubr", "--pauses", "0.28s"]).ok();
+    let found = after["pauses"].as_array().unwrap();
+    assert!(found.len() == 4 && near(&found[1]["seconds"], 0.3) && near(&found[2]["seconds"], 0.3), "{after}");
+    let error = bench.run(&["tighten", "ep.scrubr"]).fails(1, "no_long_pauses");
+    assert!(error["hint"].as_str().unwrap().contains("--pauses"));
+    bench.run(&["tighten", "ep.scrubr", "--over", "0.2s", "--to", "0.3s"]).fails(1, "bad_pause_lengths");
+
+    // Both joins sit in quiet. With no transcript kept, the reply says the words are not known.
+    let joins = bench.run(&["analyze", "ep.scrubr", "--joins"]).ok();
+    assert_eq!((joins["join_count"].clone(), joins["joins_to_check"].clone(), joins["has_words"].clone()), (json!(2), json!(0), json!(false)), "{joins}");
+    assert!(joins["joins"][0]["heard"] == json!("quiet") && joins["joins"][0]["check"] == json!(false) && joins["joins"][0]["before"].is_null(), "{joins}");
+    assert!(near(&joins["joins"][0]["at"], 2.2), "{joins}");
+    // A cut through the middle of a sound is the one join to check.
+    bench.run(&["cut", "ep.scrubr", "0.6..1.2", "--crossfade", "0"]).ok();
+    let joins = bench.run(&["analyze", "ep.scrubr", "--joins"]).ok();
+    assert_eq!((joins["join_count"].clone(), joins["joins_to_check"].clone()), (json!(3), json!(1)), "{joins}");
+    assert!(joins["joins"][0]["heard"] == json!("sound") && joins["joins"][0]["check"] == json!(true) && near(&joins["joins"][0]["at"], 0.6), "{joins}");
+    assert_eq!(bench.run(&["analyze", "ep.scrubr", "--joins", "--range", "1..4.5"]).ok()["join_count"], json!(2));
+
+    // Undoing the tighten brings the waits back.
+    bench.run(&["undo", "ep.scrubr", "--edit", "e2"]).ok();
+    assert!(near(&bench.run(&["info", "ep.scrubr"]).ok()["timeline_seconds"], 6.4));
+}

@@ -45,6 +45,8 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr info P` | Timeline length, format, sources, head, version |
 | `scrubr analyze P [--loudness] [--peaks] [--silence -45dB:1s] [--envelope 1s] [--range R]` | Measurements. With no flags: loudness and peaks |
 | `scrubr analyze P --quietest R [--quietest R ...]` | The quietest moment in each range, as `at`: where to put a cut between two words |
+| `scrubr analyze P --pauses [0.3s] [--range R]` | Every pause of that length or more. Quiet is found from the recording, so there is no level to choose |
+| `scrubr analyze P --joins [--range R]` | Every join the edits have left: in quiet or on sound, the words either side. `check` marks the ones to look at |
 | `scrubr render P --png out.png [--range R] [--width 1600] [--height 480]` | Waveform image. The reply gives `start` and `seconds_per_pixel`, so pixel x is at `start + x * seconds_per_pixel` |
 | `scrubr transcribe P [--range R] [--model base.en]` | Every word spoken, with `start` and `end`. What it hears is kept. Only in builds with the transcription feature; other builds say so |
 | `scrubr transcribe P --saved [--range R]` | The words kept from earlier runs, where they are on the timeline now. Instant, in any build |
@@ -52,6 +54,7 @@ is seconds, so write `5ms`, not `5`.
 | `scrubr cut P R` | Remove a range |
 | `scrubr cut P --phrase "words" [--within R] [--occurrence N \| --all]` | Remove a phrase by its words, checked before it is written. Needs the transcription feature |
 | `scrubr keep P R` | Remove everything outside a range |
+| `scrubr tighten P [--over 0.6s] [--to 0.3s] [--range R]` | Shorten every pause longer than `--over` to `--to`, as one edit |
 | `scrubr mute P R` | Silence a range and keep its length |
 | `scrubr gain P +2dB [--range R]` | Change level, of everything or of a range |
 | `scrubr fade P in 0.5s` / `fade P out 2s` / `fade P in --range R` | Fade in from the start, out to the end, or across a range |
@@ -130,21 +133,43 @@ a track by its name or its id (`t2`).
   otherwise). If the target needs more gain than that, the gain stops there and the reply says
   `"limited_by": "true_peak"` with the `achieved_lufs`. Report that to the person; do not add gain
   on top.
-- **Silence ranges** from `analyze --silence` are exact. Cutting them whole butts words together;
-  leave some of each pause, for example 0.15 s at each end. The threshold is a fixed level, not
-  relative to the recording. In a quiet recording, or under a quiet speaker, speech itself falls
-  below -45 dB and is reported as silence. Run `analyze --loudness` first; if the integrated
-  loudness is below about -30 LUFS, lower the threshold (-55 dB suited a recording at -41 LUFS)
-  and check a few of the ranges with `--envelope` or `transcribe --range` before cutting.
+- **Pauses.** `analyze --pauses` and `tighten` judge quiet against the recording itself. They
+  measure where its quiet and its speech sit, and a moment is quiet when it is a little above
+  the one and well under the other. The reply's `levels` gives all three figures. A soft
+  recording is read the same way as a loud one, and there is no level for you to choose.
+  - `scrubr tighten P` cuts the middle out of every pause longer than `--over` and leaves `--to`
+    of it, half at each end. It is one edit and one undo step. Run it with `--dry-run` first:
+    the reply lists each pause and the cut it would make.
+  - The quiet before the first sound and after the last is not a pause, and `tighten` leaves it.
+    `--pauses` lists it with `"at_edge": true`; trim it with `keep`.
+  - A breath or a knock in a pause is sound, so that pause counts as two shorter ones.
+  - With a microphone on each track, listen to the mix, which is the default: a pause is when
+    nobody speaks. `--heard-on T` listens to one track; the cuts are still made on every track.
+- **Checking joins.** After cutting, `scrubr analyze P --joins` reads every join back. `heard`
+  is `quiet`, `low` or `sound`: what plays within 20 ms of the join, against the recording's own
+  levels. From the kept transcript come `before` and `after`, the words either side, `doubled`
+  when they are the same word, and `clipped`, the words the join runs through. `"check": true`
+  marks a join that is not in quiet, or doubles a word, and `joins_to_check` counts them: look
+  at those with `render` or `transcribe --range`, then fix or label them. A join in quiet names
+  no clipped word, because word times are loose and the level is not. With no transcript kept,
+  `has_words` is false and only the levels are given.
+- **Silence ranges** from `analyze --silence` are exact, and their threshold is a fixed level
+  that you choose. In a quiet recording speech itself falls below -45 dB and is reported as
+  silence, so for pauses in speech use `--pauses`. Cutting a range whole butts words together;
+  leave some of each pause, for example 0.15 s at each end.
 - **Transcripts.** `transcribe` runs a local speech model, several times faster than real time,
   and prints progress on stderr. Expect some wrong words, and many where people talk over each
   other. A sound can come back as a word, such as `MUSIC`. A word can have the same `start` and
   `end`. Word times are typically within 0.1 s, but about one in ten is off by 0.5 s or more, so
-  do not cut on them directly.
+  do not cut on them directly. The model starts a word early when a pause comes before it, so
+  `transcribe` moves those times to the edge of the pause as the level shows it
+  (`times_moved_out_of_pauses` counts them), and runs the last word before a pause on to where
+  the pause begins. The start of a word after a pause is the truest time in a transcript; times
+  inside running speech are as the model gave them.
 - **Kept transcripts.** What `transcribe` hears is kept against the audio, the way labels are.
   After a cut, an insert or an undo, `scrubr transcribe P --saved` gives the words where they are
   now without listening again: the words that were cut are gone and the rest have moved with
-  their audio. Its `covered` lists the ranges that have been listened to; audio outside them,
+  their audio. A word with less than half of it left counts as cut. Its `covered` lists the ranges that have been listened to; audio outside them,
   such as a file inserted since, has no words yet, so run `transcribe --range` over it. Listening
   to a range again replaces its words. `--track T` keeps a transcript of that track by itself.
   The window draws the kept words along the waveform for the person.
@@ -208,3 +233,7 @@ scrubr export ep42.scrubr out/ep42.flac
 
 If `apply` exits 3, someone edited the project after your analysis. Run `analyze` again and
 build the cuts from the new reply.
+
+`scrubr tighten ep42.scrubr --over 1s --to 0.3s` does the first three steps as one command,
+with quiet found from the recording. Follow either with `scrubr analyze ep42.scrubr --joins`
+and look at any join it marks.

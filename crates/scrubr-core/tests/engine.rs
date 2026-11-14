@@ -11,6 +11,7 @@ use scrubr_core::edit::{self, DEFAULT_CEILING_DBTP, Request, Revert, Target};
 use scrubr_core::export::{self, Depth};
 use scrubr_core::image;
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts};
+use scrubr_core::pacing::{self, Landing, Tighten};
 use scrubr_core::phrase::{self, Pick};
 use scrubr_core::render::Renderer;
 use scrubr_core::transcribe::{self, Heard};
@@ -1266,7 +1267,8 @@ fn a_word_a_cut_runs_through_ends_at_the_cut() {
     let fx = spoken();
     listen_and_keep(&fx, None);
     // "bravo" is heard from 1.10 s to 1.45 s. Cut from 1.25 s to 1.40 s: it still starts where
-    // it did and now ends at the cut. Cut its start as well and it is gone.
+    // it did and now ends at the cut. Cut its start as well, so that less than half of it is
+    // left, and it is gone.
     let bravo = kept(&fx)[1].clone();
     assert_eq!((bravo.text.as_str(), bravo.start, bravo.end), ("bravo", 52_800, 69_600));
     fx.apply(vec![cut(60_000, 67_200, 0)]);
@@ -1276,11 +1278,198 @@ fn a_word_a_cut_runs_through_ends_at_the_cut() {
     fx.apply(vec![cut(50_000, 56_000, 0)]);
     assert_eq!(transcribe::text(&kept(&fx)), "alpha charlie delta echo bravo foxtrot");
 
+    // A model often starts a word early, in the pause before it. So a cut that takes a little
+    // of a word's start leaves the word, beginning at the join.
+    let fx = spoken();
+    listen_and_keep(&fx, None);
+    fx.apply(vec![cut(48_000, 55_200, 0)]);
+    let now = kept(&fx);
+    assert_eq!((now.len(), now[1].text.as_str(), now[1].start, now[1].end), (7, "bravo", 48_000, 62_400));
+    let tl = Timeline::build(&fx.project()).unwrap();
+    let store = words::load(&fx.paths);
+    assert_eq!(words::broken(words::set_for(&store, &tl, None).unwrap(), &tl), [(48_000, "bravo".to_string())]);
+    // Listening again hears it afresh, and the word kept from before is not there twice.
+    listen_and_keep(&fx, None);
+    assert_eq!(transcribe::text(&kept(&fx)), "alpha bravo charlie delta echo bravo foxtrot");
+
     // The mix and a track heard alone are kept apart.
     let tl = Timeline::build(&fx.project()).unwrap();
     words::save(&fx.paths, &tl, Some(0), (0, tl.total()), "tones", &listen(&fx, None)[..2]).unwrap();
     let store = words::load(&fx.paths);
     assert_eq!(words::on_timeline(words::set_for(&store, &tl, Some(0)).unwrap(), &tl).len(), 2);
-    assert_eq!(words::on_timeline(words::set_for(&store, &tl, None).unwrap(), &tl).len(), 6);
+    assert_eq!(words::on_timeline(words::set_for(&store, &tl, None).unwrap(), &tl).len(), 7);
     assert_eq!(store.sets.iter().map(|s| s.track.as_deref()).collect::<Vec<_>>(), [None, Some("t1")]);
+}
+
+// ---- pacing and checking a cut ---------------------------------------------------------------
+
+/// Speech-like bursts over room tone: a burst every 0.6 s, 0.35 s long, with a wait of 1.2 s
+/// after the third and 0.9 s after the fifth. `level` scales the whole recording.
+fn paced(level: f32) -> Fixture {
+    // Where each burst starts, in seconds.
+    let starts = [0.5f32, 1.1, 1.7, 3.25, 3.85, 5.1, 5.7];
+    Fixture::with(7 * RATE as u64, 1, move |f, _, noise| {
+        let t = f as f32 / RATE as f32;
+        let room = noise.next() * 0.002;
+        match starts.iter().find(|&&s| t >= s && t < s + 0.35) {
+            Some(&s) => ((TAU * 500.0 * (t - s)).sin() * 0.4 + room) * level,
+            None => room * level,
+        }
+    })
+}
+
+fn levels_of(fx: &Fixture) -> analysis::Levels {
+    let project = fx.project();
+    let mut renderer = Renderer::new(&project, &fx.paths).unwrap();
+    let total = renderer.total();
+    analysis::levels(&mut renderer, 0, total, RATE).unwrap()
+}
+
+#[test]
+fn pauses_are_found_against_the_recordings_own_quiet() {
+    let secs = |r: (u64, u64)| (r.0 as f64 / RATE as f64, r.1 as f64 / RATE as f64);
+    // The same recording at full level and 34 dB down, where its speech is quieter than the first
+    // one's room: the same pauses are found in both, with no level given.
+    let mut found = Vec::new();
+    for level in [1.0f32, 0.02] {
+        let fx = paced(level);
+        let levels = levels_of(&fx);
+        assert!(levels.quiet_db > levels.floor_db && levels.quiet_db < levels.speech_db - 10.0, "{levels:?}");
+        let long: Vec<(f64, f64)> = levels.pauses(RATE as u64 / 2).into_iter().map(secs).collect();
+        assert_eq!(long.len(), 4, "{long:?}");
+        // The lead-in, the wait after the third burst, the one after the fifth, and the tail.
+        assert!(long[0].0 == 0.0 && (long[0].1 - 0.5).abs() < 0.03, "{long:?}");
+        assert!((long[1].0 - 2.05).abs() < 0.03 && (long[1].1 - 3.25).abs() < 0.03, "{long:?}");
+        assert!((long[2].0 - 4.20).abs() < 0.03 && (long[2].1 - 5.10).abs() < 0.03, "{long:?}");
+        assert!((long[3].0 - 6.05).abs() < 0.03 && long[3].1 == 7.0, "{long:?}");
+        // The quarter-second gaps between bursts are pauses too, only shorter.
+        assert_eq!(levels.pauses(RATE as u64 / 10).len(), 8);
+        found.push((levels.floor_db, long));
+    }
+    assert!((found[0].0 - found[1].0 - 34.0).abs() < 1.0, "the floor moved with the level: {found:?}");
+    assert_eq!(found[0].1, found[1].1);
+}
+
+#[test]
+fn long_pauses_are_shortened_as_one_edit() {
+    let fx = paced(1.0);
+    let (over, to) = (RATE as u64 * 6 / 10, RATE as u64 * 3 / 10);
+    let tighten = |opts: &WriteOpts, over: u64, to: u64| pacing::tighten(&fx.paths, opts, &me(), None, |_, _| Ok(Tighten { range: None, over, to, crossfade: 240 }));
+
+    // A dry run says what would be cut and writes nothing.
+    let dry = tighten(&WriteOpts { dry_run: true, ..Default::default() }, over, to).unwrap();
+    assert!(!dry.wrote && dry.value.pauses.len() == 2 && fx.project().edits.len() == 1);
+
+    let done = tighten(&WriteOpts::default(), over, to).unwrap().value;
+    assert_eq!((done.pauses.len(), done.cuts.len()), (2, 2));
+    let project = fx.project();
+    assert_eq!(project.edits.len(), 2, "one edit");
+    assert!(project.edits[1].desc.as_deref().unwrap().starts_with("tighten 2 pauses"));
+    // Each of those waits is now three tenths of a second. The short gaps are as they were, and
+    // so are the quiet before the first sound and after the last, which are not pauses.
+    let after: Vec<u64> = levels_of(&fx).pauses(RATE as u64 / 10).into_iter().map(|(a, b)| b - a).collect();
+    assert_eq!(after.len(), 8);
+    let near = |frames: u64, seconds: f64| (frames as f64 / RATE as f64 - seconds).abs() < 0.03;
+    assert!(near(after[3], 0.3) && near(after[5], 0.3), "{after:?}");
+    assert!(near(after[1], 0.25) && near(after[2], 0.25) && near(after[4], 0.25), "{after:?}");
+    assert!(near(after[0], 0.5) && near(after[7], 0.95), "{after:?}");
+    let removed: u64 = done.cuts.iter().map(|(a, b)| b - a).sum();
+    assert_eq!(Timeline::build(&project).unwrap().total(), 7 * RATE as u64 - removed);
+
+    // Nothing longer left to shorten: the reply says how long the longest is.
+    let e = tighten(&WriteOpts::default(), over, to).unwrap_err();
+    assert_eq!((e.kind(), e.code()), (Kind::Usage, "no_long_pauses"));
+    assert!(e.to_string().contains("The longest is 0.3"), "{e}");
+    assert_eq!(tighten(&WriteOpts::default(), to, over).unwrap_err().code(), "bad_pause_lengths");
+
+    // Asked about a range, the pauses are still judged against the whole recording: two seconds
+    // that are all sound have no pause in them, and a pause is given as far as the range goes.
+    let fx = paced(1.0);
+    let half = RATE as u64 / 2;
+    let found = pacing::pauses(&fx.project(), &fx.paths, None, Some((half, RATE as u64 * 5 / 2)), RATE as u64 / 10).unwrap().found;
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert!(found[2].end == RATE as u64 * 5 / 2 && !found[2].at_edge);
+    let all = pacing::pauses(&fx.project(), &fx.paths, None, None, half).unwrap().found;
+    assert_eq!(all.iter().map(|p| p.at_edge).collect::<Vec<_>>(), [true, false, false, true]);
+    // Only the pause wholly inside the range is shortened.
+    let ranged = pacing::tighten(&fx.paths, &WriteOpts::default(), &me(), None, |_, _| Ok(Tighten { range: Some((0, 4 * RATE as u64)), over, to, crossfade: 240 })).unwrap();
+    assert_eq!(ranged.value.pauses.len(), 1);
+}
+
+#[test]
+fn every_join_is_read_back_with_what_plays_across_it() {
+    let fx = spoken();
+    listen_and_keep(&fx, None);
+    let report = |fx: &Fixture| pacing::joins(&fx.project(), &fx.paths, None, None).unwrap();
+    assert!(report(&fx).joins.is_empty() && report(&fx).has_words);
+
+    // A clean cut between words: quiet, with the words either side.
+    cut_phrase(&fx, "charlie delta", Pick::Only, 0.0, &WriteOpts::default()).unwrap();
+    let found = report(&fx);
+    let said = |word: &Option<transcribe::Word>| word.as_ref().map(|w| w.text.clone()).unwrap_or_default();
+    assert_eq!(found.joins.len(), 1);
+    let join = &found.joins[0];
+    assert_eq!((join.heard, said(&join.before).as_str(), said(&join.after).as_str(), join.doubled, join.clipped.len()), (Landing::Quiet, "bravo", "echo", false, 0));
+
+    // Cut "echo" too and the same word is said twice across the join: "bravo bravo".
+    cut_phrase(&fx, "echo", Pick::Only, 0.0, &WriteOpts::default()).unwrap();
+    let found = report(&fx);
+    assert_eq!(found.joins.len(), 1, "two cuts side by side make one join");
+    assert!(found.joins[0].doubled && found.joins[0].heard == Landing::Quiet);
+
+    // A cut that starts inside a word lands on sound, and names the word it clipped. One that
+    // ends inside a word names that one.
+    let fx = spoken();
+    listen_and_keep(&fx, None);
+    fx.apply(vec![cut(60_000, 76_800, 0)]);
+    let found = report(&fx);
+    assert_eq!((found.joins[0].heard, found.joins[0].clipped.clone()), (Landing::Sound, vec!["bravo".to_string()]));
+    fx.apply(vec![cut(24_000, 28_800, 0)]);
+    let found = report(&fx);
+    assert_eq!(found.joins.len(), 2);
+    assert_eq!((found.joins[0].heard, found.joins[0].clipped.clone()), (Landing::Sound, vec!["alpha".to_string()]));
+
+    // With no transcript kept the levels are still read, and the reply says words are unknown.
+    let fx = spoken();
+    fx.apply(vec![cut(60_000, 76_800, 0)]);
+    let found = report(&fx);
+    assert!(!found.has_words && found.joins[0].heard == Landing::Sound && found.joins[0].before.is_none());
+}
+
+#[test]
+fn word_times_are_moved_out_of_the_pauses_either_side() {
+    use scrubr_core::transcribe::Word;
+    // Sound from 0.5 to 0.85 s, 1.1 to 1.45 s, 1.7 to 2.05 s and on; room tone between.
+    let fx = paced(1.0);
+    let project = fx.project();
+    let at = |seconds: f64| (seconds * RATE as f64).round() as u64;
+    let word = |text: &str, start: f64, end: f64| Word { text: text.into(), start: at(start), end: at(end), probability: 1.0 };
+    let mut words = vec![
+        // Started early, in the pause before it, and run on into the pause after it.
+        word("one", 0.3, 1.0),
+        // Heard where it is.
+        word("two", 1.1, 1.45),
+        // Begun inside a stretch of sound, where there is nothing to go by. Ended a little soon,
+        // with the sound running on to 2.05 s and a pause after it: it runs to the pause.
+        word("three", 1.75, 1.95),
+        // Wholly inside the long pause, as a noise the model took for a word can be: left.
+        word("four", 2.3, 2.9),
+        // Heard at one moment: left.
+        word("five", 3.0, 3.0),
+        // Ended too soon, with the sound running on to 4.2 s and a pause after it: it runs to
+        // the pause.
+        word("six", 3.85, 4.0),
+        // The sound after this one is the next word's, so it is left.
+        word("seven", 5.1, 5.3),
+        word("eight", 5.32, 5.45),
+    ];
+    let before = words.clone();
+    let moved = pacing::settle(&project, &fx.paths, None, (0, 7 * RATE as u64), &mut words).unwrap();
+    assert_eq!(moved, 3);
+    let near = |frames: u64, seconds: f64| (frames as f64 / RATE as f64 - seconds).abs() < 0.021;
+    assert!(near(words[0].start, 0.5) && near(words[0].end, 0.85), "{:?}", words[0]);
+    assert!(words[2].start == before[2].start && near(words[2].end, 2.05), "{:?}", words[2]);
+    assert_eq!((&words[1], &words[3..5]), (&before[1], &before[3..5]));
+    assert!(words[5].start == before[5].start && near(words[5].end, 4.2), "{:?}", words[5]);
+    assert_eq!(words[6..], before[6..]);
 }

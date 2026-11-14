@@ -133,6 +133,90 @@ pub fn quietest(renderer: &mut Renderer, t0: u64, t1: u64, sample_rate: u32) -> 
     Ok(Quiet { start: t0 + first as u64 * hop, end: t0 + last as u64 * hop + window, rms_db: level(sums[best], window) })
 }
 
+/// The length of each step [`levels`] measures, in seconds.
+pub const LEVEL_STEP_SECONDS: f64 = 0.01;
+
+/// How loud a stretch of the timeline is from one moment to the next, and where its own quiet
+/// and its own speech sit. Quiet is judged against these, not against a fixed level, so a soft
+/// recording and a loud one are read the same way.
+#[derive(Clone, Debug)]
+pub struct Levels {
+    /// The timeline frame the first step starts at, and the frames in a step.
+    pub start: u64,
+    pub end: u64,
+    pub step: u64,
+    /// RMS level of each step over all channels, in dBFS.
+    pub db: Vec<f32>,
+    /// Where the recording's quiet sits: the level a seventh of its moments are under, leaving
+    /// out digital silence.
+    pub floor_db: f64,
+    /// Where its speech sits: the level a seventh of its moments are over.
+    pub speech_db: f64,
+    /// A moment under this counts as quiet: a little above the floor, and well under speech.
+    pub quiet_db: f64,
+}
+
+/// Measures timeline range `t0..t1` in steps of [`LEVEL_STEP_SECONDS`].
+pub fn levels(renderer: &mut Renderer, t0: u64, t1: u64, sample_rate: u32) -> Result<Levels> {
+    let ch = renderer.channels();
+    let t1 = t1.min(renderer.total());
+    let step = ((sample_rate as f64 * LEVEL_STEP_SECONDS).round() as u64).max(1);
+    let mut db: Vec<f32> = Vec::with_capacity(((t1.saturating_sub(t0)) / step + 1) as usize);
+    let (mut energy, mut in_step) = (0f64, 0u64);
+    walk(renderer, t0, t1, |_, block| {
+        for frame in block.chunks_exact(ch) {
+            energy += frame.iter().map(|&s| s as f64 * s as f64).sum::<f64>();
+            in_step += 1;
+            if in_step == step {
+                db.push(to_db((energy / (step as f64 * ch as f64)).sqrt()) as f32);
+                energy = 0.0;
+                in_step = 0;
+            }
+        }
+        Ok(())
+    })?;
+    if in_step > 0 {
+        db.push(to_db((energy / (in_step as f64 * ch as f64)).sqrt()) as f32);
+    }
+    // Digital silence (a muted stretch, a gap between files) says nothing about the room.
+    let mut heard: Vec<f32> = db.iter().copied().filter(|&v| v > -100.0).collect();
+    heard.sort_by(|a, b| a.total_cmp(b));
+    let at = |part: f64| heard.get(((heard.len() as f64 - 1.0) * part).round() as usize).map_or(FLOOR_DB, |&v| v as f64);
+    let (floor_db, speech_db) = (at(0.15), at(0.85));
+    let quiet_db = if heard.is_empty() { -100.0 } else { (floor_db + 8.0).min(speech_db - 12.0) };
+    Ok(Levels { start: t0, end: t1, step, db, floor_db, speech_db, quiet_db })
+}
+
+impl Levels {
+    /// Every stretch that stays quiet for at least `min` frames, in timeline frames.
+    pub fn pauses(&self, min: u64) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut from: Option<usize> = None;
+        for i in 0..=self.db.len() {
+            let quiet = self.db.get(i).is_some_and(|&v| (v as f64) < self.quiet_db);
+            match (quiet, from) {
+                (true, None) => from = Some(i),
+                (false, Some(a)) => {
+                    let range = (self.start + a as u64 * self.step, (self.start + i as u64 * self.step).min(self.end));
+                    if range.1 - range.0 >= min {
+                        out.push(range);
+                    }
+                    from = None;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The loudest step that touches timeline range `t0..t1`, in dBFS.
+    pub fn loudest(&self, t0: u64, t1: u64) -> f64 {
+        let first = (t0.saturating_sub(self.start) / self.step) as usize;
+        let last = ((t1.saturating_sub(self.start)).div_ceil(self.step) as usize).min(self.db.len());
+        self.db.get(first..last.max(first)).into_iter().flatten().fold(FLOOR_DB, |m, &v| m.max(v as f64))
+    }
+}
+
 fn meter_failed(e: ebur128::Error) -> Error {
     Error::codec("analysis_failed", format!("The loudness meter failed: {e}"))
 }

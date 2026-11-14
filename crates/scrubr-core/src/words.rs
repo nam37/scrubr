@@ -86,9 +86,13 @@ pub fn save(paths: &Paths, tl: &Timeline, track: Option<usize>, range: (u64, u64
     };
     let set = &mut store.sets[at];
     set.model = model.to_string();
-    let inside = |w: &Kept| covered.iter().any(|c| c.0 == w.src && w.start >= c.1 && w.start < c.2);
-    set.words.retain(|w| !inside(w));
     let segs = tl.segs();
+    let inside = |w: &Kept| covered.iter().any(|c| c.0 == w.src && w.start >= c.1 && w.start < c.2);
+    // A word that began in audio since cut, and ran on into what was listened to just now, has
+    // been heard again with the rest: it goes too, or it would be there twice.
+    let plays = |w: &Kept| segs.iter().any(|s| tl.source_id(s.src) == w.src && s.start <= w.start && w.start < s.end);
+    let runs_into = |w: &Kept| !plays(w) && covered.iter().any(|c| c.0 == w.src && w.start < c.2 && w.end > c.1);
+    set.words.retain(|w| !inside(w) && !runs_into(w));
     for word in words.iter().filter(|w| w.start < tl.total()) {
         // The word belongs to the source it starts in, and ends there at the latest.
         let i = tl.seg_at(word.start);
@@ -113,33 +117,82 @@ pub fn set_for<'a>(store: &'a Store, tl: &Timeline, track: Option<usize>) -> Opt
     store.sets.iter().find(|s| s.track.as_deref() == id)
 }
 
-/// A set's words where they are on the timeline now, in order. A word whose audio has been cut
-/// is left out; one that a cut runs through ends at the cut.
-pub fn on_timeline(set: &Set, tl: &Timeline) -> Vec<Word> {
-    let segs = tl.segs();
-    let index = |id: &str| (0..tl.source_count()).find(|&i| tl.source_id(i) == id);
-    let mut out = Vec::new();
+/// The index of each kept word's source on this timeline, or `None` if the source is gone.
+/// Words come sorted by source, so each source is looked up once.
+fn sources<'a>(set: &'a Set, tl: &'a Timeline) -> impl Iterator<Item = (&'a Kept, Option<usize>)> {
     let mut known: Option<(&str, Option<usize>)> = None;
-    for word in &set.words {
-        // Words come sorted by source, so the lookup is done once for each source.
+    set.words.iter().map(move |word| {
         let src = match known {
             Some((id, src)) if id == word.src => src,
             _ => {
-                let src = index(&word.src);
+                let src = (0..tl.source_count()).find(|&i| tl.source_id(i) == word.src);
                 known = Some((&word.src, src));
                 src
             }
         };
+        (word, src)
+    })
+}
+
+/// The parts of a word's audio that still play: the segment each is in, and its source frames.
+fn pieces(tl: &Timeline, src: usize, word: &Kept) -> Vec<(usize, u64, u64)> {
+    let segs = tl.segs();
+    (0..segs.len()).filter(|&i| segs[i].src == src && segs[i].start < word.end && segs[i].end > word.start).map(|i| (i, segs[i].start.max(word.start), segs[i].end.min(word.end))).collect()
+}
+
+/// A set's words where they are on the timeline now, in order.
+///
+/// A word is still said when at least half of it still plays, and it is put over the longest
+/// part that does. Half, and not all, because a model's word times are loose: it often starts a
+/// word early, inside the pause before it, and a cut that tidies the pause must not lose the
+/// word. A word with less than half left is a fragment and is left out.
+pub fn on_timeline(set: &Set, tl: &Timeline) -> Vec<Word> {
+    let segs = tl.segs();
+    let mut out = Vec::new();
+    for (word, src) in sources(set, tl) {
         let Some(src) = src else { continue };
-        let Some(i) = segs.iter().position(|s| s.src == src && s.start <= word.start && word.start < s.end) else { continue };
-        let start = tl.seg_start(i) + (word.start - segs[i].start);
-        let end = start + (word.end.min(segs[i].end).max(word.start) - word.start);
+        let (start, end) = if word.end <= word.start {
+            // Heard at one moment: there if that moment is.
+            let Some(i) = segs.iter().position(|s| s.src == src && s.start <= word.start && word.start < s.end) else { continue };
+            let at = tl.seg_start(i) + (word.start - segs[i].start);
+            (at, at)
+        } else {
+            let pieces = pieces(tl, src, word);
+            let playing: u64 = pieces.iter().map(|&(_, a, b)| b - a).sum();
+            if playing * 2 < word.end - word.start {
+                continue;
+            }
+            let Some(&(i, a, b)) = pieces.iter().max_by_key(|&&(i, a, b)| (b - a, std::cmp::Reverse(i))) else { continue };
+            let start = tl.seg_start(i) + (a - segs[i].start);
+            (start, start + (b - a))
+        };
         out.push(Word { text: word.text.clone(), start, end, probability: word.p });
     }
     out.sort_by_key(|w| w.start);
     out
 }
 
+/// Words a cut runs through, going by their times: for each, the timeline position of the join
+/// where part of it was taken, and the word. A word with nothing left is not among them. Word
+/// times are loose, so this says where to look, not what was lost.
+pub fn broken(set: &Set, tl: &Timeline) -> Vec<(u64, String)> {
+    let segs = tl.segs();
+    let mut out = Vec::new();
+    for (word, src) in sources(set, tl) {
+        let Some(src) = src else { continue };
+        for (i, a, b) in pieces(tl, src, word) {
+            if a > word.start {
+                out.push((tl.seg_start(i), word.text.clone()));
+            }
+            if b < word.end {
+                out.push((tl.seg_start(i) + (segs[i].end - segs[i].start), word.text.clone()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
 /// The parts of the timeline a set has words for, as timeline ranges in order. Outside these
 /// the audio has not been listened to.
 pub fn covered(set: &Set, tl: &Timeline) -> Vec<(u64, u64)> {

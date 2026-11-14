@@ -458,6 +458,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <div class="cmd"><code>scrubr transcribe ep42.scrubr --range 10:00..15:00</code><span>Words with start and end times as JSON. Needs the optional transcription feature and a model, installed once with <code>--fetch-model</code>.</span></div>
       <div class="cmd"><code>scrubr cut ep42.scrubr 12:03.25..12:09.9</code><span>Remove a range. The join gets a short crossfade.</span></div>
       <div class="cmd"><code>scrubr keep ep42.scrubr 0:41..58:10</code><span>Remove everything outside a range.</span></div>
+      <div class="cmd"><code>scrubr tighten ep42.scrubr --over 0.6s --to 0.3s</code><span>Shorten every pause longer than one length to another, as one edit (M4). Quiet is found from the recording, so there is no level to choose.</span></div>
       <div class="cmd"><code>scrubr gain ep42.scrubr +2dB --range 0..0:41</code><span>Change the level of the timeline or a range.</span></div>
       <div class="cmd"><code>scrubr fade ep42.scrubr in 0.5s</code><span>Fade in or out at either end, or across a range.</span></div>
       <div class="cmd"><code>scrubr normalize ep42.scrubr --lufs -16</code><span>Normalize to integrated loudness, or to a peak with <code>--peak -1dB</code>. Gain stops at a true-peak ceiling, −1 dBTP by default.</span></div>
@@ -626,6 +627,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <tr><td>Spectrum (M5)</td><td><code>analyze --spectrum</code></td><td>Level in each frequency band over a range, as numbers: where the rumble, the hum or the hiss is</td></tr>
           <tr><td>Clipping (M5)</td><td><code>analyze --clipping</code></td><td>Ranges where the recording hit full scale and was flattened</td></tr>
           <tr><td>Quietest moment</td><td><code>analyze --quietest A..B</code></td><td>The quietest stretch between two times and its middle, with no threshold: where a cut is least likely to be heard</td></tr>
+          <tr><td>Pauses</td><td><code>analyze --pauses 0.3s</code></td><td>Every pause of that length or more, with quiet judged against the recording's own levels, and where those levels sit</td></tr>
+          <tr><td>Joins</td><td><code>analyze --joins</code></td><td>Every join the edits have left: whether it sits in quiet or on sound, the words either side, and which ones to check</td></tr>
           <tr><td>Transcript (optional)</td><td><code>transcribe</code></td><td>Words with start and end times, so an agent can find what was said and cut by phrase</td></tr>
         </tbody>
       </table>
@@ -652,17 +655,34 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     </div>
     <p class="key"><span class="tag">Cutting by phrase</span>Word times are not exact enough to cut on. <code>scrubr cut --phrase</code> finds the phrase in the transcript, takes the quietest moment between the word inside and the word outside each end, and then listens across the join as it would sound, before writing. If the phrase is not gone, or the words either side no longer follow each other, nothing is written and the reply says so. An agent can do the same by hand with <code>analyze --quietest</code> and <code>transcribe --range</code>.</p>
     <p>Tried on the recordings above: a whole sponsor sentence came out of the synthetic voice in one command, in ten seconds. On the podcast a short sentence between two pauses was cut cleanly from a 160-second window in about half a minute. Two attempts at a few words in the middle of running speech were refused by the check, which is what it is for: there was no pause to cut in, and the cut would have taken a neighbouring word. On the meeting, cutting by hand with the same rule landed in the right pause for about five ends in six.</p>
-    <p>A fixed silence threshold does not carry across recordings: at −45 dB the podcast has almost no pauses, and the quiet meeting's soft speech counts as silence. The agent guide says to check loudness first.</p>
+    <p>A fixed silence threshold does not carry across recordings: at −45 dB the podcast has almost no pauses, and the quiet meeting's soft speech counts as silence. <code>analyze --pauses</code> and <code>scrubr tighten</code> therefore take no level: they find quiet from the recording, as the next section describes.</p>
 
     <h3>Pacing and checking a cut (M4)</h3>
-    <p>Planned. These came from reading how <a href="https://github.com/Forward-Future/scarlet" target="_blank" rel="noopener">Scarlet</a>, an agent-driven video editor, cuts dialogue. Its rule is scrubr's own: the tool measures, the agent decides.</p>
+    <p>Pauses, joins and the first step on word times are built. A larger speech model and lining words up against the audio are not. These came from reading how <a href="https://github.com/Forward-Future/scarlet" target="_blank" rel="noopener">Scarlet</a>, an agent-driven video editor, cuts dialogue. Its rule is scrubr's own: the tool measures, the agent decides.</p>
+    <ul>
+      <li><strong>Quiet is judged against the recording.</strong> The level is measured every hundredth of a second. The level a seventh of those moments fall under is taken as the recording's quiet, and the level a seventh rise over as its speech. A moment is quiet when it is under 8 dB above the first and at least 12 dB under the second. Nothing is given as a level in dB, so a recording at −39 LUFS and one at −16 LUFS are read the same way. Digital silence is left out of the count, so a muted stretch does not pass for the room.</li>
+      <li><strong>Pauses as something to ask for.</strong> <code>scrubr analyze --pauses</code> lists every pause of a given length or more. <code>scrubr tighten</code> cuts the middle out of every pause longer than one length and leaves another, half at each end, as one edit and one undo step. The quiet before the first sound and after the last is not a pause and is left alone.</li>
+      <li><strong>Checking the edit, not only the recording.</strong> <code>scrubr analyze --joins</code> lists every join the edits have left with what is heard there: whether it sits in quiet or on sound, the words either side from the kept transcript, a word said twice across it, and a word it runs through. Each join says whether it is worth a second look, and the reply counts those. A join that sits in quiet names no clipped word: word times are loose and the level is not.</li>
+      <li><strong>Word times moved out of pauses.</strong> On the test recording the speech model started every one of 127 words early, typically by a tenth of a second, and a word after a pause by more, because it puts the start inside the pause. The level knows where the pause ends. So <code>scrubr transcribe</code> now starts such a word where the pause ends. That took the words after a pause from typically 130 ms early to 20 ms, with 17 of 20 within 50 ms where none had been. The model also ends the last word before a pause too soon, with the word still sounding; when a pause begins within a third of a second and no other word comes first, the word now runs to the pause (19 of 127 ends on the test recording, by 0.07 to 0.32 s). Words inside running speech are as the model gave them.</li>
+      <li><strong>A kept word survives a tidy cut.</strong> A kept word used to be dropped when its start was cut. With starts that early, tightening lost 8 of 127 words from the kept transcript although every word could still be heard. Now a word stays while at least half of it plays, and with the truer starts none is lost.</li>
+    </ul>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Recording</th><th>Quiet is under</th><th>Tightened</th><th>Words afterwards</th></tr></thead>
+        <tbody>
+          <tr><td>Synthetic voice, 46 s, −20 LUFS</td><td>−38.7 dBFS (speech −15.9)</td><td>9 pauses, 5.8 s removed, in 0.1 s</td><td>The same 127 words. All 9 joins in quiet</td></tr>
+          <tr><td>Podcast, 5 min, −16.5 LUFS</td><td>−35.4 dBFS (speech −15.9)</td><td>17 pauses, 7.5 s removed, in 0.4 s</td><td>17 of 990 differ, 1 of them near a join. Starting the same untouched audio 2.5 s later changes 40. All 17 joins in quiet</td></tr>
+          <tr><td>Meeting, 5 min, four speakers, −39 LUFS</td><td>−69.6 dBFS (speech −41.4)</td><td>26 pauses, 21.2 s removed, in 0.2 s</td><td>59 of about 600 differ, 18 of them near a join where chance would put 11. Starting 2.5 s later changes 55. All 26 joins in quiet; one has the same word either side</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The speech model hears the same audio differently when it is only divided up differently, so a changed word after an edit is not proof the edit did it. On the podcast, tightening changed fewer words than that does. On the meeting, where people talk over each other and the model is wrong about a third of the words anyway, a few more of the changed words are near joins than chance would give, so it cannot be ruled out that a soft word went with a pause there. Listing pauses or joins over the whole 95-minute podcast takes about 6 seconds.</p>
+    <p>Still to do:</p>
     <ul>
       <li><strong>A larger speech model on offer.</strong> A small model hears the sentence a speaker meant and smooths over the stumbles on the way to it, and the stumbles are what a dialogue pass cuts. <code>scrubr transcribe --fetch-model</code> is to offer larger models, and a comparison on the test recordings decides whether <code>base.en</code> stays the default.</li>
-      <li><strong>Pauses as something to ask for.</strong> <code>scrubr tighten</code> shortens every pause longer than one length down to another, as one edit. Today an agent has to do that arithmetic on silence ranges itself. A pause is found against the recording's own quiet, not a fixed level, so it works the same on a loud recording and a soft one.</li>
-      <li><strong>Checking the edit, not only the recording.</strong> <code>scrubr analyze --joins</code> lists every join the edits have left with what is heard there: whether it sits in quiet or on sound, the words either side, and a word said twice across it. An agent reads one reply to find the joins worth a second look.</li>
-      <li><strong>Truer word times, as a spike.</strong> Scarlet lines Whisper's words up against the audio a second time and reports the usual error falling from about 90 ms to about 40 ms. scrubr measured the same 90 ms. A spike is to find out whether that can be done in Rust without a native library, and what it does to how often a cut by words is refused.</li>
+      <li><strong>Truer word times inside running speech.</strong> Scarlet lines Whisper's words up against the audio a second time and reports the usual error falling from about 90 ms to about 40 ms. Moving times out of pauses does that for the words next to a pause, which are the ones a cut lands beside, and does nothing for the rest. A spike is to find out whether the rest can be done in Rust without a native library. <code>scrubr cut --phrase</code> does not use the moved times yet; whether it is refused less often with them is to be measured.</li>
     </ul>
-    <p>Noted for later, not planned: saying what sounds in a gap between words, since a gap can hold a word the model skipped; playing what a cut removed and then the join, from the activity log; and edits that wait as suggestions until the person approves them.</p>
+    <p>Noted for later, not planned: a Tighten command in the window; saying what sounds in a gap between words, since a gap can hold a word the model skipped; playing what a cut removed and then the join, from the activity log; and edits that wait as suggestions until the person approves them.</p>
 
     <h3>Words on the waveform (M4)</h3>
     <p>Built. The window shows what was said along the audio it was said in, so a person finds a place by reading and not only by listening.</p>
@@ -677,7 +697,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <p>In the window:</p>
     <ul>
       <li><strong>Transcribe</strong> (Ctrl+T) listens to the selection, or to everything when there is none. With a track picked it listens to that track alone.</li>
-      <li><strong>A press on a word</strong> selects the stretch it was heard over and puts the playhead at its start.</li>
+      <li><strong>Each word sits on a pill</strong> as long as the word was heard for, so a word said slowly is a long pill and one said in passing a short one, whatever its spelling. The word is written inside its pill when it fits. When speech is quicker than it can be written, the word is centred on its pill and lies over its neighbours, and the pills still show where each one starts and ends.</li>
+      <li><strong>A press on a word</strong> or its pill selects the stretch it was heard over and puts the playhead at its start.</li>
       <li><strong>Find words</strong> (Ctrl+F) opens a small card. Enter goes to the next place the words were said and selects it, and the card counts them.</li>
       <li><strong>Cut words</strong> (Shift+X) cuts the words the selection covers, at the quietest moment either side, and only if listening across the join finds it clean. If it does not, nothing is cut and the reason is shown.</li>
     </ul>
@@ -872,7 +893,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <p>MP3 export, spectrograms, and cut-by-words commands on top of the transcript.</p>
           <p>Words on the waveform: the window draws the transcript along the audio, first one made by the command line, then with its own Transcribe command, word selection and search.</p>
           <p>Pacing and checking a cut: larger speech models on offer, <code>scrubr tighten</code> for pauses, <code>scrubr analyze --joins</code> to check what an edit left, and a spike on truer word times.</p>
-          <p>Cutting by words and words on the waveform are built. Pacing and checking, MP3 export and spectrograms are not started.</p>
+          <p>Cutting by words, words on the waveform, and pauses and joins (<code>analyze --pauses</code>, <code>scrubr tighten</code>, <code>analyze --joins</code>, word times moved out of pauses) are built. A larger speech model, truer word times inside running speech, MP3 export and spectrograms are not started.</p>
         </div>
       </li>
       <li>

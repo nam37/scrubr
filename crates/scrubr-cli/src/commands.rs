@@ -10,6 +10,7 @@ use scrubr_core::analysis::{self, Options as Measure};
 use scrubr_core::edit::{self, Applied, DEFAULT_CEILING_DBTP, DEFAULT_CROSSFADE_MS, NormalizeReport, Request, Revert, Target};
 use scrubr_core::export::{self, Depth};
 use scrubr_core::image;
+use scrubr_core::pacing::{self, Tighten};
 use scrubr_core::project::{self, EditState, FadeDir, Op, Paths, Project, Who, WriteOpts, Written};
 use scrubr_core::render::Renderer;
 use scrubr_core::timeline::TrackState;
@@ -291,6 +292,8 @@ pub fn analyze(
     silence: Option<String>,
     envelope: Option<String>,
     quietest: Vec<String>,
+    pauses: Option<String>,
+    joins: bool,
     range: Option<String>,
     track: Option<String>,
 ) -> Result<Reply> {
@@ -324,14 +327,17 @@ pub fn analyze(
         edit::check_range(&p, &paths, renderer.timeline(), search)?;
         searches.push(search);
     }
+    let pause_min = pauses.as_deref().map(|text| time::parse_duration(text, rate)).transpose()?;
     // With nothing asked for, report the two measures an agent needs first.
     let nothing_measured = !loudness && !peaks && options.silence.is_none() && options.envelope.is_none();
-    if nothing_measured && searches.is_empty() {
+    let own_measures = !searches.is_empty() || pause_min.is_some() || joins;
+    if nothing_measured && !own_measures {
         options.loudness = true;
         options.peaks = true;
     }
-    // Quietest moments read only their own short ranges, so asking for them alone is quick.
-    let report = match nothing_measured && !searches.is_empty() {
+    // Quietest moments, pauses and joins take their own readings, so asking for them alone
+    // skips the loudness pass.
+    let report = match nothing_measured && own_measures {
         true => analysis::Report::default(),
         false => analysis::analyze(&mut renderer, t0, t1, &options, rate)?,
     };
@@ -403,7 +409,79 @@ pub fn analyze(
         }
         fields.insert("quietest".into(), Value::Array(found));
     }
+    let asked = range.as_ref().map(|_| (t0, t1));
+    if let Some(min) = pause_min {
+        let found = pacing::pauses(&p, &paths, track.as_deref(), asked, min)?;
+        let listed: Vec<Value> = found
+            .found
+            .iter()
+            .map(|pause| {
+                let mut one = json!({ "start": seconds(pause.start, rate), "end": seconds(pause.end, rate), "seconds": seconds(pause.end - pause.start, rate) });
+                if pause.at_edge {
+                    one["at_edge"] = json!(true);
+                }
+                one
+            })
+            .collect();
+        text.push_str(&format!("\npauses of {} or more: {} ({})", timecode(min, rate), found.found.len(), levels_text(&found.levels)));
+        for pause in found.found.iter().take(40) {
+            text.push_str(&format!("\n  {}  {:.2}s{}", range_text((pause.start, pause.end), rate), seconds(pause.end - pause.start, rate), if pause.at_edge { "  (start or end of the timeline)" } else { "" }));
+        }
+        if found.found.len() > 40 {
+            text.push_str(&format!("\n  ... and {} more (use --json to list all)", found.found.len() - 40));
+        }
+        fields.insert("levels".into(), levels_json(&found.levels));
+        fields.insert("pause_count".into(), json!(listed.len()));
+        fields.insert("pause_seconds".into(), json!(seconds(found.found.iter().map(|pause| pause.end - pause.start).sum(), rate)));
+        fields.insert("pauses".into(), Value::Array(listed));
+    }
+    if joins {
+        let found = pacing::joins(&p, &paths, track.as_deref(), asked)?;
+        let word = |w: &Option<scrubr_core::transcribe::Word>| w.as_ref().map(|w| json!({ "word": w.text, "start": seconds(w.start, rate), "end": seconds(w.end, rate) }));
+        let said = |w: &Option<scrubr_core::transcribe::Word>| w.as_ref().map_or("-".to_string(), |w| w.text.trim().to_string());
+        let to_check = found.joins.iter().filter(|j| j.check()).count();
+        text.push_str(&format!("\njoins: {}, {} to check ({})", found.joins.len(), to_check, levels_text(&found.levels)));
+        if !found.has_words {
+            text.push_str("\n  no transcript is kept, so the words at each join are not known: run `scrubr transcribe` first");
+        }
+        let mut listed = Vec::new();
+        for join in &found.joins {
+            let mut one = json!({ "at": seconds(join.at, rate), "level_dbfs": (join.level_db * 10.0).round() / 10.0, "heard": join.heard.as_str(), "check": join.check() });
+            if found.has_words {
+                one["before"] = json!(word(&join.before));
+                one["after"] = json!(word(&join.after));
+                one["doubled"] = json!(join.doubled);
+                one["clipped"] = json!(join.clipped);
+            }
+            listed.push(one);
+            if join.check() && listed.len() <= 200 {
+                let mut why = vec![format!("on {} ({:.1} dBFS)", join.heard.as_str(), join.level_db)];
+                if join.doubled {
+                    why.push("the same word either side".into());
+                }
+                if !join.clipped.is_empty() {
+                    why.push(format!("runs through \"{}\"", join.clipped.join("\", \"")));
+                }
+                text.push_str(&format!("\n  {}  {} | {}  {}", timecode(join.at, rate), said(&join.before), said(&join.after), why.join(", ")));
+            }
+        }
+        fields.insert("levels".into(), levels_json(&found.levels));
+        fields.insert("has_words".into(), json!(found.has_words));
+        fields.insert("join_count".into(), json!(listed.len()));
+        fields.insert("joins_to_check".into(), json!(to_check));
+        fields.insert("joins".into(), Value::Array(listed));
+    }
     Ok(Reply { version: Some(p.version), fields, text })
+}
+
+/// Where a recording's own quiet and speech sit, and the level under which a moment is quiet.
+fn levels_json(levels: &analysis::Levels) -> Value {
+    let round1 = |v: f64| (v * 10.0).round() / 10.0;
+    json!({ "floor_dbfs": round1(levels.floor_db), "speech_dbfs": round1(levels.speech_db), "quiet_under_dbfs": round1(levels.quiet_db) })
+}
+
+fn levels_text(levels: &analysis::Levels) -> String {
+    format!("quiet is under {:.1} dBFS: the floor is {:.1}, speech {:.1}", levels.quiet_db, levels.floor_db, levels.speech_db)
 }
 
 pub fn render(project: &Path, png: &Path, range: Option<String>, width: u32, height: u32, track: Option<String>) -> Result<Reply> {
@@ -507,6 +585,52 @@ pub fn cut(project: &Path, range: &str, xf: Option<String>, opts: &EditOpts, kee
     fields.insert("crossfade_ms".into(), json!(ms(xf_frames, rate)));
     fields.insert("source_spans".into(), spans_of(&written.value.resolved[0].op).unwrap_or(Value::Null));
     let text = format!("{name} {}: removed {}. {tail}", range_text(asked, rate), timecode(removed, rate));
+    Ok(finish(written, fields, text))
+}
+
+/// `tighten`: every pause longer than one length cut down to another, as one edit.
+pub fn tighten(project: &Path, over: &str, to: &str, range: Option<String>, heard_on: Option<String>, xf: Option<String>, opts: &EditOpts) -> Result<Reply> {
+    let paths = Paths::new(project);
+    let written = pacing::tighten(&paths, &write_opts(opts), &who(&opts.author, &opts.session), heard_on.as_deref(), |p, tl| {
+        let rate = p.sample_rate;
+        Ok(Tighten {
+            range: range.as_deref().map(|text| time::parse_range(text, scale(p, tl))).transpose()?,
+            over: time::parse_duration(over, rate)?,
+            to: time::parse_duration(to, rate)?,
+            crossfade: crossfade(&xf, rate)?,
+        })
+    })?;
+    let done = written.value;
+    let rate = done.applied.sample_rate;
+    let asked = done.asked;
+    let removed: u64 = done.applied.resolved.iter().map(|r| r.frames).sum();
+    let listed: Vec<Value> = done
+        .pauses
+        .iter()
+        .zip(&done.cuts)
+        .map(|(pause, cut)| json!({ "start": seconds(pause.0, rate), "end": seconds(pause.1, rate), "seconds": seconds(pause.1 - pause.0, rate), "cut": { "start": seconds(cut.0, rate), "end": seconds(cut.1, rate) } }))
+        .collect();
+    let written = Written { value: done.applied, version: written.version, wrote: written.wrote };
+    let (mut fields, tail) = edit_reply(&written, "tighten");
+    fields.insert("heard_on".into(), json!(heard_on));
+    if let Some(range) = asked.range {
+        fields.insert("range".into(), json!({ "start": seconds(range.0, rate), "end": seconds(range.1, rate) }));
+    }
+    fields.insert("over_seconds".into(), json!(seconds(asked.over, rate)));
+    fields.insert("to_seconds".into(), json!(seconds(asked.to, rate)));
+    fields.insert("levels".into(), levels_json(&done.levels));
+    fields.insert("pause_count".into(), json!(listed.len()));
+    fields.insert("removed_seconds".into(), json!(seconds(removed, rate)));
+    fields.insert("crossfade_ms".into(), json!(ms(asked.crossfade, rate)));
+    fields.insert("pauses".into(), Value::Array(listed));
+    let text = format!(
+        "tighten: {} pauses over {:.2}s shortened to {:.2}s, removed {} ({}). {tail}",
+        done.pauses.len(),
+        seconds(asked.over, rate),
+        seconds(asked.to, rate),
+        timecode(removed, rate),
+        levels_text(&done.levels)
+    );
     Ok(finish(written, fields, text))
 }
 
@@ -1115,17 +1239,21 @@ pub fn transcribe(project: Option<&Path>, model: Option<String>, range: Option<S
     let began = std::time::Instant::now();
     // Progress goes to stderr, so stdout stays one JSON reply.
     let only = alone(&paths, &tl, &track)?;
-    let words = speech::transcribe_track(&p, &paths, only, range, &mut engine, &mut |done, total| {
+    let mut words = speech::transcribe_track(&p, &paths, only, range, &mut engine, &mut |done, total| {
         eprintln!("transcribe: {} of {}", timecode(done, rate), timecode(total, rate));
     })?;
-    let took = began.elapsed().as_secs_f64();
     let (start, end) = range.unwrap_or((0, tl.total()));
+    // The model starts a word early when a pause comes before it. The level says where the
+    // pause ends, so those times are put right.
+    let settled = pacing::settle(&p, &paths, only, (start, end), &mut words)?;
+    let took = began.elapsed().as_secs_f64();
     // Kept against the audio, so the window can show the words and `--saved` can give them back
     // after edits without listening again.
     scrubr_core::words::save(&paths, &tl, only, (start, end), &engine.name(), &words)?;
     let (mut fields, text) = words_reply(&words, (start, end), tl.total(), rate, &engine.name());
     fields.insert("took_seconds".into(), json!((took * 10.0).round() / 10.0));
     fields.insert("saved".into(), json!(true));
+    fields.insert("times_moved_out_of_pauses".into(), json!(settled));
     let shown = format!("{} words in {} by {}, in {took:.1} s (use --json for word times):\n{text}", words.len(), range_text((start, end), rate), engine.name());
     Ok(Reply { version: Some(p.version), fields, text: shown })
 }
@@ -1310,10 +1438,10 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[1].starts_with("e2    cut 0:00.500..0:01.000") && lines[1].contains("you/s1"), "{text}");
         assert!(lines[3].starts_with("e4    normalize -12 LUFS") && lines[3].ends_with("<- head"), "{text}");
-        let text = analyze(&project, false, false, None, None, vec!["1..3".into()], None, None).unwrap().text;
+        let text = analyze(&project, false, false, None, None, vec!["1..3".into()], None, false, None, None).unwrap().text;
         assert_eq!(text, "timeline 0:03.500
 quietest in 0:01.000..0:03.000: 0:02.000 (0:01.500..0:02.500, -120.0 dBFS)");
-        let text = analyze(&project, true, true, Some("-50dB:0.5s".into()), Some("1s".into()), Vec::new(), None, None).unwrap().text;
+        let text = analyze(&project, true, true, Some("-50dB:0.5s".into()), Some("1s".into()), Vec::new(), None, false, None, None).unwrap().text;
         assert!(text.starts_with("timeline 0:03.500\nloudness: -12.0 LUFS, true peak "), "{text}");
         assert!(text.contains("\nsilence under -50 dBFS for 0:00.500 or more: 1 ranges\n  0:01.500..0:02.500\n"), "{text}");
         assert!(text.contains("clipped samples") && text.ends_with("envelope: 4 windows of 0:01.000 (use --json for the levels)"), "{text}");

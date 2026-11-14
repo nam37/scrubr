@@ -174,7 +174,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <dl class="plate">
       <div><dt>Status</dt><dd>Draft</dd></div>
       <div><dt>Owner</dt><dd>Neil</dd></div>
-      <div><dt>Updated</dt><dd>13 Nov 2026</dd></div>
+      <div><dt>Updated</dt><dd>14 Nov 2026</dd></div>
       <div><dt>Platforms</dt><dd>macOS · Windows · Linux</dd></div>
       <div><dt>Language</dt><dd>Rust</dd></div>
       <div><dt>GUI</dt><dd>Rune (pre-release)</dd></div>
@@ -574,7 +574,7 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>Open and Export through the system's file dialogs. An export runs in the background and shows how far it has got. With no project, the window starts empty and offers New project and Open project.</li>
       <li>New project (Ctrl+N) opens an empty project at once, with the Files tab showing and no dialog. The project is made when its first file is added: beside that file and named after it, with a number added if the name is taken. Until then nothing is written, because a project takes its sample rate and channels from its first file.</li>
       <li>Files tab (M3), the third tab in the side panel beside Activity and Labels: a file browser for adding more audio to the open project. It lists folders and the audio files scrubr can read, each with a Play button to hear it first. "Insert" puts a file into the timeline at the playhead, and "Track" lays it on a new track from the playhead. It also lists the files the project already uses.</li>
-      <li>Words on the waveform (M4, planned): what was said, drawn along the audio it was said in. The Transcription section has the plan.</li>
+      <li>Words on the waveform (M4): what was said, drawn along the audio it was said in. Transcribe (Ctrl+T) listens to the selection or to everything; a press on a word selects it; Find words (Ctrl+F) goes from one place a phrase was said to the next; Cut words (Shift+X) cuts the selected words with the same check as <code>scrubr cut --phrase</code>.</li>
       <li>Tracks (M3) as stacked lanes under one ruler, each with its name, level, pan, mute and solo. A selection can be muted on one track alone, and a track can be removed. Cuts always act on every track.</li>
       <li>Live reload when the project file changes on disk, with a short notice naming the edit. The transport's notice line is empty unless there is something to say.</li>
       <li>One menu button holds every command, the same on all three platforms. The same list drives the tool buttons and the keyboard shortcuts.</li>
@@ -654,20 +654,33 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
     <p>Tried on the recordings above: a whole sponsor sentence came out of the synthetic voice in one command, in ten seconds. On the podcast a short sentence between two pauses was cut cleanly from a 160-second window in about half a minute. Two attempts at a few words in the middle of running speech were refused by the check, which is what it is for: there was no pause to cut in, and the cut would have taken a neighbouring word. On the meeting, cutting by hand with the same rule landed in the right pause for about five ends in six.</p>
     <p>A fixed silence threshold does not carry across recordings: at −45 dB the podcast has almost no pauses, and the quiet meeting's soft speech counts as silence. The agent guide says to check loudness first.</p>
 
+    <h3>Pacing and checking a cut (M4)</h3>
+    <p>Planned. These came from reading how <a href="https://github.com/Forward-Future/scarlet" target="_blank" rel="noopener">Scarlet</a>, an agent-driven video editor, cuts dialogue. Its rule is scrubr's own: the tool measures, the agent decides.</p>
+    <ul>
+      <li><strong>A larger speech model on offer.</strong> A small model hears the sentence a speaker meant and smooths over the stumbles on the way to it, and the stumbles are what a dialogue pass cuts. <code>scrubr transcribe --fetch-model</code> is to offer larger models, and a comparison on the test recordings decides whether <code>base.en</code> stays the default.</li>
+      <li><strong>Pauses as something to ask for.</strong> <code>scrubr tighten</code> shortens every pause longer than one length down to another, as one edit. Today an agent has to do that arithmetic on silence ranges itself. A pause is found against the recording's own quiet, not a fixed level, so it works the same on a loud recording and a soft one.</li>
+      <li><strong>Checking the edit, not only the recording.</strong> <code>scrubr analyze --joins</code> lists every join the edits have left with what is heard there: whether it sits in quiet or on sound, the words either side, and a word said twice across it. An agent reads one reply to find the joins worth a second look.</li>
+      <li><strong>Truer word times, as a spike.</strong> Scarlet lines Whisper's words up against the audio a second time and reports the usual error falling from about 90 ms to about 40 ms. scrubr measured the same 90 ms. A spike is to find out whether that can be done in Rust without a native library, and what it does to how often a cut by words is refused.</li>
+    </ul>
+    <p>Noted for later, not planned: saying what sounds in a gap between words, since a gap can hold a word the model skipped; playing what a cut removed and then the join, from the activity log; and edits that wait as suggestions until the person approves them.</p>
+
     <h3>Words on the waveform (M4)</h3>
-    <p>Planned, not built. The window shows what was said along the audio it was said in, so a person finds a place by reading and not only by listening.</p>
+    <p>Built. The window shows what was said along the audio it was said in, so a person finds a place by reading and not only by listening.</p>
     <ul>
       <li><strong>A words lane.</strong> A thin strip along the timeline with each word drawn over the stretch of audio where it was heard. With a microphone on each track, each track has its own words, which also shows who said what.</li>
-      <li><strong>Zoom decides what is shown.</strong> Words can be read when about twenty seconds or less fill the window. Further out the lane shows only where there is speech.</li>
+      <li><strong>Zoom decides what is shown.</strong> Every word is written when about twelve seconds or less fill the window; where speech is too quick for a word to fit over its own audio it follows the word before it. Out to a minute and a half, the word each stretch of speech starts with is written, to find a place by. Further out the lane shows only where there is speech.</li>
       <li><strong>Words follow the audio.</strong> A transcript is kept against the source recording, as labels are. After a cut the words that remain are still on their audio and the words that were cut are gone, with no need to transcribe again. Words either side of a join may be a little out until the stretch is transcribed again.</li>
-      <li><strong>Kept in the cache.</strong> <code>scrubr transcribe</code> saves what it heard in the project's cache folder, with the model that heard it. It can be made again, so it is not part of the project file.</li>
+      <li><strong>Kept in the cache.</strong> <code>scrubr transcribe</code> saves what it heard in the project's cache folder, with the model that heard it. It can be made again, so it is not part of the project file. <code>scrubr transcribe --saved</code> reads it back where the words are now, in any build and without listening: after a sentence was cut from the test recording it answered in 0.4 seconds with the same 109 words a fresh transcription took 7.7 seconds to hear.</li>
+      <li><strong>The window carries no speech model.</strong> Its Transcribe command asks the <code>scrubr</code> program beside it to listen, in the background, and shows its progress. So the window stays as light as it was, and there is one place where the model lives. If that program was built without transcription, the window says so.</li>
       <li><strong>A guide, not a ruler.</strong> A word's time is typically within a tenth of a second, and about one in ten is half a second or more out. Words sit close to their audio, not exactly on it. A cut made from words still goes to the quietest moment nearby and is still checked.</li>
     </ul>
-    <p>It comes in two steps.</p>
-    <ol>
-      <li><strong>Show a transcript that is there.</strong> The command line makes the transcript and the window draws it when it finds one. The window needs no speech model for this, so it stays as light as it is.</li>
-      <li><strong>Work with the words.</strong> A Transcribe command in the window, run in the background with its progress shown. A press on a word moves the playhead there, and a drag across words selects that stretch. A selected phrase can be cut with the same check as <code>scrubr cut --phrase</code>. A search box jumps to where a word was said.</li>
-    </ol>
+    <p>In the window:</p>
+    <ul>
+      <li><strong>Transcribe</strong> (Ctrl+T) listens to the selection, or to everything when there is none. With a track picked it listens to that track alone.</li>
+      <li><strong>A press on a word</strong> selects the stretch it was heard over and puts the playhead at its start.</li>
+      <li><strong>Find words</strong> (Ctrl+F) opens a small card. Enter goes to the next place the words were said and selects it, and the card counts them.</li>
+      <li><strong>Cut words</strong> (Shift+X) cuts the words the selection covers, at the quietest moment either side, and only if listening across the join finds it clean. If it does not, nothing is cut and the reason is shown.</li>
+    </ul>
   </section>
 
   <section id="stems">
@@ -858,7 +871,8 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
           <h3>Extras</h3>
           <p>MP3 export, spectrograms, and cut-by-words commands on top of the transcript.</p>
           <p>Words on the waveform: the window draws the transcript along the audio, first one made by the command line, then with its own Transcribe command, word selection and search.</p>
-          <p>Cutting by words is built: <code>scrubr find</code> and <code>scrubr cut --phrase</code>. MP3 export, spectrograms and words on the waveform are not started.</p>
+          <p>Pacing and checking a cut: larger speech models on offer, <code>scrubr tighten</code> for pauses, <code>scrubr analyze --joins</code> to check what an edit left, and a spike on truer word times.</p>
+          <p>Cutting by words and words on the waveform are built. Pacing and checking, MP3 export and spectrograms are not started.</p>
         </div>
       </li>
       <li>
@@ -912,7 +926,6 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li>Once the limiter is there (M5), should normalize use it by itself to reach its target on peaky speech, or only when asked?</li>
       <li>Is apply-then-undo enough for tuning an effect by ear, or does the window need a way to hear a few seconds before applying?</li>
       <li>When a cut covers audio that an earlier edit had already removed, should it claim that hidden audio too, so it stays hidden if the earlier edit is reverted?</li>
-      <li>Should the window carry the speech model so it can transcribe by itself, or only ever show a transcript the command line made?</li>
       <li>Is <code>base.en</code> the right default model, or should recordings with several speakers default to a larger one such as <code>small.en</code>, about 1 GB?</li>
       <li>Should release builds include the transcription feature, or stay without it and leave it to people who build from source?</li>
       <li>Should recording from a microphone ever be in scope?</li>
@@ -930,12 +943,13 @@ footer { font: 12px var(--mono); color: var(--muted); border-top: 1px solid var(
       <li><a href="https://mcpservers.org/servers/vocalremover-mcp" target="_blank" rel="noopener">VocalRemover MCP server</a></li>
       <li><a href="https://mcpplaygroundonline.com/mcp-servers/io-github-swappysh-mixmake" target="_blank" rel="noopener">MixMake MCP server</a></li>
       <li><a href="https://lib.rs/crates/sampitor" target="_blank" rel="noopener">Sampitor</a></li>
+      <li><a href="https://github.com/Forward-Future/scarlet" target="_blank" rel="noopener">Scarlet, an agent-driven video editor (dialogue cutting)</a></li>
       <li><a href="https://github.com/anomalyco/rune" target="_blank" rel="noopener">Rune on GitHub</a></li>
       <li><a href="https://braindetox.kr/en/posts/rune_rust_native_gpu_ui_framework.html" target="_blank" rel="noopener">Rune overview: headless rendering and pre-release status</a></li>
     </ul>
   </section>
 
-  <footer>scrubr PRD · draft · 12 November 2026</footer>
+  <footer>scrubr PRD · draft · 14 November 2026</footer>
 </main>
 
 <script>
